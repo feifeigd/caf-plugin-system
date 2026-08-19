@@ -13,11 +13,16 @@ using ping_atom = caf::atom_constant<caf::atom("ping")>;
 using pong_atom = caf::atom_constant<caf::atom("pong")>;
 using init_atom = caf::atom_constant<caf::atom("init")>;
 
+// 插件 C ABI 函数签名
+using CreatePluginFunc  = PluginEntry* (*)();
+using DestroyPluginFunc = void (*)(PluginEntry*);
+
 struct LoadedPlugin {
     DynamicLibrary lib;
     PluginEntry* instance = nullptr;
     caf::actor actor;
     plugin_manifest manifest;
+    DestroyPluginFunc destroy = nullptr;   // 缓存，避免重复 dlsym
 };
 
 class PluginManager {

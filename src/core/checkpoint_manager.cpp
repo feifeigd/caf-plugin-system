@@ -4,7 +4,7 @@
 
 struct Checkpoint {
     std::string plugin_name;
-    std::vector<uint8_t> data;
+    std::vector<std::byte> data;
     int64_t timestamp;
     uint32_t crc32;
 };
@@ -14,16 +14,16 @@ CheckpointManager::CheckpointManager(std::filesystem::path dir)
     std::filesystem::create_directories(checkpoint_dir_);
 }
 
-uint32_t CheckpointManager::compute_crc32(const std::vector<uint8_t>& data) {
+uint32_t CheckpointManager::compute_crc32(const std::vector<std::byte>& data) {
     uint32_t crc = 0;
-    for (auto b : data) crc = crc * 31 + b;
+    for (auto b : data) crc = crc * 31 + std::to_integer<uint32_t>(b);
     return crc;
 }
 
 auto CheckpointManager::make_behavior(caf::event_based_actor* self) {
     return caf::behavior{
         [=](save_state_atom, const std::string& plugin_name,
-            const std::vector<uint8_t>& data) -> bool {
+            const std::vector<std::byte>& data) -> bool {
             try {
                 Checkpoint cp{plugin_name, data,
                     std::chrono::system_clock::now().time_since_epoch().count(),
@@ -48,7 +48,7 @@ auto CheckpointManager::make_behavior(caf::event_based_actor* self) {
             }
         },
 
-        [=](restore_state_atom, const std::string& plugin_name) -> std::vector<uint8_t> {
+        [=](restore_state_atom, const std::string& plugin_name) -> std::vector<std::byte> {
             auto path = checkpoint_dir_ / (plugin_name + ".ckpt");
             if (!std::filesystem::exists(path)) return {};
 
@@ -64,7 +64,7 @@ auto CheckpointManager::make_behavior(caf::event_based_actor* self) {
             size_t len;
             ifs.read(reinterpret_cast<char*>(&len), 8);
 
-            std::vector<uint8_t> data(len);
+            std::vector<std::byte> data(len);
             ifs.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(len));
 
             if (compute_crc32(data) != crc) {

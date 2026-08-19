@@ -1,10 +1,11 @@
 #pragma once
 #include <caf/all.hpp>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <vector>
 
-using save_state_atom = caf::atom_constant<caf::atom("savest")>;
+using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
 using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
 class CheckpointManager {
@@ -14,5 +15,5 @@ public:
 
 private:
     std::filesystem::path checkpoint_dir_;
-    static uint32_t compute_crc32(const std::vector<uint8_t>& data);
+    static uint32_t compute_crc32(const std::vector<std::byte>& data);
 };

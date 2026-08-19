@@ -1,4 +1,5 @@
 #include "plugin_interface.hpp"
+#include <cstddef>
 #include <iostream>
 #include <cstring>
 
@@ -33,12 +34,12 @@ public:
                     std::cout << "[Logger] Draining..." << std::endl;
                     self->send(coordinator, drain_atom::value, self->address());
                 },
-                [=](save_state_atom) -> std::vector<uint8_t> {
-                    std::vector<uint8_t> data(sizeof(int));
+                [=](save_state_atom) -> std::vector<std::byte> {
+                    std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &self->state, sizeof(int));
                     return data;
                 },
-                [=](restore_state_atom, const std::vector<uint8_t>& data) {
+                [=](restore_state_atom, const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
                         std::memcpy(&self->state, data.data(), sizeof(int));
                         std::cout << "[Logger] Restored count=" << self->state << std::endl;

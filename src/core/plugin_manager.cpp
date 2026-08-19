@@ -17,8 +17,9 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
                 return caf::make_error(caf::sec::invalid_argument, "Failed to load library");
             }
 
-            auto create = lib_opt->symbol<PluginEntry>("create_plugin");
-            auto destroy = lib_opt->symbol<void>("destroy_plugin");
+            // 正确获取函数指针：类型必须是函数签名，不能是类或 void
+            auto create  = lib_opt->symbol<CreatePluginFunc>("create_plugin");
+            auto destroy = lib_opt->symbol<DestroyPluginFunc>("destroy_plugin");
             if (!create || !destroy) {
                 return false;
             }
@@ -49,7 +50,7 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
 
             auto state_data = self->request(checkpoint_mgr_, std::chrono::seconds(2),
                                            restore_state_atom::value, name)
-                .receive([](const std::vector<uint8_t>& d) { return d; }, [](auto) { return std::vector<uint8_t>{}; });
+                .receive([](const std::vector<std::byte>& d) { return d; }, [](auto) { return std::vector<std::byte>{}; });
 
             auto actor = plugin->spawn(self->system(), deps, "");
 
@@ -64,7 +65,10 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
                 self->send(registry_, register_atom::value, svc, actor, name);
             }
 
-            plugins_[name] = LoadedPlugin{std::move(*lib_opt), plugin, actor, manifest};
+            // 缓存 destroy 函数，卸载时直接用，不用再次 dlsym
+            plugins_[name] = LoadedPlugin{
+                std::move(*lib_opt), plugin, actor, manifest, destroy
+            };
             std::cout << "[PluginManager] Loaded: " << name << std::endl;
             return true;
         },
@@ -75,8 +79,10 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
 
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
 
-            auto destroy = it->second.lib.symbol<void>("destroy_plugin");
-            if (destroy) destroy(it->second.instance);
+            // 使用缓存的 destroy 函数
+            if (it->second.destroy) {
+                it->second.destroy(it->second.instance);
+            }
             plugins_.erase(it);
             return true;
         },
@@ -96,8 +102,10 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
                     std::cout << "[PluginManager] Plugin crashed: " << it->first << std::endl;
-                    auto destroy = it->second.lib.symbol<void>("destroy_plugin");
-                    if (destroy) destroy(it->second.instance);
+                    // 使用缓存的 destroy 函数
+                    if (it->second.destroy) {
+                        it->second.destroy(it->second.instance);
+                    }
                     plugins_.erase(it);
                     break;
                 }

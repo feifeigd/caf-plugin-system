@@ -41,7 +41,7 @@ auto GracefulShutdown::make_behavior(caf::event_based_actor* self,
                             self->send(actor, drain_atom::value, self);
                             self->request(actor, config_.plugin_stop_timeout, save_state_atom::value)
                                 .then(
-                                    [=](const std::vector<uint8_t>& data) {
+                                    [=](const std::vector<std::byte>& data) {
                                         if (!data.empty()) {
                                             self->request(checkpoint_mgr, std::chrono::seconds(10),
                                                          save_state_atom::value, name, data)
@@ -78,7 +78,7 @@ auto GracefulShutdown::make_behavior(caf::event_based_actor* self,
                             self->send(actor, drain_atom::value, self);
                             self->request(actor, config_.plugin_stop_timeout, save_state_atom::value)
                                 .then(
-                                    [=](const std::vector<uint8_t>& data) {
+                                    [=](const std::vector<std::byte>& data) {
                                         if (!data.empty()) {
                                             self->request(checkpoint_mgr, std::chrono::seconds(10),
                                                          save_state_atom::value, name, data)
