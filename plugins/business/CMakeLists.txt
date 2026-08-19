@@ -1,26 +1,19 @@
-cmake_minimum_required(VERSION 3.20)
-project(business_plugin LANGUAGES CXX)
+# plugins/business/CMakeLists.txt
+# 构建 Business 插件（动态库）
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_library(business_plugin SHARED
+    business_plugin.cpp
+)
 
-find_package(CAF REQUIRED COMPONENTS core)
+target_link_libraries(business_plugin PRIVATE caf_plugin_core)
 
-add_library(business_plugin SHARED business_plugin.cpp)
-target_include_directories(business_plugin PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
-target_link_libraries(business_plugin PRIVATE CAF::core)
+set_target_properties(business_plugin PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/business"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/business"
+)
 
 if(WIN32)
-  set_target_properties(business_plugin PROPERTIES
-    PREFIX ""
-    RUNTIME_OUTPUT_NAME "business_plugin"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/business"
-  )
+    set_target_properties(business_plugin PROPERTIES PREFIX "")
 else()
-  set_target_properties(business_plugin PROPERTIES
-    PREFIX "lib"
-    OUTPUT_NAME "business_plugin"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/business"
-  )
+    set_target_properties(business_plugin PROPERTIES PREFIX "lib")
 endif()

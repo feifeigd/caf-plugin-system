@@ -1,26 +1,23 @@
-cmake_minimum_required(VERSION 3.20)
-project(logger_plugin LANGUAGES CXX)
+# plugins/logger/CMakeLists.txt
+# 构建 Logger 插件（动态库）
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# 创建 SHARED 动态库（.dll / .so / .dylib）
+add_library(logger_plugin SHARED
+    logger_plugin.cpp
+)
 
-find_package(CAF REQUIRED COMPONENTS core)
+# 链接父目录已定义的核心库（自动继承 include 路径和 CAF 依赖）
+target_link_libraries(logger_plugin PRIVATE caf_plugin_core)
 
-add_library(logger_plugin SHARED logger_plugin.cpp)
-target_include_directories(logger_plugin PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
-target_link_libraries(logger_plugin PRIVATE CAF::core)
-
-if(WIN32)
-  set_target_properties(logger_plugin PROPERTIES
-    PREFIX ""
-    RUNTIME_OUTPUT_NAME "logger_plugin"
+# 统一输出到 build/plugins/logger/
+set_target_properties(logger_plugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/logger"
-  )
-else()
-  set_target_properties(logger_plugin PROPERTIES
-    PREFIX "lib"
-    OUTPUT_NAME "logger_plugin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins/logger"
-  )
+)
+
+# Windows: 去掉 lib 前缀，保持 logger_plugin.dll
+if(WIN32)
+    set_target_properties(logger_plugin PROPERTIES PREFIX "")
+else()
+    set_target_properties(logger_plugin PROPERTIES PREFIX "lib")
 endif()
