@@ -1,0 +1,69 @@
+name: Build on Linux
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build g++ build-essential
+
+    - name: Setup vcpkg
+      run: |
+        git clone https://github.com/microsoft/vcpkg.git $HOME/vcpkg
+        $HOME/vcpkg/bootstrap-vcpkg.sh
+        echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+
+    - name: Cache vcpkg packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_ROOT }}/installed
+          ${{ github.workspace }}/vcpkg_installed
+        key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          vcpkg-${{ runner.os }}-
+
+    - name: Install vcpkg dependencies
+      run: |
+        $HOME/vcpkg/vcpkg install --triplet=x64-linux
+
+    - name: Configure CMake (Release)
+      run: |
+        cmake -B build \
+          -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DCMAKE_CXX_STANDARD=20
+
+    - name: Build (Release)
+      run: cmake --build build --config Release --parallel $(nproc)
+
+    - name: Run tests
+      run: ctest --test-dir build --output-on-failure
+
+    - name: Configure CMake (Debug)
+      run: |
+        cmake -B build-debug \
+          -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DCMAKE_CXX_STANDARD=20
+
+    - name: Build (Debug)
+      run: cmake --build build-debug --config Debug --parallel $(nproc)
