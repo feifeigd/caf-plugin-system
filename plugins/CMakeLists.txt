@@ -4,4 +4,3 @@
 add_subdirectory(logger)
 add_subdirectory(business)
 add_subdirectory(platform)
-add_subdirectory(business)
