@@ -8,7 +8,9 @@
 //   X_REG(键名, (已有类型), type_id, "显示名")    只注册已有类型（枚举 / STL 容器）
 //
 // 维护规则：
-//   1. 新条目只能追加到表尾，ID = 当前最大 ID + 1；禁止插入中间、禁止复用。
+//   1. 【开发期】首个对外发布之前 ID 未冻结：允许删除条目、整体重排，前提是
+//      exe 与全部插件 DLL 同批重编（本来就必须同版本构建）。对外发布后转为
+//      只追加规则：新条目只能追加到表尾，ID = 当前最大 ID + 1，禁止复用。
 //      元对象表按列表位置一一对应 first_custom_type_id + i，
 //      message_meta.hpp 里有 static_assert 强制校验顺序与 ID 一致。
 //   2. 显式 ID 与包含顺序无关：exe 和各插件 DLL 各自编译本列表，ID 永远一致
@@ -50,29 +52,27 @@ X_TAG(resolve_atom, 218)
 X_TAG(list_services_atom, 219)
 X_TAG(hot_reload_atom, 220)
 X_TAG(unregister_atom, 221)
-X_TAG(switch_target_atom, 222)   // 已弃用：被 quiesce/resume 取代（ID 保留不复用）
-X_TAG(force_cleanup_atom, 223)   // 已弃用：同上（ID 保留不复用）
 
 // -- 服务契约（include/services/）-----------------------------------
-X_TAG(get_config_atom, 224)
-X_TAG(set_config_atom, 225)
-X_TAG(log_atom, 226)
-X_TAG(report_metric_atom, 227)
-X_TAG(get_metrics_atom, 228)
+X_TAG(get_config_atom, 222)
+X_TAG(set_config_atom, 223)
+X_TAG(log_atom, 224)
+X_TAG(report_metric_atom, 225)
+X_TAG(get_metrics_atom, 226)
 
 // -- 消息中使用的 STL 容器类型（CAF 内置列表未覆盖）------------------
-X_REG(vec_string, (std::vector<std::string>), 229, "std::vector<std::string>")
-X_REG(map_string_int, (std::map<std::string, int>), 230, "std::map<std::string, int>")
+X_REG(vec_string, (std::vector<std::string>), 227, "std::vector<std::string>")
+X_REG(map_string_int, (std::map<std::string, int>), 228, "std::map<std::string, int>")
 
 // -- 插件私有子协议的公共信封（利弊见 common/plugin_envelope.hpp 头注释）--
-X_REG(plugin_envelope, (plugin_envelope), 231, "plugin_envelope")
+X_REG(plugin_envelope, (plugin_envelope), 229, "plugin_envelope")
 
 // -- 服务代理 ACL（见 docs/plugin-guide.md §6）------------------------
 // （std::vector<caf::actor_addr> 是 CAF 内置注册类型，无需自行注册）
-X_TAG(set_service_acl_atom, 232)
-X_TAG(set_acl_atom, 233)
+X_TAG(set_service_acl_atom, 230)
+X_TAG(set_acl_atom, 231)
 
 // -- 旁路热更新（见 docs/plugin-guide.md §8）--------------------------
-X_TAG(reload_atom, 234)
-X_TAG(quiesce_atom, 235)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
-X_TAG(resume_atom, 236)    // 代理恢复：切换到新实现并冲刷缓冲
+X_TAG(reload_atom, 232)
+X_TAG(quiesce_atom, 233)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
+X_TAG(resume_atom, 234)    // 代理恢复：切换到新实现并冲刷缓冲

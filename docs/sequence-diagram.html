@@ -170,36 +170,37 @@ sequenceDiagram
     actor Admin as 管理员/触发器
     participant PM as PluginManager
     participant SR as ServiceRegistry
-    participant OldProxy as Proxy(v1)
+    participant Proxy as ServiceProxy
     participant OldLP as LoggerPlugin v1
     participant NewLP as LoggerPlugin v2
 
-    Admin->>PM: hot reload "LoggerPlugin"
-    PM->>PM: unload old, load new
-    PM->>NewLP: spawn LoggerPlugin v2
-    PM->>NewLP: send(init_atom, PM, "")
+    Admin->>PM: reload("LoggerPlugin", path_v2)
+    PM->>PM: 加载新 DLL、创建插件实例（先不 spawn）
+
+    PM->>Proxy: request(quiesce_atom)
+    Note over Proxy: 进入 paused：新调用连同 promise 一起缓冲<br/>ack 之前的调用已全部委托给 v1（邮箱 FIFO 保证）
+    Proxy-->>PM: true（已静默）
+
+    PM->>OldLP: request(save_state_atom)
+    Note over OldLP: 邮箱到达序屏障：响应时<br/>全部在途工作已处理完
+    OldLP-->>PM: state bytes（快照即终态）
+
+    PM->>NewLP: spawn v2 + restore(state) + init
     NewLP-->>PM: init done
 
-    PM->>SR: hot_reload("logging_service", NewLP)
-    SR->>OldProxy: switch_target(NewLP, v2)
-    OldProxy->>OldProxy: current = NewLP, old = OldLP
-    OldProxy->>OldLP: send(drain_done, OldProxy)
-    Note over OldProxy: 新请求 → NewLP<br/>旧请求继续由 OldLP 处理完
+    PM->>SR: hot_reload("logging_service", NewLP)（台账）
+    PM->>Proxy: send(resume_atom, NewLP)
+    Note over Proxy: 切到 v2 并冲刷缓冲<br/>ACL 按原始调用方复查
 
-    loop 等待旧版本 drain 完成
-        OldLP-->>OldProxy: drain_done ack
-    end
+    PM->>OldLP: delayed_send(shutdown_atom, 2s)
+    PM->>PM: down_msg → destroy 旧实例
+    Note over OldLP: v1 安全退役
 
-    OldProxy->>OldProxy: old = nullptr
-    PM->>OldLP: send_exit(shutdown)
-    PM->>OldLP: destroy_plugin()
-    Note over OldLP: v1 安全退出
-
-    BusinessPlugin->>OldProxy: send(log_atom, ...)
-    OldProxy->>NewLP: forward to v2
+    BusinessPlugin->>Proxy: send(log_atom, ...)
+    Proxy->>NewLP: forward to v2
   </div>
   <div class="note">
-    💡 <strong>零停机热重载：</strong>Proxy 先把新请求路由到 v2，等 v1 的<strong>在途请求全部处理完</strong>后再退出 v1。BusinessPlugin 整个过程完全无感知。
+    💡 <strong>零停机热重载（先排空后快照）：</strong>Proxy 先静默并把新调用缓冲起来（调用方无感知、请求不丢失），等 v1 处理完在途工作后快照状态并移交 v2，再恢复流量冲刷缓冲；v1 随后安全退出。BusinessPlugin 整个过程完全无感知。
   </div>
 </div>
 
