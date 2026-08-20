@@ -6,5 +6,11 @@
     "caf",
     "spdlog",
     "fmt"
+  ],
+  "overrides": [
+    {
+      "name": "caf",
+      "version": "1.1.0"
+    }
   ]
 }

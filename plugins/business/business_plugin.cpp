@@ -6,10 +6,6 @@
 #include <cstring>
 
 class BusinessPlugin : public PluginEntry {
-
-#define PLUGIN_NAME "business"
-
-class BusinessPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"BusinessPlugin", "2.0.0", {"logging_service"}, {"business_service"}};
