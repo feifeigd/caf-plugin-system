@@ -1,0 +1,76 @@
+// 消息标签 / 自定义消息类型的唯一数据源（X-macro 列表）
+// ------------------------------------------------------------------
+// 本文件不是普通头文件：没有 include guard，由 message_tags.hpp 和
+// message_meta.hpp 各自定义 X_TAG / X_REG 后多次包含，展开成不同代码。
+//
+// 两种条目：
+//   X_TAG(标签名, type_id)                        定义空标签结构体并注册到 CAF
+//   X_REG(键名, (已有类型), type_id, "显示名")    只注册已有类型（枚举 / STL 容器）
+//
+// 维护规则：
+//   1. 新条目只能追加到表尾，ID = 当前最大 ID + 1；禁止插入中间、禁止复用。
+//      元对象表按列表位置一一对应 first_custom_type_id + i，
+//      message_meta.hpp 里有 static_assert 强制校验顺序与 ID 一致。
+//   2. 显式 ID 与包含顺序无关：exe 和各插件 DLL 各自编译本列表，ID 永远一致
+//      （顺序敏感的 CAF_ADD_TYPE_ID/__COUNTER__ 方案在跨 DLL 场景下不安全）。
+//   3. 重复 ID 会导致 type_by_id<ID> 重定义，编译期直接报错。
+//   4. 本文件只收内核/框架级协议类型（ID 200~999）。插件私有的消息类型
+//      不收进本文件：系统级占 1000~4999、用户级占 5000+（权限分级见
+//      docs/plugin-guide.md §6），各插件自选互不重叠的段，并通过自己的
+//      register_meta_objects 导出自注册元对象（见 plugin_interface.hpp），
+//      这样新增插件私有类型不需要修改、重编内核。
+// ------------------------------------------------------------------
+
+// -- GracefulShutdown / 生命周期协议（graceful_shutdown.hpp）---------
+X_TAG(shutdown_atom, 200)
+X_TAG(drain_atom, 201)
+X_TAG(force_exit_atom, 202)
+X_TAG(ready_atom, 203)
+X_TAG(health_check_atom, 204)
+X_TAG(plugin_saved_atom, 205)
+X_TAG(request_shutdown_atom, 206)
+X_REG(SystemState, (SystemState), 207, "SystemState")
+
+// -- CheckpointManager（checkpoint_manager.hpp）---------------------
+X_TAG(save_state_atom, 208)
+X_TAG(restore_state_atom, 209)
+
+// -- PluginManager（plugin_manager.hpp）-----------------------------
+X_TAG(load_atom, 210)
+X_TAG(unload_atom, 211)
+X_TAG(list_atom, 212)
+X_TAG(resolve_plugin_atom, 213)
+X_TAG(ping_atom, 214)
+X_TAG(pong_atom, 215)
+X_TAG(init_atom, 216)
+
+// -- ServiceRegistry（service_registry.hpp）-------------------------
+X_TAG(register_atom, 217)
+X_TAG(resolve_atom, 218)
+X_TAG(list_services_atom, 219)
+X_TAG(hot_reload_atom, 220)
+X_TAG(unregister_atom, 221)
+X_TAG(switch_target_atom, 222)
+X_TAG(force_cleanup_atom, 223)
+
+// -- 服务契约（include/services/）-----------------------------------
+X_TAG(get_config_atom, 224)
+X_TAG(set_config_atom, 225)
+X_TAG(log_atom, 226)
+X_TAG(report_metric_atom, 227)
+X_TAG(get_metrics_atom, 228)
+
+// -- 消息中使用的 STL 容器类型（CAF 内置列表未覆盖）------------------
+X_REG(vec_string, (std::vector<std::string>), 229, "std::vector<std::string>")
+X_REG(map_string_int, (std::map<std::string, int>), 230, "std::map<std::string, int>")
+
+// -- 插件私有子协议的公共信封（利弊见 common/plugin_envelope.hpp 头注释）--
+X_REG(plugin_envelope, (plugin_envelope), 231, "plugin_envelope")
+
+// -- 服务代理 ACL（见 docs/plugin-guide.md §6）------------------------
+// （std::vector<caf::actor_addr> 是 CAF 内置注册类型，无需自行注册）
+X_TAG(set_service_acl_atom, 232)
+X_TAG(set_acl_atom, 233)
+
+// -- 旁路热更新（见 docs/plugin-guide.md §8）--------------------------
+X_TAG(reload_atom, 234)
