@@ -77,6 +77,11 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             auto it = plugins_.find(name);
             if (it == plugins_.end()) return false;
 
+            // 注销该插件提供的所有服务
+            for (const auto& svc : it->second.manifest.provides) {
+                self->send(registry_, unregister_atom::value, svc);
+            }
+
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
 
             // 使用缓存的 destroy 函数
@@ -118,6 +123,12 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
                     std::cout << "[PluginManager] Plugin crashed: " << it->first << std::endl;
+
+                    // 注销该插件提供的所有服务
+                    for (const auto& svc : it->second.manifest.provides) {
+                        self->send(registry_, unregister_atom::value, svc);
+                    }
+
                     // 使用缓存的 destroy 函数
                     if (it->second.destroy) {
                         it->second.destroy(it->second.instance);

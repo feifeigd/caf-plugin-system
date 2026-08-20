@@ -48,22 +48,42 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
 auto ServiceRegistry::make_behavior(caf::event_based_actor* self) {
     return caf::behavior{
         [=](register_atom, const std::string& name, caf::actor impl,
-            const std::string& plugin) {
+            const std::string& plugin) -> caf::result<void> {
+            if (self->state.count(name)) {
+                return caf::make_error(caf::sec::invalid_argument,
+                    "Service already registered: " + name +
+                    ". Use hot_reload to switch implementation.");
+            }
             auto proxy = spawn_service_proxy(self->system(), impl);
             VersionedEntry entry{name, proxy, impl, 1, plugin};
             self->state[name] = std::move(entry);
             std::cout << "[Registry] Registered: " << name << " (v1)" << std::endl;
+            return {};
         },
 
-        [=](hot_reload_atom, const std::string& name, caf::actor new_impl) -> bool {
+        [=](hot_reload_atom, const std::string& name, caf::actor new_impl) -> caf::result<bool> {
             auto it = self->state.find(name);
-            if (it == self->state.end()) return false;
+            if (it == self->state.end()) {
+                return caf::make_error(caf::sec::invalid_argument,
+                    "Service not found: " + name + ". Register first.");
+            }
 
             auto& entry = it->second;
             entry.version++;
             self->send(entry.proxy, switch_target_atom::value, new_impl, entry.version);
             entry.impl = new_impl;
             std::cout << "[Registry] Hot-reloaded: " << name << " (v" << entry.version << ")" << std::endl;
+            return true;
+        },
+
+        [=](unregister_atom, const std::string& name) -> bool {
+            auto it = self->state.find(name);
+            if (it == self->state.end()) return false;
+
+            // 安全退出 proxy，通知所有调用方
+            self->send_exit(it->second.proxy, caf::exit_reason::user_shutdown);
+            self->state.erase(it);
+            std::cout << "[Registry] Unregistered: " << name << std::endl;
             return true;
         },
 

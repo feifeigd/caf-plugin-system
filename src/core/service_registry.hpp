@@ -7,6 +7,7 @@ using register_atom = caf::atom_constant<caf::atom("register")>;
 using resolve_atom = caf::atom_constant<caf::atom("resolve")>;
 using list_services_atom = caf::atom_constant<caf::atom("ls")>;
 using hot_reload_atom = caf::atom_constant<caf::atom("reload")>;
+using unregister_atom = caf::atom_constant<caf::atom("unreg")>;
 using switch_target_atom = caf::atom_constant<caf::atom("swtch")>;
 using drain_done_atom = caf::atom_constant<caf::atom("drain")>;
 using force_cleanup_atom = caf::atom_constant<caf::atom("fcln")>;
