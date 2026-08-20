@@ -37,6 +37,11 @@ find_package(CAF REQUIRED COMPONENTS core)
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 
+# 启用 CAF 框架日志（所有级别）
+add_compile_definitions(CAF_LOG_LEVEL=CAF_LOG_LEVEL_DEBUG)
+find_package(spdlog CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+
 # Core library + Main executable
 add_subdirectory(src)
 

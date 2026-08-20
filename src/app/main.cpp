@@ -1,4 +1,5 @@
 #include <caf/all.hpp>
+#include <caf/logger.hpp>
 #include <iostream>
 #include <thread>
 #include <filesystem>
@@ -37,7 +38,7 @@ void signal_handler(int) {
 #endif
 
 // ------------------------------------------------------------------
-// CAF 配置
+// CAF 配置：同时启用 CAF 自带 logger（框架级）和 spdlog（业务级）
 // ------------------------------------------------------------------
 
 struct app_config : caf::actor_system_config {
@@ -45,6 +46,12 @@ struct app_config : caf::actor_system_config {
     std::vector<std::string> shutdown_order;
 
     app_config() {
+        // CAF 框架日志配置：控制台 + 文件双输出
+        set("logger.console-verbosity", "info");
+        set("logger.file-verbosity", "debug");
+        set("logger.file-name", "logs/caf-framework.log");
+        set("logger.console", "colored");  // 带颜色的控制台输出
+
         opt_group{custom_options_, "caf-plugin-system"}
             .add(entry_plugins, "entry-plugins,e", "entry plugins to auto-load with deps")
             .add(shutdown_order, "shutdown-order,s", "plugin shutdown order (reverse topo if empty)");
@@ -54,6 +61,8 @@ struct app_config : caf::actor_system_config {
 // ------------------------------------------------------------------
 
 void caf_main(caf::actor_system& sys, const app_config& cfg) {
+    CAF_LOG_INFO("framework startup begin");
+
     auto registry = sys.spawn<ServiceRegistry>();
     auto checkpoint_mgr = sys.spawn<CheckpointManager>(std::filesystem::path{"./checkpoints"});
     auto plugin_mgr = sys.spawn<PluginManager>(registry, checkpoint_mgr);
@@ -67,11 +76,6 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         ShutdownConfig{},
         plugin_mgr, registry, checkpoint_mgr, get_stop_order);
 
-    // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
-    self->send(plugin_mgr, shutdown_atom::value, g_shutdown_mgr);
-        ShutdownConfig{},
-        plugin_mgr, registry, checkpoint_mgr, get_stop_order);
-
 #ifdef _WIN32
     SetConsoleCtrlHandler(console_handler, TRUE);
 #else
@@ -81,51 +85,60 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
 
     caf::scoped_actor self{sys};
 
+    // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
+    self->send(plugin_mgr, shutdown_atom::value, g_shutdown_mgr);
+
     // ---- 第 1 步：从 CAF 配置读取入口插件 ----
     if (cfg.entry_plugins.empty()) {
-        std::cerr << "[Init] No entry plugins configured. Use --caf-plugin-system.entry-plugins=PluginA,PluginB"
-                  << " or --config-file=app.ini" << std::endl;
+        CAF_LOG_ERROR("No entry plugins configured. Use --caf-plugin-system.entry-plugins=PluginA,PluginB"
+                      " or --config-file=app.ini");
         self->send(g_shutdown_mgr, shutdown_atom::value);
         return;
     }
 
-    std::cout << "[Init] Entry plugins:";
-    for (const auto& name : cfg.entry_plugins) std::cout << " " << name;
-    std::cout << std::endl;
+    CAF_LOG_INFO("Entry plugins:" << [&]() {
+        std::string s;
+        for (const auto& name : cfg.entry_plugins) s += " " + name;
+        return s;
+    }());
 
     // ---- 第 2 步：扫描所有插件，获取 manifest ----
     auto all_plugins = scan_all_plugins("./plugins");
     if (all_plugins.empty()) {
-        std::cerr << "[Init] No plugins found in ./plugins/" << std::endl;
+        CAF_LOG_ERROR("No plugins found in ./plugins/");
         self->send(g_shutdown_mgr, shutdown_atom::value);
         return;
     }
 
-    std::cout << "[Init] Scanned " << all_plugins.size() << " plugin(s) in ./plugins/" << std::endl;
+    CAF_LOG_INFO("Scanned " << all_plugins.size() << " plugin(s) in ./plugins/");
 
     // ---- 第 3 步：从入口出发，自动解析依赖链 ----
     auto required = resolve_dependencies(cfg.entry_plugins, all_plugins);
     if (required.empty()) {
-        std::cerr << "[Init] Failed to resolve dependencies" << std::endl;
+        CAF_LOG_ERROR("Failed to resolve dependencies");
         self->send(g_shutdown_mgr, shutdown_atom::value);
         return;
     }
 
-    std::cout << "[Init] Resolved " << required.size() << " plugin(s) to load:";
-    for (const auto& p : required) std::cout << " " << p.name;
-    std::cout << std::endl;
+    CAF_LOG_INFO("Resolved " << required.size() << " plugin(s) to load:" << [&]() {
+        std::string s;
+        for (const auto& p : required) s += " " + p.name;
+        return s;
+    }());
 
     // ---- 第 4 步：拓扑排序 ----
     auto load_order = compute_load_order(required);
     if (load_order.empty()) {
-        std::cerr << "[Init] Circular dependency detected" << std::endl;
+        CAF_LOG_ERROR("Circular dependency detected");
         self->send(g_shutdown_mgr, shutdown_atom::value);
         return;
     }
 
-    std::cout << "[Init] Load order:";
-    for (const auto& name : load_order) std::cout << " " << name;
-    std::cout << std::endl;
+    CAF_LOG_INFO("Load order:" << [&]() {
+        std::string s;
+        for (const auto& name : load_order) s += " " + name;
+        return s;
+    }());
 
     // ---- 第 5 步：按序加载 ----
     std::unordered_map<std::string, PluginInfo> info_map;
@@ -135,8 +148,8 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         auto it = info_map.find(name);
         if (it == info_map.end()) continue;
         self->request(plugin_mgr, caf::infinite, load_atom::value, name, it->second.path.string())
-            .receive([](bool ok) { std::cout << "Load: " << ok << std::endl; },
-                     [](const caf::error& e) { std::cerr << "Load err: " << to_string(e) << std::endl; });
+            .receive([](bool ok) { CAF_LOG_INFO("Load result: " << ok); },
+                     [](const caf::error& e) { CAF_LOG_ERROR("Load err: " << to_string(e)); });
     }
 
     bool healthy = true;
@@ -147,14 +160,16 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     }
 
     if (!healthy) {
+        CAF_LOG_ERROR("One or more plugins failed to resolve");
         self->send(g_shutdown_mgr, shutdown_atom::value);
         return;
     }
 
     self->send(g_shutdown_mgr, ready_atom::value);
-    std::cout << "[System] Startup complete. Press Ctrl+C to shutdown." << std::endl;
+    CAF_LOG_INFO("Startup complete. Press Ctrl+C to shutdown.");
 
     self->wait_for(g_shutdown_mgr);
+    CAF_LOG_INFO("framework shutdown complete");
 }
 
 // 手写 main，避免 CAF_MAIN 宏的 id_block 限制

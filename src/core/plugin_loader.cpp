@@ -1,4 +1,5 @@
 #include "plugin_loader.hpp"
+#include <caf/logger.hpp>
 #include <iostream>
 #include <unordered_set>
 #include <algorithm>
@@ -16,12 +17,22 @@ std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path) {
     auto manifest = plugin->manifest();
     destroy(plugin);
 
+    CAF_LOG_INFO("Probed plugin: " << manifest.name
+                 << " version=" << manifest.version
+                 << " deps=" << manifest.dependencies.size()
+                 << " provides=" << manifest.provides.size());
+
     return PluginInfo{manifest.name, path, manifest};
 }
 
 std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root) {
     std::vector<PluginInfo> result;
-    if (!std::filesystem::exists(root)) return result;
+    if (!std::filesystem::exists(root)) {
+        CAF_LOG_WARN("Plugin directory not found: " << root.string());
+        return result;
+    }
+
+    CAF_LOG_INFO("Scanning plugin directory: " << root.string());
 
     for (const auto& entry : std::filesystem::directory_iterator(root)) {
         if (!entry.is_directory()) continue;
@@ -37,6 +48,8 @@ std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root) {
             }
         }
     }
+
+    CAF_LOG_INFO("Scan complete: " << result.size() << " plugin(s) found");
     return result;
 }
 
@@ -69,7 +82,7 @@ std::vector<PluginInfo> resolve_dependencies(
 
         auto it = plugin_map.find(name);
         if (it == plugin_map.end()) {
-            std::cerr << "[Deps] Unknown plugin: " << name << std::endl;
+            CAF_LOG_ERROR("Unknown plugin: " << name);
             continue;
         }
 
@@ -78,14 +91,16 @@ std::vector<PluginInfo> resolve_dependencies(
         for (const auto& dep_svc : it->second->manifest.dependencies) {
             auto svc_it = service_to_plugin.find(dep_svc);
             if (svc_it == service_to_plugin.end()) {
-                std::cerr << "[Deps] No provider for service: " << dep_svc
-                          << " (required by " << name << ")" << std::endl;
+                CAF_LOG_ERROR("No provider for service: " << dep_svc
+                              << " (required by " << name << ")");
                 continue;
             }
             stack.push_back(svc_it->second);
         }
     }
 
+    CAF_LOG_INFO("Resolved " << resolved.size() << " plugin(s) from "
+                 << entry_plugins.size() << " entry point(s)");
     return resolved;
 }
 
@@ -103,10 +118,12 @@ std::vector<std::string> compute_load_order(const std::vector<PluginInfo>& plugi
 
     for (const auto& p : plugins) {
         if (graph.has_cycle_from(p.name)) {
-            std::cerr << "[Init] Circular dependency: " << p.name << std::endl;
+            CAF_LOG_ERROR("Circular dependency detected involving: " << p.name);
             return {};
         }
     }
 
-    return graph.topological_order();
+    auto order = graph.topological_order();
+    CAF_LOG_INFO("Computed load order: " << order.size() << " plugin(s)");
+    return order;
 }
