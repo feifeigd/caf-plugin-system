@@ -97,5 +97,22 @@ jobs:
 
     - name: Run tests (Debug)
       run: |
+        echo "=== vcpkg debug libs ==="
+        ls -la ${{ env.VCPKG_ROOT }}/installed/x64-linux/debug/lib/ || true
+        echo "=== vcpkg release libs ==="
+        ls -la ${{ env.VCPKG_ROOT }}/installed/x64-linux/lib/ || true
+        echo "=== ldd test executable ==="
+        ldd build-debug/tests/test_dependency_graph || true
+        echo "=== running tests ==="
+        export LD_LIBRARY_PATH=${{ env.VCPKG_ROOT }}/installed/x64-linux/debug/lib:${{ env.VCPKG_ROOT }}/installed/x64-linux/lib:$LD_LIBRARY_PATH
+        ctest --test-dir build-debug --output-on-failure 2>&1 | tee test-debug.log
+
+    - name: Upload debug test logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-debug
+        path: test-debug.log
+      run: |
         export LD_LIBRARY_PATH=${{ env.VCPKG_ROOT }}/installed/x64-linux/debug/lib:${{ env.VCPKG_ROOT }}/installed/x64-linux/lib:$LD_LIBRARY_PATH
         ctest --test-dir build-debug --output-on-failure
