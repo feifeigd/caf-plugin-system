@@ -41,6 +41,26 @@ public:
                 visit(node, visited, temp_mark, result);
             }
         }
+        // DFS 后序遍历：依赖先 push_back，自己后 push_back
+        // 对于 graph["Business"] = ["Logger"]，后序输出为 ["Logger", "Business"]
+        // 这正是正确的加载顺序（被依赖的先加载），无需 reverse
+        return result;
+    }
+
+    std::vector<std::string> reverse_topological_order() const {
+        auto order = topological_order();
+        std::reverse(order.begin(), order.end());
+        return order;
+    }
+        std::vector<std::string> result;
+        std::unordered_set<std::string> visited;
+        std::unordered_set<std::string> temp_mark; // 当前深度优先搜索栈
+
+        for (const auto& [node, _] : graph_) {
+            if (!visited.count(node)) {
+                visit(node, visited, temp_mark, result);
+            }
+        }
         std::reverse(result.begin(), result.end());
         return result;
     }
