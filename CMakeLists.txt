@@ -34,6 +34,8 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE OR NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}")
 endif()
 
 find_package(CAF REQUIRED COMPONENTS core)
+find_package(spdlog CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 
 # Core library + Main executable
 add_subdirectory(src)

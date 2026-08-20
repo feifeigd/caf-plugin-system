@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "Cross-platform plugin system based on CAF (C++ Actor Framework)",
   "dependencies": [
-    "caf"
+    "caf",
+    "spdlog",
+    "fmt"
   ]
 }

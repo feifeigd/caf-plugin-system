@@ -5,6 +5,8 @@
 #include <iostream>
 #include <cstring>
 
+#define PLUGIN_NAME "business"
+
 using init_atom          = caf::atom_constant<caf::atom("init")>;
 using drain_atom         = caf::atom_constant<caf::atom("drain")>;
 using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
@@ -28,25 +30,22 @@ public:
             return caf::behavior{
                 [=](init_atom, caf::actor manager, const std::string&) {
                     plugin_mgr = manager;
-                    std::cout << "[Business] Initialized" << std::endl;
-                    if (logger) self->send(logger, log_atom::value, "INFO", "Business started");
+                    LOG_INFO(logger, "BusinessPlugin initialized");
                 },
                 [=](const std::string& cmd) -> std::string {
                     self->state++;
                     if (cmd == "shutdown") {
                         if (plugin_mgr) {
                             self->send(plugin_mgr, request_shutdown_atom::value);
-                            std::cout << "[Business] Shutdown requested" << std::endl;
+                            LOG_INFO(logger, "Shutdown requested by command");
                         }
                         return "shutdown requested";
                     }
-                    if (logger) {
-                        self->send(logger, log_atom::value, "DEBUG", "Cmd: " + cmd);
-                    }
+                    LOG_DEBUG(logger, "Command received: {}", cmd);
                     return "processed: " + cmd;
                 },
                 [=](drain_atom, caf::actor coordinator) {
-                    std::cout << "[Business] Draining..." << std::endl;
+                    LOG_INFO(logger, "Draining...");
                     self->send(coordinator, drain_atom::value, self->address());
                 },
                 [=](save_state_atom) -> std::vector<std::byte> {
@@ -57,11 +56,11 @@ public:
                 [=](restore_state_atom, const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
                         std::memcpy(&self->state, data.data(), sizeof(int));
-                        std::cout << "[Business] Restored count=" << self->state << std::endl;
+                        LOG_INFO(logger, "Restored count={}", self->state);
                     }
                 },
                 [=](shutdown_atom) {
-                    std::cout << "[Business] Shutdown" << std::endl;
+                    LOG_INFO(logger, "Shutdown");
                     self->quit();
                 }
             };

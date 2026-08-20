@@ -15,11 +15,8 @@ target_include_directories(caf_plugin_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:include>
-)
 
-target_link_libraries(caf_plugin_core PUBLIC CAF::core)
+target_link_libraries(caf_plugin_core PUBLIC CAF::core fmt::fmt)
 
 if(WIN32)
     target_link_libraries(caf_plugin_core PRIVATE kernel32)
