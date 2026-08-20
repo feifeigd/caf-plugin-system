@@ -2,6 +2,7 @@
 #include <caf/init_global_meta_objects.hpp>
 #include <caf/logger.hpp>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <filesystem>
 #include <vector>
@@ -196,9 +197,23 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
                                   << caf::to_string(e) << std::endl;
                     });
         }
+        // 缓冲路径的确定性验证：先手动 quiesce 代理，再挂起一个 request——
+        // 它进入代理缓冲，等 reload 内部 resume 冲刷时才被处理（main 不在
+        // ACL 白名单，冲刷复查时被拦）。响应在 reload 完成后才到达，即为
+        // "曾进入缓冲"的时序证据；代理日志应显示 flushing 1 buffered。
+        using buffered_req_t = decltype(self->request(
+            biz_proxy, std::chrono::seconds(5), std::string("")));
+        std::optional<buffered_req_t> pending;
+        if (biz_proxy) {
+            self->request(biz_proxy, std::chrono::seconds(2), quiesce_atom{})
+                .receive([](bool) {}, [](caf::error&) {});
+            pending.emplace(self->request(biz_proxy, std::chrono::seconds(5),
+                                          std::string("buffered-hello")));
+        }
         // 热更新自测：从【旁路新路径】加载 BusinessPlugin v2（同一份源码加
         // BIZ_HOT_V2 编出，绕过 Windows 文件锁与 LoadLibrary 路径缓存）。
-        // 期望链路：reload → 状态内存移交 → 代理热切换 → 旧实例排空退役。
+        // 期望链路：quiesce 静默 → 状态内存移交（先排空后快照，无丢失窗口）
+        // → resume 热切换 + 冲刷缓冲 → 旧实例退役。
         self->request(plugin_mgr, caf::infinite, reload_atom{},
                       std::string("BusinessPlugin"),
                       std::string("./updates/business_plugin_v2.dll"))
@@ -209,6 +224,17 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
                          std::cout << "[HotUpdate] reload error: "
                                    << caf::to_string(e) << std::endl;
                      });
+        // 收缓冲验证的响应：只有代理 resume 冲刷后才会到达
+        if (pending) {
+            pending->receive(
+                [](const std::string& r) {
+                    std::cout << "[HotUpdate] buffered response: " << r << std::endl;
+                },
+                [](const caf::error& e) {
+                    std::cout << "[HotUpdate] buffered call resolved post-reload: "
+                              << caf::to_string(e) << std::endl;
+                });
+        }
         // 验证新代码：直连插件 actor（不经服务代理，不受 ACL 约束）
         caf::actor biz;
         self->request(plugin_mgr, caf::infinite, resolve_plugin_atom{}, "BusinessPlugin")

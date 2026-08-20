@@ -136,7 +136,17 @@ caf::behavior PluginManager::make_behavior() {
         },
 
         // 旁路热更新（docs/plugin-guide.md §8）：从【新路径】加载同名插件的
-        // 新版本，状态从旧 actor 直接移交，服务代理切换到新 actor。
+        // 新版本。流程（先排空后快照，无状态丢失窗口）：
+        //   1. 准备：新 DLL 校验、依赖解析（失败时尚未动旧实现，直接返回）；
+        //   2. quiesce 该插件所有服务的代理并等 ack——代理邮箱 FIFO 保证
+        //      ack 之前到达的调用都已委托给旧 actor（失败则把已静默的代理
+        //      resume 回旧实现，回滚）；
+        //   3. 对旧 actor request save_state：邮箱到达序屏障，响应时旧 actor
+        //      已处理完全部在途工作，且代理已静默不会有新工作——快照即终态；
+        //   4. spawn 新 actor + restore + monitor + init；
+        //   5. registry 台账（hot_reload_atom）→ resume 代理（切目标+冲刷
+        //      缓冲，ACL 按原始 sender 复查）；
+        //   6. 旧实例退役：邮箱已空，2s 后 shutdown，down_msg 销毁实例。
         // 约束：
         //   - 新代码必须在新文件/新路径：Windows 对已加载 DLL 有文件锁，
         //     且 LoadLibrary 对同路径返回缓存的旧模块，拿不到新代码；
@@ -189,7 +199,33 @@ caf::behavior PluginManager::make_behavior() {
                 deps.push_back(dep_actor);
             }
 
-            // 状态移交：直接向旧 actor 要（内存移交，不走 checkpoint 磁盘）
+            // 静默该插件全部服务的代理；任一失败则把已静默的代理恢复回
+            // 旧实现（回滚），旧服务不受半截热更新影响
+            std::vector<caf::actor> proxies;
+            for (const auto& svc : it->second.manifest.provides) {
+                caf::actor proxy;
+                blocking->request(registry_, caf::infinite, resolve_atom{}, svc)
+                    .receive([&proxy](const caf::actor& a) { proxy = a; },
+                             [](caf::error&) {});
+                bool paused = false;
+                if (proxy) {
+                    blocking->request(proxy, std::chrono::seconds(5), quiesce_atom{})
+                        .receive([&paused](bool b) { paused = b; },
+                                 [](caf::error&) {});
+                }
+                if (!paused) {
+                    for (auto& p : proxies)
+                        self->send(p, resume_atom{}, it->second.actor);
+                    destroy(new_plugin);
+                    return caf::make_error(
+                        caf::sec::invalid_argument,
+                        "Reload: failed to quiesce proxy for service: " + svc);
+                }
+                proxies.push_back(proxy);
+            }
+
+            // 状态移交：此刻旧 actor 已静默——save_state 的响应本身就是
+            // "邮箱已排空"的证据（邮箱到达序屏障），快照即终态，无丢失窗口
             std::vector<std::byte> state_data;
             blocking->request(it->second.actor, std::chrono::seconds(5),
                               save_state_atom{})
@@ -203,16 +239,19 @@ caf::behavior PluginManager::make_behavior() {
             self->monitor(new_actor);
             self->send(new_actor, init_atom{}, self, "");
 
-            // 服务代理热切换（proxy 会 drain 旧实现）。
-            // 代理 ACL 的白名单记的是【调用方】，与被切换的实现无关，
-            // 因此 ACL 在热切换后原样保留；若新版本要改 acl_allow，
-            // 需要另行重新下发 set_service_acl_atom。
+            // registry 台账（impl 引用与版本号）
             for (const auto& svc : manifest.provides) {
                 self->send(registry_, hot_reload_atom{}, svc, new_actor);
             }
+            // 恢复流量：代理切到新实现并冲刷静默期缓冲的调用。
+            // ACL 白名单记的是【调用方】，与被切换的实现无关，热切换后原样保留；
+            // 若新版本要改 acl_allow，需另行重新下发 set_service_acl_atom。
+            for (auto& p : proxies) {
+                self->send(p, resume_atom{}, new_actor);
+            }
 
-            // 旧实例退役：2s 排空窗口后让旧 actor 退出，down_msg 到来时
-            // 销毁旧实例（C++ 对象）；旧 DLL 留在句柄池。
+            // 旧实例退役：邮箱已空（quiesce 屏障），2s 后退出，down_msg
+            // 到来时销毁旧实例（C++ 对象）；旧 DLL 留在句柄池。
             self->delayed_send(it->second.actor, std::chrono::seconds(2),
                                shutdown_atom{});
             retired_.push_back(std::move(it->second));

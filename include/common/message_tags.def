@@ -50,8 +50,8 @@ X_TAG(resolve_atom, 218)
 X_TAG(list_services_atom, 219)
 X_TAG(hot_reload_atom, 220)
 X_TAG(unregister_atom, 221)
-X_TAG(switch_target_atom, 222)
-X_TAG(force_cleanup_atom, 223)
+X_TAG(switch_target_atom, 222)   // 已弃用：被 quiesce/resume 取代（ID 保留不复用）
+X_TAG(force_cleanup_atom, 223)   // 已弃用：同上（ID 保留不复用）
 
 // -- 服务契约（include/services/）-----------------------------------
 X_TAG(get_config_atom, 224)
@@ -74,3 +74,5 @@ X_TAG(set_acl_atom, 233)
 
 // -- 旁路热更新（见 docs/plugin-guide.md §8）--------------------------
 X_TAG(reload_atom, 234)
+X_TAG(quiesce_atom, 235)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
+X_TAG(resume_atom, 236)    // 代理恢复：切换到新实现并冲刷缓冲
