@@ -1,6 +1,10 @@
 #include "plugin_interface.hpp"
+#include "graceful_shutdown.hpp"
+#include "checkpoint_manager.hpp"
+#include "plugin_manager.hpp"
 #include "services/logging_service.hpp"
 #include <spdlog/spdlog.h>
+#include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <unordered_map>
@@ -34,7 +38,7 @@ public:
         return sys.spawn([console_sink, file_sink, logger_cache](
             caf::stateful_actor<int>* self) -> caf::behavior {
 
-            self->state = 0;
+            self->state() = 0;
 
             return caf::behavior{
                 [=](init_atom, caf::actor, const std::string&) {
@@ -43,7 +47,7 @@ public:
                 [=](log_atom, const std::string& source,
                     const std::string& level, const std::string& msg) {
 
-                    self->state++;
+                    self->state()++;
 
                     auto it = logger_cache->find(source);
                     if (it == logger_cache->end()) {
@@ -63,18 +67,18 @@ public:
                 },
                 [=](drain_atom, caf::actor coordinator) {
                     spdlog::info("LoggerPlugin draining...");
-                    self->send(coordinator, drain_atom::value, self->address());
+                    self->send(coordinator, drain_atom{}, self->address());
                 },
                 [=](save_state_atom) -> std::vector<std::byte> {
-                    int count = self->state;
+                    int count = self->state();
                     std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &count, sizeof(int));
                     return data;
                 },
                 [=](restore_state_atom, const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
-                        std::memcpy(&self->state, data.data(), sizeof(int));
-                        spdlog::info("LoggerPlugin restored count={}", self->state);
+                        std::memcpy(&self->state(), data.data(), sizeof(int));
+                        spdlog::info("LoggerPlugin restored count={}", self->state());
                     }
                 },
                 [=](shutdown_atom) {

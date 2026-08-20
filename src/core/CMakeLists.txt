@@ -19,5 +19,6 @@ target_include_directories(caf_plugin_core PUBLIC
 target_link_libraries(caf_plugin_core PUBLIC CAF::core fmt::fmt)
 
 if(WIN32)
+    target_compile_options(caf_plugin_core PRIVATE /FS)
     target_link_libraries(caf_plugin_core PRIVATE kernel32)
 endif()

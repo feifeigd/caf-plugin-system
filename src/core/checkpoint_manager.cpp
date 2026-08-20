@@ -59,14 +59,14 @@ template bool CheckpointManager::read_le<uint64_t>(std::istream&, uint64_t&);
 
 // ------------------------------------------------------------------
 
-CheckpointManager::CheckpointManager(std::filesystem::path dir)
-    : checkpoint_dir_(std::move(dir)) {
+CheckpointManager::CheckpointManager(caf::actor_config& cfg, std::filesystem::path dir)
+    : caf::event_based_actor(cfg), checkpoint_dir_(std::move(dir)) {
     std::filesystem::create_directories(checkpoint_dir_);
 }
 
-auto CheckpointManager::make_behavior(caf::event_based_actor* self) {
+caf::behavior CheckpointManager::make_behavior() {
     return caf::behavior{
-        [=](save_state_atom, const std::string& plugin_name,
+        [=, this](save_state_atom, const std::string& plugin_name,
             const std::vector<std::byte>& data) -> bool {
             try {
                 auto path = checkpoint_dir_ / (plugin_name + ".ckpt");
@@ -103,7 +103,7 @@ auto CheckpointManager::make_behavior(caf::event_based_actor* self) {
             }
         },
 
-        [=](restore_state_atom, const std::string& plugin_name) -> std::vector<std::byte> {
+        [=, this](restore_state_atom, const std::string& plugin_name) -> std::vector<std::byte> {
             auto path = checkpoint_dir_ / (plugin_name + ".ckpt");
             if (!std::filesystem::exists(path)) return {};
 

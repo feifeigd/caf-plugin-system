@@ -1,4 +1,7 @@
 #include "plugin_interface.hpp"
+#include "graceful_shutdown.hpp"
+#include "checkpoint_manager.hpp"
+#include "plugin_manager.hpp"
 #include "services/config_service.hpp"
 #include "services/metrics_service.hpp"
 #include <cstddef>
@@ -34,29 +37,29 @@ public:
         return sys.spawn([](caf::stateful_actor<PlatformState>* self) -> caf::behavior {
             return caf::behavior{
                 [=](get_config_atom, const std::string& key) -> std::string {
-                    auto it = self->state.configs.find(key);
-                    return (it != self->state.configs.end()) ? it->second : "";
+                    auto it = self->state().configs.find(key);
+                    return (it != self->state().configs.end()) ? it->second : "";
                 },
                 [=](set_config_atom, const std::string& key, const std::string& val) {
-                    self->state.configs[key] = val;
+                    self->state().configs[key] = val;
                     std::cout << "[PlatformConfig] Set: " << key << " = " << val << std::endl;
                 },
                 [=](report_metric_atom, const std::string& key, int delta) {
-                    self->state.metrics[key] += delta;
+                    self->state().metrics[key] += delta;
                 },
                 [=](get_metrics_atom) -> std::map<std::string, int> {
-                    return self->state.metrics;
+                    return self->state().metrics;
                 },
                 [=](init_atom, caf::actor, const std::string&) {
                     std::cout << "[Platform] config + metrics ready ("
-                              << self->state.configs.size() << " default configs)" << std::endl;
+                              << self->state().configs.size() << " default configs)" << std::endl;
                 },
                 [=](drain_atom, caf::actor coordinator) {
                     std::cout << "[Platform] Draining..." << std::endl;
-                    self->send(coordinator, drain_atom::value, self->address());
+                    self->send(coordinator, drain_atom{}, self->address());
                 },
                 [=](save_state_atom) -> std::vector<std::byte> {
-                    int cfg_count = static_cast<int>(self->state.configs.size());
+                    int cfg_count = static_cast<int>(self->state().configs.size());
                     std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &cfg_count, sizeof(int));
                     return data;

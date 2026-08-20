@@ -19,10 +19,10 @@ public:
     DynamicLibrary(const DynamicLibrary&) = delete;
     DynamicLibrary& operator=(const DynamicLibrary&) = delete;
 
-    // 获取符号地址，转换为函数指针
+    // 获取符号地址，转换为函数指针（Func 为函数指针类型，如 void(*)()）
     template<typename Func>
-    Func* symbol(const std::string& name) const {
-        return reinterpret_cast<Func*>(symbol_raw(name));
+    Func symbol(const std::string& name) const {
+        return reinterpret_cast<Func>(symbol_raw(name));
     }
 
     bool valid() const { return handle_ != nullptr; }

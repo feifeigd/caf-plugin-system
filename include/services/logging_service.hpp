@@ -1,4 +1,5 @@
 #pragma once
+#include "common/message_tags.hpp"
 #include <caf/all.hpp>
 #include <string>
 #include <fmt/format.h>
@@ -7,8 +8,8 @@
 // 日志服务契约
 // 提供方：LoggerPlugin
 // 消费方：任何需要打日志的插件
+// 消息标签（log_atom）见 common/message_tags.def
 // ------------------------------------------------------------------
-using log_atom = caf::atom_constant<caf::atom("logmsg")>;
 
 namespace logging_service {
 
@@ -19,7 +20,7 @@ inline void send_log(const caf::actor& logger,
                      const std::string& level,
                      const std::string& msg) {
     if (logger) {
-        caf::anon_send(logger, log_atom::value, source, level, msg);
+        caf::anon_send(logger, log_atom{}, source, level, msg);
     }
 }
 

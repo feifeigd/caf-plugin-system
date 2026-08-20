@@ -1,12 +1,12 @@
 #pragma once
+#include "common/message_tags.hpp"
 #include <caf/all.hpp>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <vector>
 
-using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
-using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
+// 消息标签集中定义于 common/message_tags.def（X-macro 唯一数据源）
 
 // ------------------------------------------------------------------
 // 改进后的 Checkpoint 文件格式（v1）
@@ -25,10 +25,11 @@ struct CheckpointHeader {
     uint64_t data_len      = 0;                       // 数据长度
 };
 
-class CheckpointManager {
+class CheckpointManager : public caf::event_based_actor {
 public:
-    explicit CheckpointManager(std::filesystem::path dir = "./checkpoints");
-    auto make_behavior(caf::event_based_actor* self);
+    CheckpointManager(caf::actor_config& cfg, std::filesystem::path dir);
+
+    caf::behavior make_behavior() override;
 
 private:
     std::filesystem::path checkpoint_dir_;
