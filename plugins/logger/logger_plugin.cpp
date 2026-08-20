@@ -6,23 +6,7 @@
 #include <unordered_map>
 #include <memory>
 #include <cstddef>
-#include "plugin_interface.hpp"
-#include "services/logging_service.hpp"
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/basic_file_sink.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <unordered_map>
-#include <memory>
-#include <cstddef>
 #include <cstring>
-
-class LoggerPlugin : public PluginEntry {
-
-using init_atom = caf::atom_constant<caf::atom("init")>;
-using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
-using drain_atom = caf::atom_constant<caf::atom("drain")>;
-using save_state_atom = caf::atom_constant<caf::atom("savest")>;
-using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
 class LoggerPlugin : public PluginEntry {
 public:
@@ -34,18 +18,15 @@ public:
                      const std::vector<caf::actor>&,
                      const std::string&) override {
 
-        // 共享 sinks：控制台 + 文件
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
         auto file_sink    = std::make_shared<spdlog::sinks::basic_file_sink_mt>("logs/app.log", true);
 
-        // 统一日志格式: [时间] [插件名] [级别] 消息
         auto formatter = std::make_unique<spdlog::pattern_formatter>(
             "[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v"
         );
         console_sink->set_formatter(formatter->clone());
         file_sink->set_formatter(std::move(formatter));
 
-        // 懒加载的命名 logger 缓存
         auto logger_cache = std::make_shared<
             std::unordered_map<std::string, std::shared_ptr<spdlog::logger>>
         >();
@@ -64,7 +45,6 @@ public:
 
                     self->state++;
 
-                    // 懒加载：为每个 source 创建命名 logger
                     auto it = logger_cache->find(source);
                     if (it == logger_cache->end()) {
                         auto logger = std::make_shared<spdlog::logger>(source);
@@ -79,7 +59,7 @@ public:
                     else if (level == "DEBUG") logger->debug(msg);
                     else if (level == "WARN")  logger->warn(msg);
                     else if (level == "ERROR") logger->error(msg);
-                    else                       logger->info(msg); // fallback
+                    else                       logger->info(msg);
                 },
                 [=](drain_atom, caf::actor coordinator) {
                     spdlog::info("LoggerPlugin draining...");
@@ -99,7 +79,7 @@ public:
                 },
                 [=](shutdown_atom) {
                     spdlog::info("LoggerPlugin shutdown");
-                    spdlog::shutdown();  // 刷盘
+                    spdlog::shutdown();
                     self->quit();
                 }
             };

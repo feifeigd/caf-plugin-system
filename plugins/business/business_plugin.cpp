@@ -5,21 +5,7 @@
 #include <iostream>
 #include <cstring>
 
-#include "plugin_interface.hpp"
-#include "graceful_shutdown.hpp"
-#include "services/logging_service.hpp"
-#include <cstddef>
-#include <iostream>
-#include <cstring>
-
 #define PLUGIN_NAME "business"
-
-class BusinessPlugin : public PluginEntry { "business"
-
-using init_atom          = caf::atom_constant<caf::atom("init")>;
-using drain_atom         = caf::atom_constant<caf::atom("drain")>;
-using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
-using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
 class BusinessPlugin : public PluginEntry {
 public:

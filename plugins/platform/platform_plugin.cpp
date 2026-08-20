@@ -4,21 +4,7 @@
 #include <cstddef>
 #include <iostream>
 #include <cstring>
-#include "plugin_interface.hpp"
-#include "services/config_service.hpp"
-#include "services/metrics_service.hpp"
-#include <cstddef>
-#include <iostream>
-#include <cstring>
 #include <map>
-
-struct PlatformState {
-
-using init_atom    = caf::atom_constant<caf::atom("init")>;
-using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
-using drain_atom   = caf::atom_constant<caf::atom("drain")>;
-using save_state_atom = caf::atom_constant<caf::atom("savest")>;
-using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
 struct PlatformState {
     std::map<std::string, std::string> configs{
@@ -47,7 +33,6 @@ public:
 
         return sys.spawn([](caf::stateful_actor<PlatformState>* self) -> caf::behavior {
             return caf::behavior{
-                // ---------- config_service ----------
                 [=](get_config_atom, const std::string& key) -> std::string {
                     auto it = self->state.configs.find(key);
                     return (it != self->state.configs.end()) ? it->second : "";
@@ -56,16 +41,12 @@ public:
                     self->state.configs[key] = val;
                     std::cout << "[PlatformConfig] Set: " << key << " = " << val << std::endl;
                 },
-
-                // ---------- metrics_service ----------
                 [=](report_metric_atom, const std::string& key, int delta) {
                     self->state.metrics[key] += delta;
                 },
                 [=](get_metrics_atom) -> std::map<std::string, int> {
                     return self->state.metrics;
                 },
-
-                // ---------- lifecycle ----------
                 [=](init_atom, caf::actor, const std::string&) {
                     std::cout << "[Platform] config + metrics ready ("
                               << self->state.configs.size() << " default configs)" << std::endl;
