@@ -3,6 +3,7 @@
 #include "dynamic_library.hpp"
 #include "service_registry.hpp"
 #include "dependency_graph.hpp"
+#include "graceful_shutdown.hpp"
 #include <map>
 
 using load_atom          = caf::atom_constant<caf::atom("load")>;
@@ -33,6 +34,7 @@ public:
 private:
     caf::actor registry_;
     caf::actor checkpoint_mgr_;
+    caf::actor shutdown_mgr_;              // ← GracefulShutdown 引用
     DependencyGraph dep_graph_;
     std::map<std::string, LoadedPlugin> plugins_;
 };

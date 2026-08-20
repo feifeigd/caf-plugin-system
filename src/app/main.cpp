@@ -67,6 +67,11 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         ShutdownConfig{},
         plugin_mgr, registry, checkpoint_mgr, get_stop_order);
 
+    // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
+    self->send(plugin_mgr, shutdown_atom::value, g_shutdown_mgr);
+        ShutdownConfig{},
+        plugin_mgr, registry, checkpoint_mgr, get_stop_order);
+
 #ifdef _WIN32
     SetConsoleCtrlHandler(console_handler, TRUE);
 #else

@@ -1,10 +1,10 @@
 #include "plugin_interface.hpp"
+#include "graceful_shutdown.hpp"
 #include <cstddef>
 #include <iostream>
 #include <cstring>
 
 using init_atom          = caf::atom_constant<caf::atom("init")>;
-using shutdown_atom      = caf::atom_constant<caf::atom("shutd")>;
 using drain_atom         = caf::atom_constant<caf::atom("drain")>;
 using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
 using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
@@ -22,14 +22,24 @@ public:
 
         return sys.spawn([logger](caf::stateful_actor<int>* self) -> caf::behavior {
             self->state = 0;
+            caf::actor plugin_mgr;  // 保存 PluginManager 引用
 
             return caf::behavior{
-                [=](init_atom, caf::actor, const std::string&) {
+                [=](init_atom, caf::actor manager, const std::string&) {
+                    plugin_mgr = manager;
                     std::cout << "[Business] Initialized" << std::endl;
                     if (logger) self->send(logger, caf::atom_constant<caf::atom("logmsg")>::value, "INFO", "Business started");
                 },
                 [=](const std::string& cmd) -> std::string {
                     self->state++;
+                    if (cmd == "shutdown") {
+                        // 插件主动请求系统关机
+                        if (plugin_mgr) {
+                            self->send(plugin_mgr, request_shutdown_atom::value);
+                            std::cout << "[Business] Shutdown requested" << std::endl;
+                        }
+                        return "shutdown requested";
+                    }
                     if (logger) {
                         self->send(logger, caf::atom_constant<caf::atom("logmsg")>::value, "DEBUG", "Cmd: " + cmd);
                     }

@@ -98,6 +98,22 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             return (it != plugins_.end()) ? it->second.actor : caf::actor{};
         },
 
+        // 设置关机管理器（由 main 在创建 GracefulShutdown 后调用）
+        [=](shutdown_atom, caf::actor mgr) {
+            shutdown_mgr_ = mgr;
+            std::cout << "[PluginManager] Shutdown manager registered" << std::endl;
+        },
+
+        // 插件请求关机 → 转发给 GracefulShutdown
+        [=](request_shutdown_atom) {
+            if (shutdown_mgr_) {
+                std::cout << "[PluginManager] Forwarding shutdown request" << std::endl;
+                self->send(shutdown_mgr_, shutdown_atom::value);
+            } else {
+                std::cerr << "[PluginManager] Shutdown manager not set" << std::endl;
+            }
+        },
+
         [=](const caf::down_msg& dm) {
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
