@@ -113,6 +113,3 @@ jobs:
       with:
         name: test-logs-debug
         path: test-debug.log
-      run: |
-        export LD_LIBRARY_PATH=${{ env.VCPKG_ROOT }}/installed/x64-linux/debug/lib:${{ env.VCPKG_ROOT }}/installed/x64-linux/lib:$LD_LIBRARY_PATH
-        ctest --test-dir build-debug --output-on-failure
