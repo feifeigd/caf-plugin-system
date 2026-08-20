@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <iostream>
 #include <cstring>
-#include <unordered_map>
+#include <map>
 
 // ------------------------------------------------------------------
 // 两个服务的 atom
@@ -25,12 +25,12 @@ using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 // 内部通过同一个 actor 的 behavior 统一处理 config 和 metrics 消息。
 // ------------------------------------------------------------------
 struct PlatformState {
-    std::unordered_map<std::string, std::string> configs{
+    std::map<std::string, std::string> configs{
         {"app.name", "caf-plugin-system"},
         {"app.version", "1.0.0"},
         {"log.level", "INFO"}
     };
-    std::unordered_map<std::string, int> metrics;
+    std::map<std::string, int> metrics;
 };
 
 class PlatformPlugin : public PluginEntry {
@@ -68,7 +68,7 @@ public:
                 [=](report_metric_atom, const std::string& key, int delta) {
                     self->state.metrics[key] += delta;
                 },
-                [=](get_metrics_atom) -> std::unordered_map<std::string, int> {
+                [=](get_metrics_atom) -> std::map<std::string, int> {
                     return self->state.metrics;
                 },
 
