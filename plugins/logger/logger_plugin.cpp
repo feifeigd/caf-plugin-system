@@ -1,9 +1,9 @@
 #include "plugin_interface.hpp"
+#include "services/logging_service.hpp"
 #include <cstddef>
 #include <iostream>
 #include <cstring>
 
-using log_atom = caf::atom_constant<caf::atom("logmsg")>;
 using init_atom = caf::atom_constant<caf::atom("init")>;
 using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
 using drain_atom = caf::atom_constant<caf::atom("drain")>;
@@ -14,8 +14,6 @@ class LoggerPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"LoggerPlugin", "1.0.0", {}, {"logging_service"}, -100};
-    }
-        return {"LoggerPlugin", "1.0.0", {}, {"logging_service"}};
     }
 
     caf::actor spawn(caf::actor_system& sys,

@@ -1,29 +1,17 @@
 #include "plugin_interface.hpp"
+#include "services/config_service.hpp"
+#include "services/metrics_service.hpp"
 #include <cstddef>
 #include <iostream>
 #include <cstring>
 #include <map>
 
-// ------------------------------------------------------------------
-// 两个服务的 atom
-// ------------------------------------------------------------------
-using get_config_atom  = caf::atom_constant<caf::atom("getcfg")>;
-using set_config_atom  = caf::atom_constant<caf::atom("setcfg")>;
-using report_metric_atom = caf::atom_constant<caf::atom("rptmet")>;
-using get_metrics_atom = caf::atom_constant<caf::atom("getmet")>;
 using init_atom    = caf::atom_constant<caf::atom("init")>;
 using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
 using drain_atom   = caf::atom_constant<caf::atom("drain")>;
 using save_state_atom = caf::atom_constant<caf::atom("savest")>;
 using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
-// ------------------------------------------------------------------
-// PlatformPlugin：一个插件提供两个基础设施服务（配置 + 指标）
-//
-// 日志服务由独立的 LoggerPlugin 提供，保持"一个进程只有一个 logging_service"。
-//
-// 内部通过同一个 actor 的 behavior 统一处理 config 和 metrics 消息。
-// ------------------------------------------------------------------
 struct PlatformState {
     std::map<std::string, std::string> configs{
         {"app.name", "caf-plugin-system"},
@@ -40,10 +28,7 @@ public:
             "PlatformPlugin",
             "1.0.0",
             {},
-            {
-                "config_service",
-                "metrics_service"
-            },
+            {"config_service", "metrics_service"},
             -100
         };
     }
@@ -82,7 +67,6 @@ public:
                     self->send(coordinator, drain_atom::value, self->address());
                 },
                 [=](save_state_atom) -> std::vector<std::byte> {
-                    // 序列化 configs 数量 + configs 数据
                     int cfg_count = static_cast<int>(self->state.configs.size());
                     std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &cfg_count, sizeof(int));

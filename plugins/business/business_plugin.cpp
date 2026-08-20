@@ -1,5 +1,6 @@
 #include "plugin_interface.hpp"
 #include "graceful_shutdown.hpp"
+#include "services/logging_service.hpp"
 #include <cstddef>
 #include <iostream>
 #include <cstring>
@@ -22,18 +23,17 @@ public:
 
         return sys.spawn([logger](caf::stateful_actor<int>* self) -> caf::behavior {
             self->state = 0;
-            caf::actor plugin_mgr;  // 保存 PluginManager 引用
+            caf::actor plugin_mgr;
 
             return caf::behavior{
                 [=](init_atom, caf::actor manager, const std::string&) {
                     plugin_mgr = manager;
                     std::cout << "[Business] Initialized" << std::endl;
-                    if (logger) self->send(logger, caf::atom_constant<caf::atom("logmsg")>::value, "INFO", "Business started");
+                    if (logger) self->send(logger, log_atom::value, "INFO", "Business started");
                 },
                 [=](const std::string& cmd) -> std::string {
                     self->state++;
                     if (cmd == "shutdown") {
-                        // 插件主动请求系统关机
                         if (plugin_mgr) {
                             self->send(plugin_mgr, request_shutdown_atom::value);
                             std::cout << "[Business] Shutdown requested" << std::endl;
@@ -41,7 +41,7 @@ public:
                         return "shutdown requested";
                     }
                     if (logger) {
-                        self->send(logger, caf::atom_constant<caf::atom("logmsg")>::value, "DEBUG", "Cmd: " + cmd);
+                        self->send(logger, log_atom::value, "DEBUG", "Cmd: " + cmd);
                     }
                     return "processed: " + cmd;
                 },
