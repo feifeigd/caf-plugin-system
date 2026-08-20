@@ -13,6 +13,8 @@ using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 class LoggerPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
+        return {"LoggerPlugin", "1.0.0", {}, {"logging_service"}, -100};
+    }
         return {"LoggerPlugin", "1.0.0", {}, {"logging_service"}};
     }
 

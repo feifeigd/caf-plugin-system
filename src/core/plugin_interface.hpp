@@ -20,6 +20,12 @@ struct plugin_manifest {
     std::string version;
     std::vector<std::string> dependencies;   // 依赖的服务名
     std::vector<std::string> provides;       // 提供的服务名
+    int priority = 0;                        // ← 加载优先级（越小越先加载，负数给基础设施）
+};
+    std::string name;
+    std::string version;
+    std::vector<std::string> dependencies;   // 依赖的服务名
+    std::vector<std::string> provides;       // 提供的服务名
 };
 
 // ------------------------------------------------------------------

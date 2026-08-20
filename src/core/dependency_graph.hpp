@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <stdexcept>
 #include <algorithm>
+#include <queue>
 
 class DependencyGraph {
 public:
@@ -24,6 +25,10 @@ public:
         graph_[plugin_name] = plugin_deps;
     }
 
+    void set_priority(const std::string& plugin_name, int priority) {
+        priorities_[plugin_name] = priority;
+    }
+
     /// 循环检测
     bool has_cycle_from(const std::string& plugin_name) const {
         std::unordered_set<std::string> visiting; // 当前路径栈
@@ -31,37 +36,54 @@ public:
         return dfs(plugin_name, visiting, visited);
     }
 
+    /// Kahn 算法拓扑排序 + 按 priority 优先队列
     std::vector<std::string> topological_order() const {
-        std::vector<std::string> result;
-        std::unordered_set<std::string> visited;
-        std::unordered_set<std::string> temp_mark; // 当前深度优先搜索栈
-
-        for (const auto& [node, _] : graph_) {
-            if (!visited.count(node)) {
-                visit(node, visited, temp_mark, result);
+        // 1. 计算入度
+        std::unordered_map<std::string, int> in_degree;
+        for (const auto& [node, deps] : graph_) {
+            in_degree[node] = static_cast<int>(deps.size());
+            for (const auto& dep : deps) {
+                in_degree[dep]; // 确保 dep 也在 map 中
             }
         }
-        // DFS 后序遍历：依赖先 push_back，自己后 push_back
-        // 对于 graph["Business"] = ["Logger"]，后序输出为 ["Logger", "Business"]
-        // 这正是正确的加载顺序（被依赖的先加载），无需 reverse
-        return result;
-    }
 
-    std::vector<std::string> reverse_topological_order() const {
-        auto order = topological_order();
-        std::reverse(order.begin(), order.end());
-        return order;
-    }
+        // 2. 优先队列：priority 小的先出队，priority 相同按名字排序（保证确定性）
+        auto cmp = [this](const std::string& a, const std::string& b) {
+            auto it_a = priorities_.find(a);
+            auto it_b = priorities_.find(b);
+            int pa = (it_a != priorities_.end()) ? it_a->second : 0;
+            int pb = (it_b != priorities_.end()) ? it_b->second : 0;
+            if (pa != pb) return pa > pb;  // priority 小的先出队
+            return a > b;                   // 名字排序保证确定性
+        };
+        std::priority_queue<std::string, std::vector<std::string>, decltype(cmp)> q(cmp);
+
+        // 3. 入度为 0 的节点入队（没有依赖，可以先加载）
+        for (const auto& [node, deg] : in_degree) {
+            if (deg == 0) q.push(node);
+        }
+
+        // 4. Kahn 算法主体
         std::vector<std::string> result;
-        std::unordered_set<std::string> visited;
-        std::unordered_set<std::string> temp_mark; // 当前深度优先搜索栈
+        while (!q.empty()) {
+            auto u = q.top(); q.pop();
+            result.push_back(u);
 
-        for (const auto& [node, _] : graph_) {
-            if (!visited.count(node)) {
-                visit(node, visited, temp_mark, result);
+            // 找到所有依赖 u 的节点，入度 -1
+            for (const auto& [node, deps] : graph_) {
+                if (std::find(deps.begin(), deps.end(), u) != deps.end()) {
+                    if (--in_degree[node] == 0) {
+                        q.push(node);
+                    }
+                }
             }
         }
-        std::reverse(result.begin(), result.end());
+
+        // 5. 环检测：结果数量不等于节点数量说明有环
+        if (result.size() != in_degree.size()) {
+            return {};
+        }
+
         return result;
     }
 
@@ -76,7 +98,7 @@ private:
              std::unordered_set<std::string>& visiting,
              std::unordered_set<std::string>& visited) const {
         if (visiting.count(node)) return true;
-        if (visited.count(node)) return false; // 已经确认没环的节点
+        if (visited.count(node)) return false;
 
         visiting.insert(node);
         auto it = graph_.find(node);
@@ -86,31 +108,11 @@ private:
             }
         }
         visiting.erase(node);
-        visited.insert(node); // 已经确认没环的节点
-        return false;
-    }
-
-    void visit(const std::string& node,
-               std::unordered_set<std::string>& visited,
-               std::unordered_set<std::string>& temp_mark,
-               std::vector<std::string>& result) const {
-        if (temp_mark.count(node)) {
-            throw std::runtime_error("Cycle detected at: " + node);
-        }
-        if (visited.count(node)) return;
-
-        temp_mark.insert(node);
-        auto it = graph_.find(node);
-        if (it != graph_.end()) {
-            for (const auto& dep : it->second) {
-                visit(dep, visited, temp_mark, result);
-            }
-        }
-        temp_mark.erase(node);
         visited.insert(node);
-        result.push_back(node);
+        return false;
     }
 
     std::unordered_map<std::string, std::vector<std::string>> graph_;
     std::unordered_map<std::string, std::string> service_providers_;
+    std::unordered_map<std::string, int> priorities_;
 };

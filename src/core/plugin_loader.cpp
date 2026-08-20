@@ -98,6 +98,7 @@ std::vector<std::string> compute_load_order(const std::vector<PluginInfo>& plugi
     }
     for (const auto& p : plugins) {
         graph.add_plugin(p.name, p.manifest.dependencies);
+        graph.set_priority(p.name, p.manifest.priority);
     }
 
     for (const auto& p : plugins) {
