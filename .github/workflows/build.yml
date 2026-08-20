@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "*" ]
 
+env:
+  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,9 +26,8 @@ jobs:
 
     - name: Setup vcpkg
       run: |
-        git clone https://github.com/microsoft/vcpkg.git $HOME/vcpkg
-        $HOME/vcpkg/bootstrap-vcpkg.sh
-        echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+        git clone --depth=1 https://github.com/microsoft/vcpkg.git ${{ env.VCPKG_ROOT }}
+        ${{ env.VCPKG_ROOT }}/bootstrap-vcpkg.sh
 
     - name: Cache vcpkg packages
       uses: actions/cache@v4
@@ -39,7 +41,7 @@ jobs:
 
     - name: Install vcpkg dependencies
       run: |
-        $HOME/vcpkg/vcpkg install --triplet=x64-linux
+        ${{ env.VCPKG_ROOT }}/vcpkg install --triplet=x64-linux
 
     - name: Configure CMake (Release)
       run: |
@@ -47,7 +49,7 @@ jobs:
           -S . \
           -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake \
           -DCMAKE_CXX_STANDARD=20
 
     - name: Build (Release)
@@ -62,7 +64,16 @@ jobs:
         path: build-release.log
 
     - name: Run tests
-      run: ctest --test-dir build --output-on-failure
+      run: |
+        export LD_LIBRARY_PATH=${{ env.VCPKG_ROOT }}/installed/x64-linux/lib:$LD_LIBRARY_PATH
+        ctest --test-dir build --output-on-failure 2>&1 | tee test-output.log
+
+    - name: Upload test logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs
+        path: test-output.log
 
     - name: Configure CMake (Debug)
       run: |
@@ -70,7 +81,7 @@ jobs:
           -S . \
           -G Ninja \
           -DCMAKE_BUILD_TYPE=Debug \
-          -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake \
           -DCMAKE_CXX_STANDARD=20
 
     - name: Build (Debug)
@@ -83,3 +94,8 @@ jobs:
       with:
         name: build-logs-debug
         path: build-debug.log
+
+    - name: Run tests (Debug)
+      run: |
+        export LD_LIBRARY_PATH=${{ env.VCPKG_ROOT }}/installed/x64-linux/debug/lib:${{ env.VCPKG_ROOT }}/installed/x64-linux/lib:$LD_LIBRARY_PATH
+        ctest --test-dir build-debug --output-on-failure
