@@ -1,14 +1,38 @@
 #include "plugin_manager.hpp"
+#include "checkpoint_manager.hpp"
 #include <caf/logger.hpp>
+#include <deque>
+#include <vector>
 #include <iostream>
 #include <cstring>
 
-PluginManager::PluginManager(caf::actor registry, caf::actor checkpoint_mgr)
-    : registry_(registry), checkpoint_mgr_(checkpoint_mgr) {}
+namespace {
+/// 插件 DLL 句柄池（进程级常驻）。见 LoadedPlugin::lib 注释：
+/// actor 的 vtable/lambda 代码在插件 DLL 里，CAF 异步释放引用，
+/// FreeLibrary 过早会崩（0xC0000005 exec 到已卸载代码段）。
+/// 用 deque 保证元素地址稳定。进程退出时由 OS 回收。
+std::deque<DynamicLibrary>& plugin_lib_pool() {
+    static std::deque<DynamicLibrary> pool;
+    return pool;
+}
+} // namespace
 
-auto PluginManager::make_behavior(caf::event_based_actor* self) {
+PluginManager::PluginManager(caf::actor_config& cfg, caf::actor registry, caf::actor checkpoint_mgr)
+    : caf::event_based_actor(cfg), registry_(registry), checkpoint_mgr_(checkpoint_mgr) {}
+
+caf::behavior PluginManager::make_behavior() {
+    caf::event_based_actor* self = this;
+    // 兜底：吞掉意外消息而不是退出。CAF 1.1 的默认 print_and_drop
+    // 会产生 error 结果并让 actor quit；PluginManager 是长期驻留的
+    // 宿主 actor，不能因协议毛刺被杀死。
+    self->set_default_handler([](caf::scheduled_actor*, caf::message& msg)
+                              -> caf::skippable_result {
+        CAF_LOG_WARNING("PluginManager discarding unexpected message: " << caf::to_string(msg));
+        return caf::make_message();
+    });
+    
     return caf::behavior{
-        [=](load_atom, const std::string& name, const std::string& path) -> caf::result<bool> {
+        [=, this](load_atom, const std::string& name, const std::string& path) -> caf::result<bool> {
             CAF_LOG_INFO("Loading plugin: " << name);
 
             if (plugins_.count(name)) {
@@ -47,10 +71,13 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             }
 
             std::vector<caf::actor> deps;
+            caf::scoped_actor blocking{self->system()};
             for (const auto& dep : manifest.dependencies) {
                 CAF_LOG_INFO("Resolving dependency: " << dep << " for " << name);
-                auto dep_actor = self->request(registry_, caf::infinite, resolve_atom::value, dep)
-                    .receive([](const caf::actor& a) { return a; }, [](const caf::error&) { return caf::actor{}; });
+                caf::actor dep_actor;
+                blocking->request(registry_, caf::infinite, resolve_atom{}, dep)
+                    .receive([&dep_actor](const caf::actor& a) { dep_actor = a; },
+                             [](caf::error&) {});
                 if (!dep_actor) {
                     CAF_LOG_ERROR("Missing dependency: " << dep << " for " << name);
                     destroy(plugin);
@@ -59,41 +86,156 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
                 deps.push_back(dep_actor);
             }
 
-            auto state_data = self->request(checkpoint_mgr_, std::chrono::seconds(2),
-                                           restore_state_atom::value, name)
-                .receive([](const std::vector<std::byte>& d) { return d; }, [](auto) { return std::vector<std::byte>{}; });
+            std::vector<std::byte> state_data;
+            blocking->request(checkpoint_mgr_, std::chrono::seconds(2),
+                              restore_state_atom{}, name)
+                .receive([&state_data](const std::vector<std::byte>& d) { state_data = d; },
+                         [](caf::error&) {});
 
             auto actor = plugin->spawn(self->system(), deps, "");
 
             if (!state_data.empty()) {
                 CAF_LOG_INFO("Restoring state for: " << name);
-                self->send(actor, restore_state_atom::value, state_data);
+                self->send(actor, restore_state_atom{}, state_data);
             }
 
             self->monitor(actor);
-            self->send(actor, init_atom::value, self, "");
+            self->send(actor, init_atom{}, self, "");
 
             for (const auto& svc : manifest.provides) {
-                self->send(registry_, register_atom::value, svc, actor, name);
+                self->send(registry_, register_atom{}, svc, actor, name);
             }
 
-            plugins_[name] = LoadedPlugin{
-                std::move(*lib_opt), plugin, actor, manifest, destroy
-            };
+            // 服务代理 ACL：插件在 manifest 声明 acl_allow 时，
+            // 把它提供的服务全部切到受限策略（见 docs/plugin-guide.md §6）。
+            // 与 register_svc 同一 sender→receiver 对，CAF 保证 FIFO，
+            // 代理先建成、再收 ACL；两者之间有个开放窗口（仅启动期存在）。
+            if (!manifest.acl_allow.empty()) {
+                std::vector<caf::actor_addr> allowed;
+                for (const auto& pname : manifest.acl_allow) {
+                    auto pit = plugins_.find(pname);
+                    if (pit != plugins_.end()) {
+                        allowed.push_back(pit->second.actor->address());
+                    } else {
+                        // 拓扑序保证依赖已加载；找不到说明清单写错了
+                        CAF_LOG_WARNING("ACL: unknown plugin in acl_allow of "
+                                        << name << ": " << pname);
+                    }
+                }
+                for (const auto& svc : manifest.provides) {
+                    self->send(registry_, set_service_acl_atom{}, svc, allowed);
+                }
+            }
+
+            plugin_lib_pool().push_back(std::move(*lib_opt));
+            plugins_.emplace(name, LoadedPlugin{
+                &plugin_lib_pool().back(), plugin, actor, manifest, destroy
+            });
             CAF_LOG_INFO("Plugin loaded successfully: " << name);
             return true;
         },
 
-        [=](unload_atom, const std::string& name) -> bool {
+        // 旁路热更新（docs/plugin-guide.md §8）：从【新路径】加载同名插件的
+        // 新版本，状态从旧 actor 直接移交，服务代理切换到新 actor。
+        // 约束：
+        //   - 新代码必须在新文件/新路径：Windows 对已加载 DLL 有文件锁，
+        //     且 LoadLibrary 对同路径返回缓存的旧模块，拿不到新代码；
+        //   - 不能调用新 DLL 的 register_meta_objects：号段在启动时已注册，
+        //     重复注册同一段 CAF 直接 abort。因此热更新不能引入未注册的
+        //     新 type_id——新协议请走信封 sub_proto（无需新 ID）；
+        //   - 旧 DLL 常驻句柄池不卸载（actor vtable 在 DLL 代码段，
+        //     CAF 异步释放引用，FreeLibrary 过早会崩）。
+        [=, this](reload_atom, const std::string& name, const std::string& path)
+            -> caf::result<bool> {
+            auto it = plugins_.find(name);
+            if (it == plugins_.end()) {
+                return caf::make_error(caf::sec::invalid_argument,
+                                       "Plugin not loaded: " + name);
+            }
+
+            auto lib_opt = DynamicLibrary::open(path);
+            if (!lib_opt) {
+                return caf::make_error(caf::sec::invalid_argument,
+                                       "Failed to load library: " + path);
+            }
+            auto create  = lib_opt->symbol<CreatePluginFunc>("create_plugin");
+            auto destroy = lib_opt->symbol<DestroyPluginFunc>("destroy_plugin");
+            if (!create || !destroy) {
+                return caf::make_error(caf::sec::invalid_argument,
+                                       "Missing create/destroy symbols in: " + path);
+            }
+
+            PluginEntry* new_plugin = create();
+            auto manifest = new_plugin->manifest();
+            if (manifest.name != name) {
+                destroy(new_plugin);
+                return caf::make_error(caf::sec::invalid_argument,
+                                       "Reloaded manifest name mismatch: " + manifest.name);
+            }
+
+            // 依赖解析（与 load 相同）
+            std::vector<caf::actor> deps;
+            caf::scoped_actor blocking{self->system()};
+            for (const auto& dep : manifest.dependencies) {
+                caf::actor dep_actor;
+                blocking->request(registry_, caf::infinite, resolve_atom{}, dep)
+                    .receive([&dep_actor](const caf::actor& a) { dep_actor = a; },
+                             [](caf::error&) {});
+                if (!dep_actor) {
+                    destroy(new_plugin);
+                    return caf::make_error(caf::sec::invalid_argument,
+                                           "Missing dep: " + dep);
+                }
+                deps.push_back(dep_actor);
+            }
+
+            // 状态移交：直接向旧 actor 要（内存移交，不走 checkpoint 磁盘）
+            std::vector<std::byte> state_data;
+            blocking->request(it->second.actor, std::chrono::seconds(5),
+                              save_state_atom{})
+                .receive([&state_data](const std::vector<std::byte>& d) { state_data = d; },
+                         [](caf::error&) {});
+
+            auto new_actor = new_plugin->spawn(self->system(), deps, "");
+            if (!state_data.empty()) {
+                self->send(new_actor, restore_state_atom{}, state_data);
+            }
+            self->monitor(new_actor);
+            self->send(new_actor, init_atom{}, self, "");
+
+            // 服务代理热切换（proxy 会 drain 旧实现）。
+            // 代理 ACL 的白名单记的是【调用方】，与被切换的实现无关，
+            // 因此 ACL 在热切换后原样保留；若新版本要改 acl_allow，
+            // 需要另行重新下发 set_service_acl_atom。
+            for (const auto& svc : manifest.provides) {
+                self->send(registry_, hot_reload_atom{}, svc, new_actor);
+            }
+
+            // 旧实例退役：2s 排空窗口后让旧 actor 退出，down_msg 到来时
+            // 销毁旧实例（C++ 对象）；旧 DLL 留在句柄池。
+            self->delayed_send(it->second.actor, std::chrono::seconds(2),
+                               shutdown_atom{});
+            retired_.push_back(std::move(it->second));
+
+            plugin_lib_pool().push_back(std::move(*lib_opt));
+            it->second = LoadedPlugin{
+                &plugin_lib_pool().back(), new_plugin, new_actor, manifest, destroy
+            };
+
+            CAF_LOG_INFO("Plugin hot-reloaded: " << name << " -> " << path);
+            return true;
+        },
+
+        [=, this](unload_atom, const std::string& name) -> bool {
             CAF_LOG_INFO("Unloading plugin: " << name);
             auto it = plugins_.find(name);
             if (it == plugins_.end()) {
-                CAF_LOG_WARN("Plugin not found for unload: " << name);
+                CAF_LOG_WARNING("Plugin not found for unload: " << name);
                 return false;
             }
 
             for (const auto& svc : it->second.manifest.provides) {
-                self->send(registry_, unregister_atom::value, svc);
+                self->send(registry_, unregister_atom{}, svc);
             }
 
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
@@ -106,38 +248,49 @@ auto PluginManager::make_behavior(caf::event_based_actor* self) {
             return true;
         },
 
-        [=](list_atom) -> std::vector<std::string> {
+        [=, this](list_atom) -> std::vector<std::string> {
             std::vector<std::string> names;
             for (const auto& [n, _] : plugins_) names.push_back(n);
             return names;
         },
 
-        [=](resolve_plugin_atom, const std::string& name) -> caf::actor {
+        [=, this](resolve_plugin_atom, const std::string& name) -> caf::actor {
             auto it = plugins_.find(name);
             return (it != plugins_.end()) ? it->second.actor : caf::actor{};
         },
 
-        [=](shutdown_atom, caf::actor mgr) {
+        [=, this](shutdown_atom, caf::actor mgr) {
             shutdown_mgr_ = mgr;
             CAF_LOG_INFO("Shutdown manager registered");
         },
 
-        [=](request_shutdown_atom) {
+        [=, this](request_shutdown_atom) {
             if (shutdown_mgr_) {
                 CAF_LOG_INFO("Forwarding shutdown request to GracefulShutdown");
-                self->send(shutdown_mgr_, shutdown_atom::value);
+                self->send(shutdown_mgr_, shutdown_atom{});
             } else {
                 CAF_LOG_ERROR("Shutdown manager not set");
             }
         },
 
-        [=](const caf::down_msg& dm) {
+        [=, this](const caf::down_msg& dm) {
+            // 热更新退役的旧 actor 退出：正常销毁旧实例，不算崩溃
+            for (auto rit = retired_.begin(); rit != retired_.end(); ++rit) {
+                if (rit->actor && rit->actor->address() == dm.source) {
+                    CAF_LOG_INFO("Hot-reload: retired instance cleaned up");
+                    if (rit->destroy) {
+                        rit->destroy(rit->instance);
+                    }
+                    retired_.erase(rit);
+                    return;
+                }
+            }
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
                     CAF_LOG_ERROR("Plugin crashed: " << it->first);
 
                     for (const auto& svc : it->second.manifest.provides) {
-                        self->send(registry_, unregister_atom::value, svc);
+                        self->send(registry_, unregister_atom{}, svc);
                     }
 
                     if (it->second.destroy) {

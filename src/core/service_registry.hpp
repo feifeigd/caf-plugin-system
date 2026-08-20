@@ -1,7 +1,12 @@
 #pragma once
 #include "plugin_interface.hpp"
-#include <typeindex>
+#include "graceful_shutdown.hpp" // drain_atom
 #include <functional>
+#include <map>
+#include <string>
+#include <typeindex>
+
+// 消息标签集中定义于 common/message_tags.def（X-macro 唯一数据源）
 
 enum class service_lifetime { singleton, transient, scoped };
 
@@ -15,7 +20,13 @@ struct VersionedEntry {
 
 caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target);
 
-class ServiceRegistry {
+class ServiceRegistry : public caf::event_based_actor {
 public:
-    auto make_behavior(caf::event_based_actor* self);
+    explicit ServiceRegistry(caf::actor_config& cfg) : caf::event_based_actor(cfg) {}
+
+    caf::behavior make_behavior() override;
+
+private:
+    std::map<std::string, VersionedEntry> services_;
 };
+
