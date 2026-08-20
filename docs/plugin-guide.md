@@ -163,18 +163,45 @@ struct plugin_envelope {
 self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
 ```
 
-`PluginManager` 的流程（`plugin_manager.cpp` reload handler）：
+`PluginManager` 的流程（`plugin_manager.cpp` reload handler，**先排空后快照**）：
 
-1. 从**新路径**旁路加载新 DLL（manifest.name 必须与原名一致，防止换错插件）；
-2. 解析依赖（同 load），直接向旧 actor `request save_state`——状态**内存移交**，
-   不走 checkpoint 磁盘；
-3. spawn 新 actor → `restore_state` → monitor → `init_atom`；
-4. 对每个 provides 服务发 `hot_reload_atom`：服务代理切换目标并 drain 旧实现
-   （在途请求跑完，回执后输出 `[Proxy] Old version fully drained`）；
-5. 旧实例退役：2s 排空窗口后收 `shutdown_atom` 退出，PluginManager 经 down_msg
-   销毁旧 C++ 对象；**旧 DLL 常驻句柄池不卸载**（actor vtable 在 DLL 代码段，
-   CAF 异步释放引用，FreeLibrary 过早会崩——句柄池与热更新不冲突，
-   恰恰是热更新的前提）。
+1. 准备：从**新路径**旁路加载新 DLL（manifest.name 必须与原名一致）、解析依赖；
+2. **quiesce 静默**：对该插件每个服务的代理发 `quiesce_atom` 并等 ack——
+   代理邮箱 FIFO 保证 ack 之前到达的调用都已委托给旧 actor；此后代理
+   进入静默态，新调用进**缓冲**不再转发（任一代理静默失败则把已静默的
+   resume 回旧实现，整体回滚）；
+3. **快照**：对旧 actor `request save_state`——邮箱到达序屏障：响应到达时
+   旧 actor 已处理完全部在途工作，且不会再有新工作，**快照即终态**；
+4. spawn 新 actor → `restore_state` → monitor → `init_atom`；
+5. registry 台账（`hot_reload_atom`：impl 引用 + 版本号）→ 对每个代理发
+   `resume_atom`：切到新实现并**冲刷缓冲**（按缓冲时记录的原始 sender
+   复查 ACL；缓冲的 request 通过 `response_promise.delegate` 按原
+   sender/mid 路由交付响应，调用方无感）；
+6. 旧实例退役：邮箱已空，2s 后收 `shutdown_atom` 退出，PluginManager 经
+   down_msg 销毁旧 C++ 对象；**旧 DLL 常驻句柄池不卸载**（actor vtable 在
+   DLL 代码段，CAF 异步释放引用，FreeLibrary 过早会崩——句柄池与热更新
+   不冲突，恰恰是热更新的前提）。
+
+### 状态一致性（快照为什么不丢数据）
+
+热更新的经典难题是：快照之后、旧实现完全停下之前，旧实现处理的增量
+修改会丢（"以哪方为准都有问题"）。本实现用**消息顺序**消除该窗口，
+不需要锁：
+
+- quiesce 的 ack 是代理侧屏障：ack 之前的调用都已离开代理；
+- save_state 的响应是旧 actor 侧屏障：响应之前其邮箱已排空；
+- 两个屏障都靠 CAF 邮箱的到达序天然成立，快照点之后旧实现处于
+  静默态，不存在"快照后被修改"的可能。
+
+代价与边界（实话）：
+
+- 静默期间服务调用被**缓冲**而非拒绝，冲刷后由新实现处理——表现为
+  一次 reload 时长（毫秒级）的延迟毛刺；
+- 冲刷的**纯 send** 在新实现看到的 sender 是代理/PM 而非原始调用方
+  （request 不受影响，promise 保存原始路由）；业务 handler 若依赖
+  sender 身份需注意；
+- 绕过代理直连插件 actor 的调用不受 quiesce 约束（lifecycle 消息同理），
+  调用方需自行避开 reload 窗口。
 
 ### 为什么必须新路径
 
@@ -194,7 +221,7 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
 | ✅ | handler 业务逻辑 | v2 演示：string handler 返回 `processed by v2: ...` |
 | ✅ | 内部状态结构 | 只要 save/restore 字节格式跨版本兼容（移交是直接内存拷贝） |
 | ✅ | 对**已注册类型**新增 handler | 类型系统没动，行为随便改 |
-| ✅ | 同名服务实现切换 | 代理 drain 保证在途请求不丢；ACL 白名单记的是调用方，热切换后原样保留 |
+| ✅ | 同名服务实现切换 | 代理 quiesce/resume 静默切换 + 缓冲冲刷，在途请求不丢；ACL 白名单记的是调用方，热切换后原样保留 |
 | ❌ | **新增未注册的 type_id（协议号）** | 元对象必须在 actor_system 构造前注册；热更新路径调新 DLL 的 `register_meta_objects` 会因重复注册同一段直接 abort |
 | ❌ | C ABI / PluginEntry 接口 | create/destroy/manifest/spawn 签名必须兼容 |
 | ❌ | manifest.name | reload 按名匹配 |
@@ -236,8 +263,14 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
 - **消息类型必须与接收方 handler 精确匹配**：代理 drain 旧实现时曾误发
   `self->address()`（`actor_addr`），而插件 drain handler 匹配
   `(drain_atom, caf::actor)`——类型不符 → 意外消息 → 旧 actor 被杀而非
-  正常排空。应发 `caf::actor_cast<caf::actor>(self)` 的句柄
-  （§8 热更新的代理 drain 链路依赖这一点）；
+  正常排空。应发 `caf::actor_cast<caf::actor>(self)` 的句柄。
+  （现热更新已改走 §8 的 quiesce/resume 静默切换，不再 drain 旧实现；
+  drain 协议仍服务于 GracefulShutdown 的优雅关机路径）；
+- **暂存 request 的正确姿势（代理缓冲的实现要点）**：default_handler 里
+  `make_response_promise()` 取走承诺 + 返回 `delegated<message>`（承诺
+  存着原 sender/mid，CAF 不会自动响应也不会断约）；冲刷时用
+  `promise.delegate(target, msg)` 转发——对单个 `caf::message` 参数
+  原样透传不二次包装，响应直达原调用方。纯 send 无承诺，普通转发即可；
 - **FreeLibrary 过早会崩（0xC0000005）**：actor 的 vtable/lambda 和元对象的
   destroy/copy 函数指针都在 DLL 代码段，而 CAF 的引用释放是异步的——
   卸载 DLL 后，迟到的清理会跳到已卸载代码。因此 `meta_lib_pool`
@@ -253,7 +286,7 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
   仅 reload 时进 plugin 池一次；
 - **actor 退出 ≠ 可以卸载 DLL**：down_msg 只表示 actor 终止运行；actor 实现
   对象是侵入式引用计数的，析构发生在最后一个 `caf::actor` 句柄释放时——
-  registry 的 `entry.impl`、proxy 的 `s.old`、PM 的 `plugins_`/`retired_`
+  registry 的 `entry.impl`、代理的 `current`、PM 的 `plugins_`/`retired_`
   全是强引用，CAF 不提供"最后一根引用已释放"的通知，FreeLibrary 后迟到的
   析构会在某个 worker 线程跳进已卸载代码（0xC0000005）。元对象表同样不可
   按插件注销：`set_global_meta_objects` 对已有段直接 abort、actor_system
