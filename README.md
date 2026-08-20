@@ -51,6 +51,7 @@ cmake --list-presets
 
 # Windows (Visual Studio 2022)
 cmake --preset windows-x64
+cmake --build --preset windows-x64-debug
 cmake --build --preset windows-x64-release
 
 # Windows (Ninja)

@@ -5,6 +5,8 @@
 #include <iostream>
 #include <cstring>
 
+class BusinessPlugin : public PluginEntry {
+
 #define PLUGIN_NAME "business"
 
 class BusinessPlugin : public PluginEntry {

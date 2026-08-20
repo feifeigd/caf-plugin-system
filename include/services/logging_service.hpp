@@ -29,6 +29,18 @@ inline void send_log(const caf::actor& logger,
 // 变参日志宏（基于 fmt::format，支持 {} 占位符）
 //
 // 使用方式：
+//   在插件的 CMakeLists.txt 中定义 PLUGIN_NAME：
+//     target_compile_definitions(xxx_plugin PRIVATE PLUGIN_NAME="xxx")
+//
+//   LOG_INFO(logger,  "order {} created, price={}", order_id, price);
+//   LOG_DEBUG(logger, "current state: {}", state);
+//   LOG_WARN(logger,  "connection slow: {}ms", latency);
+//   LOG_ERROR(logger, "failed to open {}", path);
+// ------------------------------------------------------------------
+
+#ifndef PLUGIN_NAME
+    #error "PLUGIN_NAME must be defined. Add target_compile_definitions(your_plugin PRIVATE PLUGIN_NAME=\"name\") in CMakeLists.txt"
+#endif
 //   #define PLUGIN_NAME "business"
 //   #include "services/logging_service.hpp"
 //

@@ -9,6 +9,8 @@
 #include <cstring>
 
 class LoggerPlugin : public PluginEntry {
+
+class LoggerPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"LoggerPlugin", "1.0.0", {}, {"logging_service"}, -100};
