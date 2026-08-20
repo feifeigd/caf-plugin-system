@@ -1,15 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ------------------------------------------------------------------
-# vcpkg toolchain 必须在 project() 之前设置，否则第一次 configure 不会生效
+# vcpkg toolchain 必须在 project() 之前设置
+# 优先级：1) 环境变量 2) 项目同级目录 3) VS2022 自带
 # ------------------------------------------------------------------
-if(DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake")
-    set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/scripts/buildsystems/vcpkg.cmake")
-    set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-endif()
+set(VCPKG_TOOLCHAIN_CANDIDATES
+    "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/scripts/buildsystems/vcpkg.cmake"
+    "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake"
+)
+
+foreach(candidate IN LISTS VCPKG_TOOLCHAIN_CANDIDATES)
+    if(EXISTS "${candidate}")
+        set(CMAKE_TOOLCHAIN_FILE "${candidate}" CACHE STRING "")
+        message(STATUS "vcpkg toolchain: ${candidate}")
+        break()
+    endif()
+endforeach()
 
 project(caf-plugin-system VERSION 1.0.0 LANGUAGES CXX)
 

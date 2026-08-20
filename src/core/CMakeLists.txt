@@ -7,6 +7,7 @@ add_library(caf_plugin_core STATIC
     checkpoint_manager.cpp
     graceful_shutdown.cpp
     plugin_manager.cpp
+    plugin_loader.cpp
 )
 
 target_include_directories(caf_plugin_core PUBLIC

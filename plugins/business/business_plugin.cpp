@@ -3,10 +3,10 @@
 #include <iostream>
 #include <cstring>
 
-using init_atom = caf::atom_constant<caf::atom("init")>;
-using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
-using drain_atom = caf::atom_constant<caf::atom("drain")>;
-using save_state_atom = caf::atom_constant<caf::atom("savest")>;
+using init_atom          = caf::atom_constant<caf::atom("init")>;
+using shutdown_atom      = caf::atom_constant<caf::atom("shutd")>;
+using drain_atom         = caf::atom_constant<caf::atom("drain")>;
+using save_state_atom    = caf::atom_constant<caf::atom("savest")>;
 using restore_state_atom = caf::atom_constant<caf::atom("restore")>;
 
 class BusinessPlugin : public PluginEntry {

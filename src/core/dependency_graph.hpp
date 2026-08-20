@@ -24,16 +24,17 @@ public:
         graph_[plugin_name] = plugin_deps;
     }
 
+    /// 循环检测
     bool has_cycle_from(const std::string& plugin_name) const {
-        std::unordered_set<std::string> visiting;
-        std::unordered_set<std::string> visited;
+        std::unordered_set<std::string> visiting; // 当前路径栈
+        std::unordered_set<std::string> visited;  // 已经确认没环的节点
         return dfs(plugin_name, visiting, visited);
     }
 
     std::vector<std::string> topological_order() const {
         std::vector<std::string> result;
         std::unordered_set<std::string> visited;
-        std::unordered_set<std::string> temp_mark;
+        std::unordered_set<std::string> temp_mark; // 当前深度优先搜索栈
 
         for (const auto& [node, _] : graph_) {
             if (!visited.count(node)) {
@@ -55,7 +56,7 @@ private:
              std::unordered_set<std::string>& visiting,
              std::unordered_set<std::string>& visited) const {
         if (visiting.count(node)) return true;
-        if (visited.count(node)) return false;
+        if (visited.count(node)) return false; // 已经确认没环的节点
 
         visiting.insert(node);
         auto it = graph_.find(node);
@@ -65,7 +66,7 @@ private:
             }
         }
         visiting.erase(node);
-        visited.insert(node);
+        visited.insert(node); // 已经确认没环的节点
         return false;
     }
 

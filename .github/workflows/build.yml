@@ -51,7 +51,15 @@ jobs:
           -DCMAKE_CXX_STANDARD=20
 
     - name: Build (Release)
-      run: cmake --build build --config Release --parallel $(nproc)
+      run: |
+        cmake --build build --config Release --parallel $(nproc) 2>&1 | tee build-release.log
+
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-release
+        path: build-release.log
 
     - name: Run tests
       run: ctest --test-dir build --output-on-failure
@@ -66,4 +74,12 @@ jobs:
           -DCMAKE_CXX_STANDARD=20
 
     - name: Build (Debug)
-      run: cmake --build build-debug --config Debug --parallel $(nproc)
+      run: |
+        cmake --build build-debug --config Debug --parallel $(nproc) 2>&1 | tee build-debug.log
+
+    - name: Upload debug build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-debug
+        path: build-debug.log

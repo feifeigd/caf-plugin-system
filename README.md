@@ -24,9 +24,10 @@ caf-plugin-system/
 │   ├── service_registry.hpp/cpp # IoC 服务注册表
 │   ├── checkpoint_manager.cpp  # 状态存盘管理
 │   ├── graceful_shutdown.hpp/cpp # 优雅关机协调器
-│   └── plugin_manager.hpp/cpp  # 插件管理器
+│   ├── plugin_manager.hpp/cpp  # 插件管理器
+│   └── plugin_loader.hpp/cpp   # 插件扫描 + 依赖解析 + 拓扑排序
 ├── src/app/
-│   └── main.cpp                # 主程序
+│   └── main.cpp                # 主程序（CAF 配置 + 启动流程）
 ├── plugins/                    # 示例插件
 │   ├── logger/
 │   └── business/
@@ -42,7 +43,40 @@ caf-plugin-system/
 
 ## 构建步骤
 
-### Linux / macOS
+### 使用 CMake Preset（推荐）
+
+```bash
+# 列出可用 preset
+cmake --list-presets
+
+# Windows (Visual Studio 2022)
+cmake --preset windows-x64
+cmake --build --preset windows-x64-release
+
+# Windows (Ninja)
+cmake --preset windows-x64-ninja
+cmake --build --preset windows-x64-release
+
+# Linux Debug
+cmake --preset linux-x64-debug
+cmake --build --preset linux-x64-debug
+
+# Linux Release
+cmake --preset linux-x64-release
+cmake --build --preset linux-x64-release
+```
+
+### VS Code
+
+安装 **CMake Tools** 扩展后，状态栏会自动识别 `CMakePresets.json`：
+
+1. 点击状态栏的 **Configure Preset** → 选择 `windows-x64`（或 `linux-x64-release`）
+2. 点击 **Build** → 自动编译
+3. 点击 **Run** → 启动 `caf_plugin_app`
+
+### 手动构建
+
+#### Linux / macOS
 
 ```bash
 export VCPKG_ROOT=/path/to/vcpkg
@@ -51,13 +85,27 @@ cmake --build build --parallel
 ./build/caf_plugin_app
 ```
 
-### Windows (Visual Studio 2022)
+#### Windows (Visual Studio 2022)
 
 ```powershell
 $env:VCPKG_ROOT = "C:\path\to\vcpkg"
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
 cmake --build build --config Release
 .\build\Release\caf_plugin_app.exe
+```
+
+## 配置插件入口
+
+在 `app.ini` 中声明顶层插件，系统自动解析依赖并拓扑排序加载：
+
+```ini
+[caf-plugin-system]
+entry-plugins=["BusinessPlugin"]
+```
+
+运行时：
+```bash
+./caf_plugin_app --config-file=app.ini
 ```
 
 ## 跨平台动态库加载
