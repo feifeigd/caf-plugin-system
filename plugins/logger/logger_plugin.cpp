@@ -6,7 +6,17 @@
 #include <unordered_map>
 #include <memory>
 #include <cstddef>
+#include "plugin_interface.hpp"
+#include "services/logging_service.hpp"
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <unordered_map>
+#include <memory>
+#include <cstddef>
 #include <cstring>
+
+class LoggerPlugin : public PluginEntry {
 
 using init_atom = caf::atom_constant<caf::atom("init")>;
 using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;

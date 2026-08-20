@@ -2,14 +2,7 @@
 #include <caf/all.hpp>
 #include <vector>
 #include <chrono>
-
-using shutdown_atom         = caf::atom_constant<caf::atom("shutd")>;
-using drain_atom            = caf::atom_constant<caf::atom("drain")>;
-using force_exit_atom       = caf::atom_constant<caf::atom("force")>;
-using ready_atom            = caf::atom_constant<caf::atom("ready")>;
-using health_check_atom     = caf::atom_constant<caf::atom("hcheck")>;
-using plugin_saved_atom     = caf::atom_constant<caf::atom("plgsaved")>;
-using request_shutdown_atom = caf::atom_constant<caf::atom("rqshut")>;  // ← 插件请求关机
+#include "common/lifecycle_atoms.hpp"
 
 enum class SystemState { initializing, ready, shutting_down, stopped };
 

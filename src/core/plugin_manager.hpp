@@ -6,14 +6,6 @@
 #include "graceful_shutdown.hpp"
 #include <map>
 
-using load_atom          = caf::atom_constant<caf::atom("load")>;
-using unload_atom        = caf::atom_constant<caf::atom("unload")>;
-using list_atom          = caf::atom_constant<caf::atom("list")>;
-using resolve_plugin_atom = caf::atom_constant<caf::atom("resplug")>;
-using ping_atom          = caf::atom_constant<caf::atom("ping")>;
-using pong_atom          = caf::atom_constant<caf::atom("pong")>;
-using init_atom          = caf::atom_constant<caf::atom("init")>;
-
 // 插件 C ABI 函数签名
 using CreatePluginFunc  = PluginEntry* (*)();
 using DestroyPluginFunc = void (*)(PluginEntry*);

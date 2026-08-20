@@ -2,6 +2,10 @@
 #include <string>
 #include <vector>
 #include <caf/all.hpp>
+#include "common/lifecycle_atoms.hpp"
+#include <string>
+#include <vector>
+#include <caf/all.hpp>
 
 // ------------------------------------------------------------------
 // 跨平台导出宏

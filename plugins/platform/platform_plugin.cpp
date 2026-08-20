@@ -4,7 +4,15 @@
 #include <cstddef>
 #include <iostream>
 #include <cstring>
+#include "plugin_interface.hpp"
+#include "services/config_service.hpp"
+#include "services/metrics_service.hpp"
+#include <cstddef>
+#include <iostream>
+#include <cstring>
 #include <map>
+
+struct PlatformState {
 
 using init_atom    = caf::atom_constant<caf::atom("init")>;
 using shutdown_atom = caf::atom_constant<caf::atom("shutd")>;
