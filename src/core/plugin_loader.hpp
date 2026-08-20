@@ -19,6 +19,12 @@ struct PluginInfo {
 // 预加载插件：打开动态库 → create_plugin() → manifest() → destroy()，不创建 actor
 std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path);
 
+// 元对象预注册：扫描插件目录，调用各插件的可选导出 register_meta_objects()
+// （见 plugin_interface.hpp）。CAF 1.1 禁止在 actor_system 构造之后注册
+// 元对象（UB），因此必须在 main() 里、构造 actor_system 之前调用本函数。
+// 含有该导出的 DLL 会常驻进程（元对象函数指针指向 DLL 代码段）。
+void preregister_plugin_meta(const std::filesystem::path& root);
+
 // 扫描插件目录，预加载所有插件获取 manifest
 std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root);
 

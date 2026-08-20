@@ -1,9 +1,47 @@
 #include "plugin_loader.hpp"
 #include <caf/logger.hpp>
+#include <deque>
 #include <iostream>
 #include <unordered_set>
 #include <algorithm>
 #include <cctype>
+
+namespace {
+/// 注册了元对象的插件 DLL 句柄池（进程级常驻）。
+/// 元对象里的 destroy/copy 函数指针指向 DLL 代码段，FreeLibrary 后
+/// 消息析构会跳到已卸载代码（0xC0000005）。进程退出时由 OS 回收。
+std::deque<DynamicLibrary>& meta_lib_pool() {
+    static std::deque<DynamicLibrary> pool;
+    return pool;
+}
+} // namespace
+
+void preregister_plugin_meta(const std::filesystem::path& root) {
+    if (!std::filesystem::exists(root)) return;
+
+    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        if (!entry.is_directory()) continue;
+        for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
+            auto ext = file.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            std::string expected(PLUGIN_EXT);
+            std::transform(expected.begin(), expected.end(), expected.begin(), ::tolower);
+            if (ext != expected) continue;
+
+            auto lib_opt = DynamicLibrary::open(file.path());
+            if (!lib_opt) continue;  // 打不开的留给 scan_all_plugins 报告
+
+            auto reg = lib_opt->symbol<void (*)()>("register_meta_objects");
+            if (!reg) continue;      // 无该导出：插件没有私有消息类型，句柄随作用域释放
+
+            reg();  // 插件自注册私有类型的元对象（此时任何 actor_system 都还不存在）
+            // 注意：此刻 CAF logger 尚未创建，CAF_LOG_* 会被丢弃，只能用 std::cout
+            std::cout << "[Loader] Plugin self-registered meta objects: "
+                      << file.path().string() << std::endl;
+            meta_lib_pool().push_back(std::move(*lib_opt));
+        }
+    }
+}
 
 std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path) {
     auto lib_opt = DynamicLibrary::open(path);
@@ -28,7 +66,7 @@ std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path) {
 std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root) {
     std::vector<PluginInfo> result;
     if (!std::filesystem::exists(root)) {
-        CAF_LOG_WARN("Plugin directory not found: " << root.string());
+        CAF_LOG_WARNING("Plugin directory not found: " << root.string());
         return result;
     }
 

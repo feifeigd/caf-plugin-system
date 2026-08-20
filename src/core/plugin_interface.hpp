@@ -1,11 +1,8 @@
 #pragma once
+
+#include <caf/all.hpp>
 #include <string>
 #include <vector>
-#include <caf/all.hpp>
-#include "common/lifecycle_atoms.hpp"
-#include <string>
-#include <vector>
-#include <caf/all.hpp>
 
 // ------------------------------------------------------------------
 // 跨平台导出宏
@@ -24,12 +21,11 @@ struct plugin_manifest {
     std::string version;
     std::vector<std::string> dependencies;   // 依赖的服务名
     std::vector<std::string> provides;       // 提供的服务名
-    int priority = 0;                        // ← 加载优先级（越小越先加载，负数给基础设施）
-};
-    std::string name;
-    std::string version;
-    std::vector<std::string> dependencies;   // 依赖的服务名
-    std::vector<std::string> provides;       // 提供的服务名
+    int priority = 0;                        // 加载优先级：越小越先加载
+    // 服务代理 ACL：声明后，本插件提供的所有服务只接受清单内插件的调用，
+    // 其余 sender 的消息在代理处被拦截（见 docs/plugin-guide.md §6）。
+    // 空 = 开放策略（默认，兼容旧行为）。
+    std::vector<std::string> acl_allow;
 };
 
 // ------------------------------------------------------------------
@@ -55,6 +51,22 @@ public:
 extern "C" {
     PLUGIN_API PluginEntry* create_plugin();
     PLUGIN_API void destroy_plugin(PluginEntry* p);
+
+    // 可选导出：插件私有消息类型的元对象自注册（CAF 1.1 必需，没有私有
+    // 消息类型的插件可以不实现）。
+    //
+    // 若插件定义了自己的消息类型（含自定义标签），在函数体内调用：
+    //     caf::detail::set_global_meta_objects(段起点, 元对象表);
+    // 框架在构造任何 actor_system 之前调用本导出（CAF 规定之后再注册
+    // 是未定义行为；重复注册同一段会 abort，可用于发现段冲突）。
+    //
+    // type_id 段约定（详见 docs/plugin-guide.md §2/§6）：
+    //   200 ~ 999    内核/框架（common/message_tags.def）
+    //   1000 ~ 4999  插件私有·系统级（受信组件间通信，默认信任）
+    //   5000+        插件私有·用户级（源头可达用户/外部输入，handler
+    //                须在副作用前自行校验调用方权限）
+    // 每个插件自选互不重叠的段（CAF 支持 ID 空洞，多段可分多次注册）。
+    PLUGIN_API void register_meta_objects();
 }
 
 // ------------------------------------------------------------------
