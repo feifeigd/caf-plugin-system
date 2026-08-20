@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CAF Plugin System - 交互时序图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    line-height: 1.6;
+    padding: 24px;
+  }
+  h1 {
+    text-align: center;
+    margin-bottom: 8px;
+    font-size: 22px;
+    color: #38bdf8;
+  }
+  .subtitle {
+    text-align: center;
+    color: #94a3b8;
+    font-size: 13px;
+    margin-bottom: 28px;
+  }
+  .section {
+    margin-bottom: 32px;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 20px;
+    border: 1px solid #334155;
+  }
+  .section h2 {
+    font-size: 15px;
+    color: #7dd3fc;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .section h2 .num {
+    background: #0ea5e9;
+    color: #fff;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .mermaid {
+    display: flex;
+    justify-content: center;
+  }
+  .note {
+    background: #0f172a;
+    border-left: 3px solid #0ea5e9;
+    padding: 10px 14px;
+    margin-top: 12px;
+    border-radius: 0 8px 8px 0;
+    font-size: 13px;
+    color: #cbd5e1;
+  }
+  .note code {
+    background: #334155;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 16px;
+    font-size: 12px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #0f172a;
+    padding: 4px 10px;
+    border-radius: 6px;
+  }
+  .legend-item .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+  .dot-blue { background: #0ea5e9; }
+  .dot-green { background: #22c55e; }
+  .dot-amber { background: #f59e0b; }
+  .dot-red { background: #ef4444; }
+</style>
+</head>
+<body>
+
+<h1>🎭 CAF Plugin System 交互时序图</h1>
+<p class="subtitle">插件加载 → 服务注册 → 消息调用 → 热重载 完整流程</p>
+
+<div class="section">
+  <h2><span class="num">1</span> 系统启动与插件加载</h2>
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor Main as main()
+    participant PM as PluginManager
+    participant SR as ServiceRegistry
+    participant LP as LoggerPlugin
+    participant BP as BusinessPlugin
+
+    Main->>SR: spawn ServiceRegistry
+    Main->>PM: spawn PluginManager(registry, checkpoint)
+    Main->>PM: load "LoggerPlugin"
+    PM->>LP: load library → create → spawn actor
+    PM->>LP: send(init_atom, PM, "")
+    LP-->>PM: init done
+    PM->>SR: register("logging_service", LP_actor)
+    SR->>SR: spawn proxy for logging_service
+    SR-->>PM: registered
+    PM-->>Main: LoggerPlugin loaded
+
+    Main->>PM: load "BusinessPlugin"
+    PM->>SR: resolve("logging_service")
+    SR-->>PM: return proxy_actor
+    PM->>BP: load library → create → spawn(actor, [proxy])
+    PM->>BP: send(init_atom, PM, "")
+    BP->>BP: save plugin_mgr ref
+    BP-->>PM: init done
+    PM->>SR: register("business_service", BP_actor)
+    SR-->>PM: registered
+    PM-->>Main: BusinessPlugin loaded
+  </div>
+  <div class="note">
+    💡 <strong>关键点：</strong>BusinessPlugin 的 <code>deps[0]</code> 不是 LoggerPlugin 本尊，而是 <strong>ServiceRegistry 创建的 proxy actor</strong>。
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="num">2</span> 插件间消息调用（通过 Proxy）</h2>
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant BP as BusinessPlugin
+    participant Proxy as ServiceProxy
+    participant LP as LoggerPlugin
+
+    BP->>Proxy: send(log_atom, "INFO", "Business started")
+    Note over Proxy: proxy 持有 current=LP_actor
+    Proxy->>LP: forward(log_atom, "INFO", "Business started")
+    LP-->>Proxy: processed
+    Note over BP,LP: BusinessPlugin 全程不知道 LP_actor 是谁<br/>只知道 "logging_service" 这个服务名
+  </div>
+  <div class="note">
+    💡 <strong>为什么用 proxy？</strong> 如果 BusinessPlugin 直接持有 LoggerPlugin 句柄，LoggerPlugin 崩溃时 BusinessPlugin 会收到死信。Proxy 作为中间层，可以在背后<strong>无缝切换实现</strong>而不让调用方感知。
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="num">3</span> 热重载（不中断业务）</h2>
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor Admin as 管理员/触发器
+    participant PM as PluginManager
+    participant SR as ServiceRegistry
+    participant OldProxy as Proxy(v1)
+    participant OldLP as LoggerPlugin v1
+    participant NewLP as LoggerPlugin v2
+
+    Admin->>PM: hot reload "LoggerPlugin"
+    PM->>PM: unload old, load new
+    PM->>NewLP: spawn LoggerPlugin v2
+    PM->>NewLP: send(init_atom, PM, "")
+    NewLP-->>PM: init done
+
+    PM->>SR: hot_reload("logging_service", NewLP)
+    SR->>OldProxy: switch_target(NewLP, v2)
+    OldProxy->>OldProxy: current = NewLP, old = OldLP
+    OldProxy->>OldLP: send(drain_done, OldProxy)
+    Note over OldProxy: 新请求 → NewLP<br/>旧请求继续由 OldLP 处理完
+
+    loop 等待旧版本 drain 完成
+        OldLP-->>OldProxy: drain_done ack
+    end
+
+    OldProxy->>OldProxy: old = nullptr
+    PM->>OldLP: send_exit(shutdown)
+    PM->>OldLP: destroy_plugin()
+    Note over OldLP: v1 安全退出
+
+    BusinessPlugin->>OldProxy: send(log_atom, ...)
+    OldProxy->>NewLP: forward to v2
+  </div>
+  <div class="note">
+    💡 <strong>零停机热重载：</strong>Proxy 先把新请求路由到 v2，等 v1 的<strong>在途请求全部处理完</strong>后再退出 v1。BusinessPlugin 整个过程完全无感知。
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="num">4</span> 插件请求系统关机</h2>
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户/CLI
+    participant BP as BusinessPlugin
+    participant PM as PluginManager
+    participant GS as GracefulShutdown
+    participant SR as ServiceRegistry
+    participant CP as CheckpointManager
+
+    User->>BP: send("shutdown")
+    BP->>PM: send(request_shutdown_atom)
+    PM->>GS: forward(shutdown_atom)
+
+    GS->>SR: send(shutdown_atom)
+    GS->>GS: remaining = ["BusinessPlugin", "LoggerPlugin"]
+
+    GS->>PM: resolve("BusinessPlugin")
+    PM-->>GS: return BP_actor
+    GS->>BP: send(drain_atom, GS)
+    BP->>BP: 停止接收新请求，处理完在途请求
+    BP->>GS: send(drain_done, BP_addr)
+    GS->>BP: send(save_state_atom)
+    BP-->>GS: return checkpoint data
+    GS->>CP: save_state("BusinessPlugin", data)
+    CP-->>GS: saved
+    GS->>BP: send(shutdown_atom)
+    BP->>BP: quit()
+    PM->>BP: monitor 检测到 down_msg
+    PM->>BP: destroy_plugin()
+
+    Note over GS: 对 LoggerPlugin 重复同样的流程...
+
+    GS->>SR: send_exit(shutdown)
+    GS->>CP: send_exit(shutdown)
+    GS->>GS: quit()
+    GS-->>Main: 所有 actor 已退出
+  </div>
+  <div class="note">
+    💡 <strong>优雅关机顺序：</strong>按 <code>shutdown_order</code> 的<strong>逆序</strong>逐个关闭（依赖方先停，被依赖方后停），每个插件都有机会保存状态到 CheckpointManager。
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="num">5</span> 类图与依赖关系</h2>
+  <div class="mermaid">
+classDiagram
+    class PluginEntry {
+        +manifest() plugin_manifest
+        +spawn(sys, deps, config) caf::actor
+    }
+    class LoggerPlugin {
+        +manifest()
+        +spawn()
+    }
+    class BusinessPlugin {
+        +manifest()
+        +spawn()
+    }
+    class PluginManager {
+        -registry_ : caf::actor
+        -checkpoint_mgr_ : caf::actor
+        -shutdown_mgr_ : caf::actor
+        -plugins_ : map
+        +make_behavior()
+    }
+    class ServiceRegistry {
+        +make_behavior()
+    }
+    class GracefulShutdown {
+        +make_behavior()
+    }
+    class CheckpointManager {
+        +make_behavior()
+    }
+    class DynamicLibrary {
+        +open(path) optional
+        +symbol(name) Func*
+    }
+
+    PluginEntry <|-- LoggerPlugin
+    PluginEntry <|-- BusinessPlugin
+    PluginManager --> ServiceRegistry : 注册/发现
+    PluginManager --> GracefulShutdown : 转发关机
+    PluginManager --> DynamicLibrary : 加载插件
+    ServiceRegistry --> "0..*" ServiceProxy : 创建
+    BusinessPlugin ..> ServiceRegistry : resolve 依赖
+  </div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="dot dot-blue"></div> 系统核心组件</div>
+  <div class="legend-item"><div class="dot dot-green"></div> 插件实现</div>
+  <div class="legend-item"><div class="dot dot-amber"></div> 代理/中间层</div>
+  <div class="legend-item"><div class="dot dot-red"></div> 关闭/销毁流程</div>
+</div>
+
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  sequence: {
+    actorMargin: 60,
+    diagramMarginX: 10,
+    diagramMarginY: 10,
+    boxMargin: 8,
+    boxTextMargin: 4,
+    noteMargin: 12,
+    messageMargin: 30,
+    mirrorActors: false,
+    bottomMarginAdj: 1
+  }
+});
+</script>
+
+</body>
+</html>
