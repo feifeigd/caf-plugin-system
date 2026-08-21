@@ -111,7 +111,7 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
     // ---- 第 1 步：入口插件 ----
     if (cfg.entry_plugins.empty()) {
         CAF_LOG_ERROR("No entry plugins configured. Use --caf-plugin-system.entry-plugins=PluginA,PluginB"
-                      " or --config-file=app.ini");
+                      " or --config-file=caf-application.conf");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }

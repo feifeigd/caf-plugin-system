@@ -17,7 +17,7 @@ using namespace caf_plugin_system;
 // ------------------------------------------------------------------
 // 进程配置 = 插件框架（caf_plugin_core） + 集群节点（caf_plugin_cluster）
 // 两个模块正交，可按需组合：
-//   - 纯插件进程：--config-file=app.ini
+//   - 纯插件进程：默认加载 caf-application.conf（CAF 默认文件名，无需参数）
 //   - 纯节点进程：--caf-plugin-system.node-kind=master|region|worker
 //   - 节点 + 插件：两者都配（region 上跑服务插件）
 // ------------------------------------------------------------------
