@@ -192,9 +192,9 @@ sequenceDiagram
     PM->>Proxy: send(resume_atom, NewLP)
     Note over Proxy: 切到 v2 并冲刷缓冲<br/>ACL 按原始调用方复查
 
-    PM->>OldLP: delayed_send(shutdown_atom, 2s)
+    PM->>OldLP: send_exit(user_shutdown) 立即冻结<br/>（丢弃在途异步响应，快照即终态）
     PM->>PM: down_msg → destroy 旧实例
-    Note over OldLP: v1 安全退役
+    Note over OldLP: v1 安全退役（状态冻结在快照时刻）
 
     BusinessPlugin->>Proxy: send(log_atom, ...)
     Proxy->>NewLP: forward to v2

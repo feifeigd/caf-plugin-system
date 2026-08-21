@@ -177,21 +177,41 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
    `resume_atom`：切到新实现并**冲刷缓冲**（按缓冲时记录的原始 sender
    复查 ACL；缓冲的 request 通过 `response_promise.delegate` 按原
    sender/mid 路由交付响应，调用方无感）；
-6. 旧实例退役：邮箱已空，2s 后收 `shutdown_atom` 退出，PluginManager 经
-   down_msg 销毁旧 C++ 对象；**旧 DLL 常驻句柄池不卸载**（actor vtable 在
-   DLL 代码段，CAF 异步释放引用，FreeLibrary 过早会崩——句柄池与热更新
-   不冲突，恰恰是热更新的前提）。
+6. 旧实例退役：**立即** `send_exit` 冻结——save_state 响应即邮箱排空证明，
+   此刻退出后，exit 之后的邮箱消息（含在途异步响应）被 CAF 丢弃，旧 actor
+   状态冻结在快照时刻，**快照即终态**。PluginManager 经 down_msg 销毁旧
+   C++ 对象；**旧 DLL 常驻句柄池不卸载**（actor vtable 在 DLL 代码段，CAF
+   异步释放引用，FreeLibrary 过早会崩——句柄池与热更新不冲突，恰恰是
+   热更新的前提）。
 
 ### 状态一致性（快照为什么不丢数据）
 
 热更新的经典难题是：快照之后、旧实现完全停下之前，旧实现处理的增量
-修改会丢（"以哪方为准都有问题"）。本实现用**消息顺序**消除该窗口，
-不需要锁：
+修改会丢（"以哪方为准都有问题"）。本实现用**消息顺序 + 立即冻结**
+消除该窗口，不需要锁：
 
 - quiesce 的 ack 是代理侧屏障：ack 之前的调用都已离开代理；
 - save_state 的响应是旧 actor 侧屏障：响应之前其邮箱已排空；
-- 两个屏障都靠 CAF 邮箱的到达序天然成立，快照点之后旧实现处于
-  静默态，不存在"快照后被修改"的可能。
+- 快照后**立即** send_exit：exit 之后的邮箱消息（含在途异步响应——
+  pending promise 的回调）被丢弃，回调永不执行，旧 actor 状态不再
+  变更，快照即终态。
+
+### 异步 promise 的一致性语义
+
+注意：**邮箱排空 ≠ 无 pending promise**。旧 actor 处理最后一批调用时
+可能发起异步 request（handler 挂起等响应），快照时刻这些回调尚未执行，
+快照不含其变更。这不丢数据：
+
+- CAF 的原子性保证：回调执行与 deliver 调用方响应在**同一消息处理内**，
+  "状态已变更" ⇔ "调用方已收到响应"，不存在中间态；
+- 未 settle 的异步工作随旧 actor 终止：CAF 自动向调用方交付
+  `sec::actor_died`，调用方**重试打新实例**，变更在新实例上完整发生；
+- 残余窗口：异步响应若恰好在 save_state 处理完与 exit 入队之间到达，
+  仍会被处理（微秒级竞态）。要 100% 消除，插件可在 save_state handler
+  内 `self->quit()` 自我冻结。
+
+插件开发约定：handler 的异步结果要么在响应回调内同步落状态并交付
+调用方，要么接受调用方重试——快照只保证**已提交状态**。
 
 代价与边界（实话）：
 

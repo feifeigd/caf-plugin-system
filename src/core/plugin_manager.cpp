@@ -99,7 +99,7 @@ caf::behavior PluginManager::make_behavior() {
                 self->send(actor, restore_state_atom{}, state_data);
             }
 
-            self->monitor(actor);
+			self->monitor(actor);   // actor 退出，self 会收到 down_msg
             self->send(actor, init_atom{}, self, "");
 
             for (const auto& svc : manifest.provides) {
@@ -177,7 +177,7 @@ caf::behavior PluginManager::make_behavior() {
 
             PluginEntry* new_plugin = create();
             auto manifest = new_plugin->manifest();
-            if (manifest.name != name) {
+            if (manifest.name != name) {    // 热更新，不能改变插件名字
                 destroy(new_plugin);
                 return caf::make_error(caf::sec::invalid_argument,
                                        "Reloaded manifest name mismatch: " + manifest.name);
@@ -213,6 +213,8 @@ caf::behavior PluginManager::make_behavior() {
                         .receive([&paused](bool b) { paused = b; },
                                  [](caf::error&) {});
                 }
+
+				// 代理静默失败：回滚已静默的代理，销毁新插件，返回错误
                 if (!paused) {
                     for (auto& p : proxies)
                         self->send(p, resume_atom{}, it->second.actor);
@@ -236,7 +238,7 @@ caf::behavior PluginManager::make_behavior() {
             if (!state_data.empty()) {
                 self->send(new_actor, restore_state_atom{}, state_data);
             }
-            self->monitor(new_actor);
+			self->monitor(new_actor);  // 新 actor 退出，self 会收到 down_msg
             self->send(new_actor, init_atom{}, self, "");
 
             // registry 台账（impl 引用与版本号）
@@ -250,10 +252,18 @@ caf::behavior PluginManager::make_behavior() {
                 self->send(p, resume_atom{}, new_actor);
             }
 
-            // 旧实例退役：邮箱已空（quiesce 屏障），2s 后退出，down_msg
-            // 到来时销毁旧实例（C++ 对象）；旧 DLL 留在句柄池。
-            self->delayed_send(it->second.actor, std::chrono::seconds(2),
-                               shutdown_atom{});
+            // 旧实例退役（快照即终态）：save_state 响应 = 邮箱已排空，
+            // 此刻【立即】send_exit 冻结——之前用 delayed 2s shutdown_atom
+            // 会留下一个窗口：异步响应（pending promise 的回调）在这段
+            // 时间里继续到达并执行，旧 actor 状态继续变更，快照 S1 就与
+            // 旧实例最终状态不一致了。立即退出后，exit 之后的邮箱消息
+            // （含在途异步响应）被 CAF 丢弃，回调永不执行，状态冻结在
+            // 快照时刻。调用方一致性由 actor_died 错误 + 重试保证
+            // （CAF 终止时未交付的 promise 自动交付 sec::actor_died）。
+            // 残余窗口：B 的异步响应若恰好在 save_state 处理完与 exit
+            // 入队之间到达，仍会被处理（微秒级竞态）。要 100% 消除，
+            // 插件可在 save_state handler 内 self->quit() 自我冻结。
+            self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
             retired_.push_back(std::move(it->second));
 
             plugin_lib_pool().push_back(std::move(*lib_opt));
@@ -273,15 +283,44 @@ caf::behavior PluginManager::make_behavior() {
                 return false;
             }
 
+            // 优雅退役（与热更新同一套屏障语义，见 reload_atom 注释）：
+            //   1. quiesce 全部服务代理并等 ack——ack 前代理 delegate 的
+            //      调用已同步入队旧 actor 邮箱（断流：该来的都来了）；
+            //   2. request save_state 构成邮箱到达序屏障：响应时旧 actor
+            //      已处理完全部在途调用（来了的都处理了）——此刻 send_exit
+            //      不会丢弃任何在途消息；
+            //   3. unregister 服务（proxy 随 unregister 退役，quiesce 期
+            //      缓冲的调用由 promise 析构自动交付 actor_died）；
+            //   4. 旧 actor send_exit → retired_，实例销毁统一等 down_msg。
+            //   注意：unregister 必须放在 quiesce 之后——它会让 proxy 退役，
+            //   先 unregister 则 resolve 拿不到 proxy，无法 quiesce。
+            caf::scoped_actor blocking{self->system()};
+
+            for (const auto& svc : it->second.manifest.provides) {
+                caf::actor proxy;
+                blocking->request(registry_, caf::infinite, resolve_atom{}, svc)
+                    .receive([&proxy](const caf::actor& a) { proxy = a; },
+                             [](caf::error&) {});
+                if (proxy) {
+                    blocking->request(proxy, std::chrono::seconds(5),
+                                      quiesce_atom{})
+                        .receive([](bool) {}, [](caf::error&) {});
+                }
+            }
+
+            // 排空屏障：响应 = 旧 actor 邮箱已空（save_state handler 返回
+            // 空数据也无妨，请求/响应机制本身就是排空证明）
+            blocking->request(it->second.actor, std::chrono::seconds(5),
+                              save_state_atom{})
+                .receive([](const std::vector<std::byte>&) {},
+                         [](caf::error&) {});
+
             for (const auto& svc : it->second.manifest.provides) {
                 self->send(registry_, unregister_atom{}, svc);
             }
 
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
-
-            if (it->second.destroy) {
-                it->second.destroy(it->second.instance);
-            }
+            retired_.push_back(std::move(it->second));
             plugins_.erase(it);
             CAF_LOG_INFO("Plugin unloaded: " << name);
             return true;
@@ -316,7 +355,7 @@ caf::behavior PluginManager::make_behavior() {
             // 热更新退役的旧 actor 退出：正常销毁旧实例，不算崩溃
             for (auto rit = retired_.begin(); rit != retired_.end(); ++rit) {
                 if (rit->actor && rit->actor->address() == dm.source) {
-                    CAF_LOG_INFO("Hot-reload: retired instance cleaned up");
+                    CAF_LOG_INFO("Retired instance cleaned up (hot-reload/unload)");
                     if (rit->destroy) {
                         rit->destroy(rit->instance);
                     }
