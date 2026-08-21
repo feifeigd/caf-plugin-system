@@ -26,7 +26,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
     };
 
     return sys.spawn([initial_target](caf::stateful_actor<ProxyState>* self) {
-        self->state().current = initial_target;
+        self->state().current = initial_target; // 实现
 
         // CAF 1.1: default_handler 使用 caf::message&（message_view 已移除）
         self->set_default_handler([self](caf::scheduled_actor*, caf::message& msg)
@@ -35,9 +35,11 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
             if (!st.current) {
                 return caf::make_error(caf::sec::invalid_request);
             }
+
+            // 热更新的时候，暂停消息的处理
             if (st.paused) {
                 // 静默中：只缓冲不处理，ACL 延后到冲刷时统一复查
-                caf::actor_addr from;
+                caf::actor_addr from; // msg 的发送者
                 if (auto& snd = self->current_sender()) from = snd->address();
                 if (self->current_message_id().is_request()) {
                     // request：取走响应承诺并返回 delegated（不等价于丢弃——
@@ -49,6 +51,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 st.buffered.push_back(Buffered{std::move(msg), from, {}});
                 return caf::make_message();
             }
+
             if (st.restricted) {
                 // ACL 拦截点：匿名 sender（anon_send）addr 为空，一律不受信
                 caf::actor_addr from;
@@ -76,15 +79,17 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 std::cout << "[Proxy] ACL enabled, " << s.allowed.size()
                           << " trusted sender(s)" << std::endl;
             },
+
             // 热更新·静默：暂停转发，新消息进缓冲。PM 以 request 调用并等
             // ack——代理邮箱 FIFO 保证：ack 之前到达的调用都已委托给旧实现。
             // 之后 PM 对旧 actor 的 save_state 构成邮箱到达序屏障：响应时
             // 旧 actor 已处理完全部在途工作（先排空后快照，无丢失窗口）。
             [=](quiesce_atom) -> bool {
-                self->state().paused = true;
+                self->state().paused = true;    // 暂停转发，新消息进缓冲
                 std::cout << "[Proxy] quiesced, buffering new calls" << std::endl;
-                return true;
+                return true;    // 设置暂停成功
             },
+
             // 热更新·恢复：切到新目标并冲刷缓冲（按缓冲时记录的原始 sender
             // 复查 ACL）。被 PM 以 send 调用，必须返回 void（CAF 1.1 里 send
             // 调用的 handler 返回值会回弹成普通消息）。
@@ -111,6 +116,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                         }
                         continue;
                     }
+                    
                     if (b.promise.pending()) {
                         // promise.delegate 对单个 caf::message 参数原样透传
                         // （response_promise.hpp 的 type_list<message> 分支），
