@@ -9,6 +9,8 @@ add_library(caf_plugin_core STATIC
     plugin_manager.cpp
     plugin_loader.cpp
     framework_bootstrap.cpp
+    cluster_master.cpp
+    cluster_client.cpp
 )
 
 target_include_directories(caf_plugin_core PUBLIC
@@ -17,7 +19,7 @@ target_include_directories(caf_plugin_core PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(caf_plugin_core PUBLIC CAF::core fmt::fmt)
+target_link_libraries(caf_plugin_core PUBLIC CAF::core CAF::io fmt::fmt)
 
 if(WIN32)
     target_compile_options(caf_plugin_core PRIVATE /FS)

@@ -76,3 +76,26 @@ X_TAG(set_acl_atom, 231)
 X_TAG(reload_atom, 232)
 X_TAG(quiesce_atom, 233)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
 X_TAG(resume_atom, 234)    // 代理恢复：切换到新实现并冲刷缓冲
+
+// -- 集群节点协议（master 扁平注册 + 子树，见 common/cluster_types.hpp）--
+// 机制移植自 warehouse-backend/distributed-nodes，类型注册沿用本文件
+// 显式 ID 方案（跨 DLL 一致，DLL 动态加载场景安全）。
+X_TAG(node_register_atom, 235)    // 节点注册（manifest + monitor）
+X_TAG(node_heartbeat_atom, 236)   // 心跳续租
+X_TAG(node_unregister_atom, 237)  // 节点注销
+X_TAG(node_topology_atom, 238)    // 全量拓扑快照
+X_TAG(node_children_atom, 239)    // 指定父节点的子树
+X_TAG(node_resolve_atom, 240)     // 解析节点上导出的 actor 路由
+X_TAG(node_shutdown_atom, 241)    // 关机级联请求
+X_REG(node_kind, (caf_plugin_system::node_kind), 242, "node_kind")
+X_REG(node_manifest, (caf_plugin_system::node_manifest), 243, "node_manifest")
+X_REG(node_registration, (caf_plugin_system::node_registration), 244, "node_registration")
+X_REG(register_reply, (caf_plugin_system::register_reply), 245, "register_reply")
+X_REG(topology_snapshot, (caf_plugin_system::topology_snapshot), 246, "topology_snapshot")
+X_REG(child_snapshot, (caf_plugin_system::child_snapshot), 247, "child_snapshot")
+X_REG(actor_route, (caf_plugin_system::actor_route), 248, "actor_route")
+X_REG(shutdown_request, (caf_plugin_system::shutdown_request), 249, "shutdown_request")
+X_REG(shutdown_source, (caf_plugin_system::shutdown_source), 250, "shutdown_source")
+X_TAG(heartbeat_tick_atom, 251)   // 节点客户端内部心跳定时器
+X_TAG(retry_tick_atom, 252)       // 节点客户端重连定时器
+X_TAG(maintenance_tick_atom, 253) // master 注册表维护周期（lease 过期清理）

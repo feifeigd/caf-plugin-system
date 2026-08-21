@@ -29,6 +29,7 @@
 // SystemState 等协议类型必须先于 def 展开完成声明（X_REG 要拿完整类型）
 #include "common/system_state.hpp"
 #include "common/plugin_envelope.hpp"
+#include "common/cluster_types.hpp"
 
 /// 定义一个空标签结构体并注册显式 type_id（旧 atom 的替代品）。
 #define CAF_MESSAGE_TAG(tag_name, tag_id)                                      \
