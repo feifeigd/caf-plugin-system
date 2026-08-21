@@ -1,4 +1,5 @@
 #include <caf/all.hpp>
+#include <caf/caf_main.hpp>
 #include <caf/init_global_meta_objects.hpp>
 #include <caf/logger.hpp>
 #include <iostream>
@@ -51,6 +52,14 @@ struct app_config : caf::actor_system_config {
     bool test_auto_shutdown = false;
 
     app_config() {
+        // 元对象注册必须在 actor_system 构造前（CAF 禁止后置，UB）。
+        // app_config 由 exec_main 在 parse 前、actor_system 构造前创建，
+        // 这里是最干净的注册窗口（CAF_MAIN 的模块参数机制只服务自带模块）。
+        app_meta::init();
+        // 插件私有消息类型的元对象：扫描插件目录并调用可选导出
+        // register_meta_objects()。注册了元对象的插件 DLL 自此常驻。
+        preregister_plugin_meta("./plugins");
+
         // CAF 1.1 框架日志配置：控制台 + 文件双输出
         set("caf.logger.console.verbosity", "info");
         set("caf.logger.file.verbosity", "debug");
@@ -260,24 +269,7 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     CAF_LOG_INFO("framework shutdown complete");
 }
 
-// 手写 main，避免 CAF_MAIN 宏的 id_block 限制
-int main(int argc, char** argv) {
-    // 手写 main 必须显式初始化 CAF 内置类型的运行时元对象（CAF_MAIN 会自动做这件事）
-    caf::core::init_global_meta_objects();
-    // CAF 1.1 消息析构通过元对象表调用 destroy；自定义类型也必须注册，
-    // 否则消息释放时会通过空元对象指针发起调用（exec at 0x0 崩溃）
-    app_meta::init();
-    // 插件私有消息类型的元对象：CAF 禁止在 actor_system 构造后注册（UB），
-    // 故提前扫描插件目录并调用各插件的可选导出 register_meta_objects()。
-    // 注册了元对象的插件 DLL 自此常驻（元对象函数指针指向 DLL 代码段）。
-    preregister_plugin_meta("./plugins");
-
-    app_config cfg;
-    if (auto err = cfg.parse(argc, argv)) {
-        std::cerr << "Config error: " << caf::to_string(err) << std::endl;
-        return 1;
-    }
-    caf::actor_system sys{cfg};
-    caf_main(sys, cfg);
-    return 0;
-}
+// 手写 main 的历史原因（CAF 0.x 的 id_block 限制）在 CAF 1.1 已不存在。
+// CAF_MAIN 自动处理：core 元对象 → cfg 构造（含 app_meta/插件元对象注册）→
+// cfg.parse（错误处理）→ helptext 检查 → actor_system 构造 → caf_main。
+CAF_MAIN()
