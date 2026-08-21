@@ -64,7 +64,16 @@ caf::behavior GracefulShutdown::make_behavior() {
 
         [=, this](shutdown_atom) {
             if (state_.state != SystemState::ready) {
-                std::cout << "[Shutdown] Already shutting down or not ready" << std::endl;
+                // 未就绪（启动早期）也强制退出：Ctrl+C 任何阶段必须能响应，
+                // 否则 actor_system 析构会等核心 actor 永久挂起。
+                if (state_.state != SystemState::stopped) {
+                    std::cout << "[Shutdown] Not ready, forcing exit..." << std::endl;
+                    self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
+                    self->send_exit(registry, caf::exit_reason::user_shutdown);
+                    self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
+                    state_.state = SystemState::stopped;
+                    self->quit();
+                }
                 return;
             }
             state_.state = SystemState::shutting_down;

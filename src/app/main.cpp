@@ -145,6 +145,14 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     // ---- 等待关机：插件模式等 shutdown_mgr；纯节点模式等节点 actor ----
     if (!cfg.entry_plugins.empty()) {
         wait_for_shutdown(sys, fw);
+        // 混合模式：优雅流程只停插件侧，节点 actor 需显式停止，
+        // 否则 actor_system 析构会等 master/client 永久挂起（进程不退出）。
+        if (cfg.node_cfg.is_node()) {
+            if (nb.master)
+                caf::anon_send_exit(nb.master, caf::exit_reason::user_shutdown);
+            if (nb.client)
+                caf::anon_send_exit(nb.client, caf::exit_reason::user_shutdown);
+        }
     } else if (cfg.node_cfg.is_node()) {
         cluster::wait_for_node_shutdown(sys, nb);
     }

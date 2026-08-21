@@ -11,14 +11,19 @@
 #include <caf/logger.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sys/stat.h>
 #endif
 
 namespace caf_plugin_system {
@@ -31,20 +36,63 @@ caf::actor& shutdown_manager_ref() {
     return mgr;
 }
 
+/// 强退兜底：优雅关机链路有任何 actor 未停（如集群节点 actor），
+/// actor_system 析构会永久挂起。触发关机后 3 秒仍未退出则强制退出。
+void arm_force_exit_fallback() {
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        std::cout << "[System] Shutdown fallback: force exit" << std::endl;
+        std::_Exit(0);
+    }).detach();
+}
+
+/// stdin 管道 EOF 哨兵（WSL interop）：Ctrl+C 只杀 bash，exe 变孤儿；
+/// 父进程/终端消失 → 管道写端关闭 → EOF → 触发优雅关机。
+/// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发。
+void install_stdin_watchdog(caf::actor target) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_fstat64(_fileno(stdin), &st) != 0
+        || (st.st_mode & _S_IFMT) != _S_IFIFO)
+        return;
+#else
+    struct stat st;
+    if (fstat(STDIN_FILENO, &st) != 0 || !S_ISFIFO(st.st_mode))
+        return;
+#endif
+    std::thread([target] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        char buf[64];
+        size_t total = 0;
+        while (fread(buf, 1, sizeof buf, stdin) > 0)
+            total += sizeof buf;
+        // 只有"读过数据后 EOF"才算父进程/终端消失；启动即 EOF 的空管道
+        // （如 WSL→PowerShell 继承的空 stdin）不触发，避免误关机。
+        if (total == 0)
+            return;
+        caf::anon_send(target, shutdown_atom{});
+        arm_force_exit_fallback();
+    }).detach();
+}
+
 #ifdef _WIN32
 BOOL WINAPI console_handler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT
         || signal == CTRL_CLOSE_EVENT) {
-        if (shutdown_manager_ref())
+        if (shutdown_manager_ref()) {
             caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+            arm_force_exit_fallback();
+        }
         return TRUE;
     }
     return FALSE;
 }
 #else
 void signal_handler(int) {
-    if (shutdown_manager_ref())
+    if (shutdown_manager_ref()) {
         caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+        arm_force_exit_fallback();
+    }
 }
 #endif
 
@@ -195,6 +243,13 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
 }
 
 void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
+#ifdef _WIN32
+    SetConsoleCtrlHandler(console_handler, TRUE);
+#else
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+#endif
+    install_stdin_watchdog(fw.shutdown_mgr);
     caf::scoped_actor self{sys};
     self->wait_for(fw.shutdown_mgr);
     CAF_LOG_INFO("framework shutdown complete");
