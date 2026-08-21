@@ -258,14 +258,47 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
 
 ## 9. 插件最小骨架与生命周期
 
+### 9.1 公共生命周期协议（推荐，框架固化）
+
+插件最常见的 5 个生命周期 handler（init/drain/save/restore/shutdown）骨架
+已固化在框架侧（`src/core/plugin/plugin_lifecycle.hpp`），插件只需注册回调：
+
+```cpp
+struct MyPlugin : PluginEntry {
+  caf::behavior spawn(...) override {
+    PluginLifecycleHooks hooks;
+    hooks.on_init     = [this](caf::actor mgr, const std::string& cfg) {
+      // 初始化：记 manager（可发 request_shutdown）、解析 cfg
+    };
+    hooks.on_drain    = [] { /* 可选：排空存量（框架会统一回执） */ };
+    hooks.on_save     = [this] { return serialize(); };  // 返回 std::vector<std::byte>
+    hooks.on_restore  = [this](const std::vector<std::byte>& b) { deserialize(b); };
+    hooks.on_shutdown = [] { /* 可选：关机清理（框架统一 quit） */ };
+
+    caf::message_handler business{ /* 私有业务 handler */ };
+    return caf::behavior{business.or_else(plugin_lifecycle(self, hooks))};
+  }
+};
+```
+
+- **私有在前**：业务消息一次命中（高频路径最优）；
+- **or_else 语义**：插件可在业务列表里写同名生命周期 handler，自动优先于
+  框架默认（统一性和灵活性兼得）；`plugin_lifecycle()` 返回
+  `caf::message_handler`（CAF 1.1 的 or_else 是 message_handler 成员），
+  需包进 `caf::behavior{...}`；
+- **框架统一做对的事**：drain 回执（必须带 self->address()，忘回执卡死关机链）、
+  shutdown 后的 self->quit()——写错即卡死/泄漏的样板不再存在；
+- hooks 回调全部默认空实现，按需注册。
+
+### 9.2 生命周期消息协议（框架 ↔ 插件）
+
 - 导出 `create_plugin()` / `destroy_plugin()`（必需）、`register_meta_objects()`（可选）；
 - `PluginEntry::manifest()` 声明 name/version/dependencies/provides，
   框架据此做依赖解析与拓扑排序加载；可选 `acl_allow` 声明可信调用方
   插件名单（声明后本插件的服务进入代理 ACL 受限策略，见 §6）；
-- `PluginEntry::spawn()` 创建插件 actor，需实现的生命周期 handler：
-  `init_atom`（初始化）→ `drain_atom`（排空，回执 `(drain_atom, self->address())`）
-  → `save_state_atom`（返回 `std::vector<std::byte>`）/ `restore_state_atom`
-  → `shutdown_atom`（`self->quit()`）；
+- 协议消息：`init_atom`（初始化）→ `drain_atom`（排空，回执
+  `(drain_atom, self->address())`）→ `save_state_atom`（返回
+  `std::vector<std::byte>`）/ `restore_state_atom` → `shutdown_atom`；
 - 状态由内核的 CheckpointManager 落盘（CRC32 + 原子 rename），下次启动自动恢复。
 
 ## 10. CAF 1.1 行为变化备忘（踩过的坑）
@@ -279,6 +312,8 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
   用 `.then()` 续接或 scoped_actor；
 - 手写 main 必须显式调用 `caf::core::init_global_meta_objects()` +
   `app_meta::init()`（内核元对象）+ `preregister_plugin_meta()`（插件元对象）；
+  **本项目已 CAF_MAIN 化**：元对象注册收敛在 `framework_config` 构造函数
+  （actor_system 构造前的最干净窗口），手写 main 的历史样板不复存在；
 - 日志宏改名（`CAF_LOG_WARN` → `CAF_LOG_WARNING`），
   配置键为 `caf.logger.*`；actor_system 构造前 CAF logger 不存在，
   该阶段的诊断输出请用 std::cout；
