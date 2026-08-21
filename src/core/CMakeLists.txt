@@ -8,6 +8,7 @@ add_library(caf_plugin_core STATIC
     graceful_shutdown.cpp
     plugin_manager.cpp
     plugin_loader.cpp
+    framework_bootstrap.cpp
 )
 
 target_include_directories(caf_plugin_core PUBLIC
