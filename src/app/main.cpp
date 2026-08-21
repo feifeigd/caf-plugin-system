@@ -132,28 +132,36 @@ constexpr std::uint16_t k_env_hello = 1;
 } // namespace
 
 /// 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
-/// RemoteCaller 缓存句柄 + 失败自动重试（模式 B）；循环调用观察
-/// 杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。
+/// RemoteCaller actor 缓存句柄 + 失败自动重试（模式 B）；循环调用
+/// 观察杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。
 void run_cross_call_test(caf::actor_system& sys, caf::actor master,
                          const std::string& local_node_name,
                          const std::string& actor_name) {
-    cluster::RemoteCaller caller(sys, master, local_node_name);
+    auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
     plugin_envelope env;
     env.sub_proto = k_env_hello;
     const char* text = "cross";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                        reinterpret_cast<const std::byte*>(text)
                            + std::strlen(text));
-    bool ok = false;
-    for (int i = 0; i < 5 && !ok; ++i) {
-        auto r = caller.call(actor_name, env);
+    caf::scoped_actor self{sys};
+    auto do_call = [&] {
+        caf::expected<std::string> r = caf::make_error(
+            caf::sec::runtime_error, "no response");
+        self->request(caller, std::chrono::seconds(15), cross_call_atom_v,
+                      actor_name, env)
+            .receive([&](std::string& s) { r = std::move(s); },
+                     [&](caf::error& err) { r = std::move(err); });
         std::cout << "[CrossCall] "
                   << (r ? ("OK: " + *r)
                         : ("fail: " + caf::to_string(r.error())))
                   << std::endl;
-        if (r)
-            ok = true;
-        else
+        return static_cast<bool>(r);
+    };
+    bool ok = false;
+    for (int i = 0; i < 5 && !ok; ++i) {
+        ok = do_call();
+        if (!ok)
             std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     if (!ok) {
@@ -163,12 +171,37 @@ void run_cross_call_test(caf::actor_system& sys, caf::actor master,
     }
     for (int i = 0; i < 11; ++i) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        auto r = caller.call(actor_name, env);
-        std::cout << "[CrossCall] "
-                  << (r ? ("OK: " + *r)
-                        : ("fail: " + caf::to_string(r.error())))
-                  << std::endl;
+        do_call();
     }
+}
+
+/// 跨节点调用验证（--test-cross-call-ex=<服务名>，有界重试路径）。
+/// RemoteCaller 的 cross_call_ex：attempts 次尝试 + 1s 间隔；
+/// 配合"先启 master 后启 worker"可验证重启窗口期的调用不丢失——
+/// 目标节点未就绪时重试等待，节点上线后自动成功。
+void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
+                            const std::string& local_node_name,
+                            const std::string& actor_name) {
+    auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
+    plugin_envelope env;
+    env.sub_proto = k_env_hello;
+    const char* text = "cross";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                       reinterpret_cast<const std::byte*>(text)
+                           + std::strlen(text));
+    constexpr int k_attempts = 15;
+    caf::scoped_actor self{sys};
+    std::cout << "[CrossCallEx] request with attempts=" << k_attempts
+              << " (interval 1s)" << std::endl;
+    self->request(caller, std::chrono::seconds(60), cross_call_ex_atom_v,
+                  actor_name, k_attempts, env)
+        .receive([&](std::string& s) {
+                     std::cout << "[CrossCallEx] OK: " << s << std::endl;
+                 },
+                 [&](caf::error& err) {
+                     std::cout << "[CrossCallEx] fail: "
+                               << caf::to_string(err) << std::endl;
+                 });
 }
 
 void caf_main(caf::actor_system& sys, const app_config& cfg) {
@@ -212,6 +245,11 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     if (!cfg.test_cross_call.empty() && nb.master) {
         run_cross_call_test(sys, nb.master, cfg.node_cfg.node_name,
                             cfg.test_cross_call);
+    }
+    // ---- 集群验证后门：跨节点调用 + 有界重试（重启窗口期不丢）----
+    if (!cfg.test_cross_call_ex.empty() && nb.master) {
+        run_cross_call_ex_test(sys, nb.master, cfg.node_cfg.node_name,
+                               cfg.test_cross_call_ex);
     }
 
     // ---- 等待关机：插件模式等 shutdown_mgr；纯节点模式等节点 actor ----

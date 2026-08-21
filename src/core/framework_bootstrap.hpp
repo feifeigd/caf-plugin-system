@@ -42,6 +42,9 @@ struct framework_config : caf::actor_system_config {
     bool allow_cross_node = false;
     /// 集群验证后门：节点注册完成后跨节点调用该服务（resolve→lookup→call）
     std::string test_cross_call;
+    /// 集群验证后门：跨节点调用 + 有界重试（--test-cross-call-ex=<服务名>，
+    /// 15 次尝试 × 1s 间隔；配合启动延迟可验证重启窗口期的调用不丢失）
+    std::string test_cross_call_ex;
 
     framework_config();
 };

@@ -194,6 +194,20 @@ bool inspect(Inspector& f, actor_route& x) {
   );
 }
 
+/// master 服务路由应答：一个服务可能由多个节点导出（同名服务多副本）。
+/// 由 service_resolve_atom 返回，只含导出该服务的节点路由，
+/// 不携带全量拓扑（上千节点时避免 O(N) 响应）。
+struct service_route {
+  std::vector<actor_route> routes;
+};
+
+template <class Inspector>
+bool inspect(Inspector& f, service_route& x) {
+  return f.object(x).fields(
+    f.field("routes", x.routes)
+  );
+}
+
 /// 节点关机请求（级联传播）。
 struct shutdown_request {
   std::string initiator;    // 发起者（原始节点）

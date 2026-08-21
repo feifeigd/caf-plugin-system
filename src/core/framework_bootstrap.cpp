@@ -109,7 +109,9 @@ framework_config::framework_config() {
         .add(allow_cross_node, "allow-cross-node",
              "trust remote cluster nodes bypassing service ACL (default false)")
         .add(test_cross_call, "test-cross-call",
-             "cross-node call this service after node registration (cluster test)");
+             "cross-node call this service after node registration (cluster test)")
+        .add(test_cross_call_ex, "test-cross-call-ex",
+             "cross-node call this service with bounded retry (15x1s) after node registration");
 }
 
 bool bootstrap_plugin_framework(caf::actor_system& sys,

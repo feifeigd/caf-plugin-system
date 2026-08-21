@@ -106,6 +106,24 @@ caf::behavior ClusterMasterState::make_behavior() {
       return actor_route{manifest->node_name, manifest->kind, manifest->host,
                          manifest->port, actor_name, manifest->parent};
     },
+
+    // 按服务名解析：返回导出该服务的全部节点路由（同名服务多副本）。
+    // 只回匹配节点，不返回全量拓扑——上千节点时响应体 O(k) 而非 O(N)。
+    [this](service_resolve_atom, const std::string& svc)
+      -> caf::result<service_route> {
+      prune_expired();
+      service_route route;
+      nodes.for_each_manifest([&](const node_manifest& m) {
+        if (std::find(m.exported_actors.begin(), m.exported_actors.end(), svc)
+            == m.exported_actors.end())
+          return;
+        route.routes.push_back(
+          actor_route{m.node_name, m.kind, m.host, m.port, svc, m.parent});
+      });
+      if (route.routes.empty())
+        return caf::make_error(caf::sec::no_such_key);
+      return route;
+    },
   };
 }
 
