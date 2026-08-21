@@ -18,15 +18,21 @@ struct VersionedEntry {
     std::string plugin_name;    // dll 注册的名字
 };
 
-caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target);
+caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target,
+                               bool allow_cross_node);
 
 class ServiceRegistry : public caf::event_based_actor {
 public:
-    explicit ServiceRegistry(caf::actor_config& cfg) : caf::event_based_actor(cfg) {}
+    explicit ServiceRegistry(caf::actor_config& cfg, bool allow_cross_node = false)
+      : caf::event_based_actor(cfg), allow_cross_node_(allow_cross_node) {}
 
     caf::behavior make_behavior() override;
 
 private:
     std::map<std::string, VersionedEntry> services_;
+    /// 已导出到 CAF actor_system registry 的服务名（供集群节点上报 exported_actors）。
+    std::vector<std::string> exported_;
+    /// 跨节点调用信任开关：为 true 时远端节点的 sender 可绕过本地 ACL 白名单。
+    bool allow_cross_node_ = false;
 };
 

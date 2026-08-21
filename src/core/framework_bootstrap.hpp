@@ -37,6 +37,11 @@ struct framework_config : caf::actor_system_config {
     std::string plugins_dir = "./plugins";
     /// 启动完成后自动触发优雅关机（冒烟测试后门）
     bool test_auto_shutdown = false;
+    /// 跨节点调用信任开关：为 true 时远端节点 sender 可绕过服务代理 ACL
+    /// 白名单（集群内互信；默认 false = ACL 只管本地，跨节点一律拦截）
+    bool allow_cross_node = false;
+    /// 集群验证后门：节点注册完成后跨节点调用该服务（resolve→lookup→call）
+    std::string test_cross_call;
 
     framework_config();
 };

@@ -105,7 +105,11 @@ framework_config::framework_config() {
         .add(shutdown_order, "shutdown-order,s", "plugin shutdown order (reverse load order if empty)")
         .add(plugins_dir, "plugins-dir,p", "plugin scan directory (default ./plugins)")
         .add(test_auto_shutdown, "test-auto-shutdown",
-             "auto trigger graceful shutdown after startup (smoke test)");
+             "auto trigger graceful shutdown after startup (smoke test)")
+        .add(allow_cross_node, "allow-cross-node",
+             "trust remote cluster nodes bypassing service ACL (default false)")
+        .add(test_cross_call, "test-cross-call",
+             "cross-node call this service after node registration (cluster test)");
 }
 
 bool bootstrap_plugin_framework(caf::actor_system& sys,
@@ -113,7 +117,7 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
                                 BootstrapResult& out) {
     CAF_LOG_INFO("framework startup begin");
 
-    out.registry = sys.spawn<ServiceRegistry>();
+    out.registry = sys.spawn<ServiceRegistry>(cfg.allow_cross_node);
     out.checkpoint_mgr
         = sys.spawn<CheckpointManager>(std::filesystem::path{"./checkpoints"});
     out.plugin_mgr = sys.spawn<PluginManager>(out.registry, out.checkpoint_mgr);

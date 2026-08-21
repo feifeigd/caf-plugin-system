@@ -1,8 +1,11 @@
 #include "service_registry.hpp"
+#include "common/message_tags.hpp"
+#include <caf/actor_registry.hpp>
 #include <algorithm>
 #include <iostream>
 
-caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target) {
+caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target,
+                               bool allow_cross_node) {
     // 缓冲的消息：request 需带走响应承诺（响应由冲刷时 promise.delegate
     // 按原 sender/mid 直达调用方）；纯 send 无承诺，冲刷时普通转发
     struct Buffered {
@@ -18,6 +21,8 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
         // restricted=true  → 只转发白名单 sender 的消息，其余在入口拦截。
         bool restricted = false;
         std::vector<caf::actor_addr> allowed;
+        // 跨节点信任：为 true 时远端节点 sender 绕过白名单（集群内互信）。
+        bool allow_cross_node = false;
         // 热更新静默态（§8 先排空后快照）：paused=true 时新消息进缓冲而不
         // 转发，旧实现不再收到新工作——快照因此无丢失窗口；resume 时切到
         // 新目标并冲刷缓冲。
@@ -25,8 +30,9 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
         std::vector<Buffered> buffered;
     };
 
-    return sys.spawn([initial_target](caf::stateful_actor<ProxyState>* self) {
+    return sys.spawn([initial_target, allow_cross_node](caf::stateful_actor<ProxyState>* self) {
         self->state().current = initial_target; // 实现
+        self->state().allow_cross_node = allow_cross_node;
 
         // CAF 1.1: default_handler 使用 caf::message&（message_view 已移除）
         self->set_default_handler([self](caf::scheduled_actor*, caf::message& msg)
@@ -56,8 +62,14 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 // ACL 拦截点：匿名 sender（anon_send）addr 为空，一律不受信
                 caf::actor_addr from;
                 if (auto& snd = self->current_sender()) from = snd->address();
-                if (std::find(st.allowed.begin(), st.allowed.end(), from)
-                    == st.allowed.end()) {
+                bool trusted = std::find(st.allowed.begin(), st.allowed.end(), from)
+                               != st.allowed.end();
+                // 跨节点信任：白名单外的远端节点 sender 在开关开启时放行
+                // （集群内互信；sender->node() 非本地节点即远端）。
+                if (!trusted && st.allow_cross_node && from
+                    && from.node() != self->system().node())
+                    trusted = true;
+                if (!trusted) {
                     std::cout << "[Proxy] ACL blocked a call to the service"
                               << std::endl;
                     // 返回 error：带 promise 的 request 会收到错误响应，
@@ -146,11 +158,20 @@ caf::behavior ServiceRegistry::make_behavior() {
                           << ". Use hot_reload to switch implementation." << std::endl;
                 return;
             }
-            auto proxy = spawn_service_proxy(self->system(), impl);
+            auto proxy = spawn_service_proxy(self->system(), impl,
+                                             allow_cross_node_);
             VersionedEntry entry{name, proxy, impl, 1, plugin};
             services_[name] = std::move(entry);
-            std::cout << "[Registry] Registered: " << name << " (v1)" << std::endl;
+            // 导出到 CAF actor_system registry：集群其他节点可经
+            // middleman remote_lookup(name, node) 直接调用本服务代理。
+            self->system().registry().put(name, proxy);
+            exported_.push_back(name);
+            std::cout << "[Registry] Registered: " << name << " (v1) exported"
+                      << std::endl;
         },
+
+        // 查询本进程已导出到 CAF registry 的服务名（节点上报 exported_actors 用）
+        [=, this](exported_actors_atom) { return exported_; },
 
         // 被 PluginManager 热更新流程以 send 调用。代理的静默/切换/冲刷由
         // PM 通过 quiesce/resume 直接编排（§8 先排空后快照），这里只做台账：
@@ -173,6 +194,10 @@ caf::behavior ServiceRegistry::make_behavior() {
             auto it = services_.find(name);
             if (it == services_.end()) return;
 
+            // 从 CAF registry 摘除导出（远端 lookup 不再命中）
+            self->system().registry().erase(name);
+            exported_.erase(std::remove(exported_.begin(), exported_.end(), name),
+                            exported_.end());
             // 安全退出 proxy，通知所有调用方
             self->send_exit(it->second.proxy, caf::exit_reason::user_shutdown);
             services_.erase(it);

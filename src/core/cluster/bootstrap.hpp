@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace caf_plugin_system { namespace cluster {
 
@@ -46,6 +47,9 @@ struct node_settings {
     uint16_t master_port = 0;     ///< master 端口（--master-port）
     int lease_seconds = 10;       ///< lease TTL，0 = 永不过期（--lease-seconds）
     std::string parent;           ///< 父节点名（--parent，空 = 直属 master）
+    /// 本节点导出到 CAF registry 的服务名（节点注册时上报，master 供
+    /// node_resolve 路由）。运行时从 ServiceRegistry 台账自动填充。
+    std::vector<std::string> exported_actors;
     /// master 注册表 actor 的命名（跨进程 remote_lookup 用）
     std::string master_registry_name = "cluster.master";
 

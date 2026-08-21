@@ -126,6 +126,7 @@ bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
     cc.master_port = settings.master_port;
     cc.lease_ttl = std::chrono::seconds(settings.lease_seconds);
     cc.master_registry_name = settings.master_registry_name;
+    cc.exported_actors = settings.exported_actors;
     // local_monitor：master 监控它感知本进程退出（优雅关机时立即 down）。
     // 纯节点模式没有 shutdown_mgr 可传，spawn 一个进程哨兵 actor 兜底
     // （master 持其强引用，进程退出时必然收到 down_msg，不用等 lease 过期）。

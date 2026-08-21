@@ -99,3 +99,4 @@ X_REG(shutdown_source, (caf_plugin_system::shutdown_source), 250, "shutdown_sour
 X_TAG(heartbeat_tick_atom, 251)   // 节点客户端内部心跳定时器
 X_TAG(retry_tick_atom, 252)       // 节点客户端重连定时器
 X_TAG(maintenance_tick_atom, 253) // master 注册表维护周期（lease 过期清理）
+X_TAG(exported_actors_atom, 254)  // 查询本进程已导出到 CAF registry 的服务名列表

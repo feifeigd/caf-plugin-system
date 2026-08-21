@@ -1,7 +1,9 @@
 #include <caf/all.hpp>
 #include <caf/caf_main.hpp>
+#include <caf/io/middleman.hpp>
 #include <caf/logger.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -122,6 +124,79 @@ static void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
 // 两个模块正交：node-kind 决定集群角色，entry-plugins 决定插件加载。
 // ------------------------------------------------------------------
 
+namespace {
+/// business 插件信封子协议：hello（跨节点验证载荷，见 business_plugin.cpp）。
+constexpr std::uint16_t k_env_hello = 1;
+} // namespace
+
+/// 跨节点调用验证（--test-cross-call=<服务名>，在 master 进程执行）：
+/// 拓扑查服务所在节点 → connect → remote_lookup → 信封调用。
+/// 目标节点日志出现 "Envelope round-trip OK" 即验证到达。
+/// 节点注册有延迟，拓扑查询带重试（最多 10s）。
+void run_cross_call_test(caf::actor_system& sys, caf::actor master,
+                         const std::string& local_node_name,
+                         const std::string& actor_name) {
+    caf::scoped_actor self{sys};
+    for (int attempt = 1; attempt <= 10; ++attempt) {
+        bool done = false;
+        self->request(master, std::chrono::seconds(5), node_topology_atom_v)
+            .receive(
+              [&](const topology_snapshot& snap) {
+                  for (const auto& m : snap.nodes) {
+                      // 跳过本进程节点（跨节点验证的目标是远端节点上的服务）
+                      if (m.node_name == local_node_name)
+                          continue;
+                      if (std::find(m.exported_actors.begin(),
+                                    m.exported_actors.end(),
+                                    actor_name) == m.exported_actors.end())
+                          continue;
+                      std::cout << "[CrossCall] resolve '" << actor_name
+                                << "' -> node '" << m.node_name << "' ("
+                                << m.host << ":" << m.port << ")" << std::endl;
+                      auto nid = sys.middleman().connect(m.host, m.port);
+                      if (!nid) {
+                          std::cout << "[CrossCall] connect failed: "
+                                    << caf::to_string(nid.error()) << std::endl;
+                          done = true;
+                          return;
+                      }
+                      auto ptr = sys.middleman().remote_lookup(actor_name, *nid);
+                      if (!ptr) {
+                          std::cout << "[CrossCall] lookup '" << actor_name
+                                    << "' at " << m.node_name << " failed"
+                                    << std::endl;
+                          done = true;
+                          return;
+                      }
+                      auto target = caf::actor_cast<caf::actor>(ptr);
+                      plugin_envelope env;
+                      env.sub_proto = k_env_hello;
+                      env.payload = {std::byte('c'), std::byte('r'),
+                                     std::byte('o'), std::byte('s'),
+                                     std::byte('s')};
+                      self->send(target, std::move(env));
+                      std::cout << "[CrossCall] sent envelope(hello) to '"
+                                << m.node_name << "'" << std::endl;
+                      done = true;
+                      return;
+                  }
+                  std::cout << "[CrossCall] attempt " << attempt
+                            << ": service '" << actor_name
+                            << "' not registered yet" << std::endl;
+              },
+              [&](caf::error& err) {
+                  std::cout << "[CrossCall] topology query failed: "
+                            << caf::to_string(err) << std::endl;
+                  done = true;
+              });
+        if (done)
+            return;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    std::cout << "[CrossCall] timeout: service '" << actor_name
+              << "' never appeared" << std::endl;
+}
+
 void caf_main(caf::actor_system& sys, const app_config& cfg) {
     // ---- 插件框架引导（可选；--caf-plugin-system.entry-plugins 非空时）----
     // 先于节点引导：混合模式下 shutdown_mgr 作为节点 monitor 上报给 master
@@ -139,7 +214,30 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         // 混合模式传 shutdown_mgr 作 monitor；纯节点模式传空 →
         // bootstrap_node 内部 spawn 进程哨兵 actor 兜底。
         caf::actor monitor = fw.shutdown_mgr;
-        if (!cluster::bootstrap_node(sys, cfg.node_cfg, monitor, nb)) return;
+        // 本节点导出的服务名：从 ServiceRegistry 台账自动收集，节点注册时
+        // 随 manifest 上报 master（node_resolve 路由依据）。
+        auto node_cfg = cfg.node_cfg;
+        if (fw.registry) {
+            caf::scoped_actor self{sys};
+            self->request(fw.registry, caf::infinite, exported_actors_atom_v)
+                .receive([&](std::vector<std::string>& names) {
+                    node_cfg.exported_actors = std::move(names);
+                    for (auto& n : names)
+                        std::cout << "[Node] exporting service: " << n
+                                  << std::endl;
+                },
+                [&](caf::error& err) {
+                    std::cout << "[Node] exported_actors query failed: "
+                              << caf::to_string(err) << std::endl;
+                });
+        }
+        if (!cluster::bootstrap_node(sys, node_cfg, monitor, nb)) return;
+    }
+
+    // ---- 集群验证后门：跨节点调用（resolve → connect → lookup → call）----
+    if (!cfg.test_cross_call.empty() && nb.master) {
+        run_cross_call_test(sys, nb.master, cfg.node_cfg.node_name,
+                            cfg.test_cross_call);
     }
 
     // ---- 等待关机：插件模式等 shutdown_mgr；纯节点模式等节点 actor ----
