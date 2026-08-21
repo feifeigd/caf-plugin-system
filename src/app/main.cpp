@@ -4,6 +4,7 @@
 #include <caf/logger.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include "framework_bootstrap.hpp"
 #include "cluster/bootstrap.hpp"
+#include "cluster/remote_caller.hpp"
 #include "common/message_tags.hpp"
 #include "common/plugin_envelope.hpp"
 
@@ -129,90 +131,43 @@ namespace {
 constexpr std::uint16_t k_env_hello = 1;
 } // namespace
 
-/// 单次跨节点调用：拓扑找服务所在节点 → connect → remote_lookup → 信封。
-/// 返回 true=调用已发出；false=服务暂不可达（节点没注册/挂了）。
-/// 每次调用都重新 resolve（不缓存句柄）——节点重启后 node_id 变化，
-/// connect 拿到的永远是当下最新的 node_id，因此天然自愈。
-bool cross_call_once(caf::scoped_actor& self, caf::actor_system& sys,
-                     caf::actor master, const std::string& local_node_name,
-                     const std::string& actor_name) {
-    bool found = false;
-    bool failed = false;
-    self->request(master, std::chrono::seconds(5), node_topology_atom_v)
-        .receive(
-          [&](const topology_snapshot& snap) {
-              for (const auto& m : snap.nodes) {
-                  // 跳过本进程节点（跨节点验证的目标是远端节点上的服务）
-                  if (m.node_name == local_node_name)
-                      continue;
-                  if (std::find(m.exported_actors.begin(),
-                                m.exported_actors.end(),
-                                actor_name) == m.exported_actors.end())
-                      continue;
-                  found = true;
-                  std::cout << "[CrossCall] resolve '" << actor_name
-                            << "' -> node '" << m.node_name << "' ("
-                            << m.host << ":" << m.port << ")" << std::endl;
-                  auto nid = sys.middleman().connect(m.host, m.port);
-                  if (!nid) {
-                      std::cout << "[CrossCall] connect failed: "
-                                << caf::to_string(nid.error()) << std::endl;
-                      failed = true;
-                      return;
-                  }
-                  auto ptr = sys.middleman().remote_lookup(actor_name, *nid);
-                  if (!ptr) {
-                      std::cout << "[CrossCall] lookup '" << actor_name
-                                << "' at " << m.node_name << " failed"
-                                << std::endl;
-                      failed = true;
-                      return;
-                  }
-                  auto target = caf::actor_cast<caf::actor>(ptr);
-                  plugin_envelope env;
-                  env.sub_proto = k_env_hello;
-                  env.payload = {std::byte('c'), std::byte('r'),
-                                 std::byte('o'), std::byte('s'),
-                                 std::byte('s')};
-                  self->send(target, std::move(env));
-                  std::cout << "[CrossCall] sent envelope(hello) to '"
-                            << m.node_name << "'" << std::endl;
-                  return;
-              }
-              std::cout << "[CrossCall] service '" << actor_name
-                        << "' not registered on any node" << std::endl;
-          },
-          [&](caf::error& err) {
-              std::cout << "[CrossCall] topology query failed: "
-                        << caf::to_string(err) << std::endl;
-              failed = true;
-          });
-    if (failed)
-        return false;
-    return found;
-}
-
-/// 跨节点调用验证（--test-cross-call=<服务名>，在 master 进程执行）。
-/// 循环调用：等待节点注册（最多 10s），然后每 2s 调用一次共 12 次——
-/// 中途杀/重启目标节点可观察到"失败 → 自动恢复"（每次调用重新 resolve）。
+/// 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
+/// RemoteCaller 缓存句柄 + 失败自动重试（模式 B）；循环调用观察
+/// 杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。
 void run_cross_call_test(caf::actor_system& sys, caf::actor master,
                          const std::string& local_node_name,
                          const std::string& actor_name) {
-    caf::scoped_actor self{sys};
+    cluster::RemoteCaller caller(sys, master, local_node_name);
+    plugin_envelope env;
+    env.sub_proto = k_env_hello;
+    const char* text = "cross";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                       reinterpret_cast<const std::byte*>(text)
+                           + std::strlen(text));
     bool ok = false;
     for (int i = 0; i < 5 && !ok; ++i) {
-        ok = cross_call_once(self, sys, master, local_node_name, actor_name);
-        if (!ok)
+        auto r = caller.call(actor_name, env);
+        std::cout << "[CrossCall] "
+                  << (r ? ("OK: " + *r)
+                        : ("fail: " + caf::to_string(r.error())))
+                  << std::endl;
+        if (r)
+            ok = true;
+        else
             std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     if (!ok) {
         std::cout << "[CrossCall] timeout: service '" << actor_name
-                  << "' never appeared" << std::endl;
+                  << "' never reachable" << std::endl;
         return;
     }
     for (int i = 0; i < 11; ++i) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        cross_call_once(self, sys, master, local_node_name, actor_name);
+        auto r = caller.call(actor_name, env);
+        std::cout << "[CrossCall] "
+                  << (r ? ("OK: " + *r)
+                        : ("fail: " + caf::to_string(r.error())))
+                  << std::endl;
     }
 }
 

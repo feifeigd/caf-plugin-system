@@ -18,6 +18,7 @@ add_library(caf_plugin_core STATIC
     cluster/master.cpp
     cluster/client.cpp
     cluster/bootstrap.cpp
+    cluster/remote_caller.cpp
 )
 
 target_include_directories(caf_plugin_core PUBLIC

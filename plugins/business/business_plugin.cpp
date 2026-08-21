@@ -80,6 +80,12 @@ public:
                                 reinterpret_cast<const char*>(env.payload.data()),
                                 env.payload.size());
                             LOG_INFO(logger, "Envelope round-trip OK: {}", text);
+                            // 响应式：request 调用方（如跨节点 RemoteCaller）
+                            // 拿回执；纯 send 调用无副作用（void handler）
+                            if (self->current_message_id().is_request()) {
+                                auto rp = self->make_response_promise<std::string>();
+                                rp.deliver("cross-ok:" + text);
+                            }
                             break;
                         }
 #ifdef BIZ_HOT_V2
