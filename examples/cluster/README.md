@@ -10,6 +10,20 @@
 | worker-a | worker | BusinessPlugin + LoggerPlugin |
 | worker-b | worker | BusinessPlugin |
 
+## region 子树（多级拓扑）
+
+| 节点 | 角色 | parent |
+|---|---|---|
+| region-a | region (中间层) | master |
+| worker-r1 | worker (叶子) | region-a |
+
+region/worker 都连 master:47000，parent 字段标记层级。实测注册输出：
+
+```
+[ClusterMaster] registered node 'region-a' (region) parent=master
+[ClusterMaster] registered node 'worker-r1' (worker) parent=region-a
+```
+
 ## 运行
 
 配置和脚本拷贝到 run/（或任何有 exe + plugins/ 的目录）：
@@ -28,6 +42,14 @@ cd <run目录> && ./run-cluster.sh
 ./caf_plugin_app.exe --config-file=worker-a.conf &
 ./caf_plugin_app.exe --config-file=worker-b.conf &
 ```
+
+## 容错验证结论（实测）
+
+- **lease 清理**：worker-lease.conf（lease-seconds=3）挂起心跳停 →
+  master `expired node 'worker-lease'`（maintenance 1s 步长兜底）
+- **自愈**：杀 master → worker 秒级 `master lost, reconnecting` →
+  1s 重试 → master 重启后自动 `register: OK`，零人工干预
+- **优雅退出**：Ctrl+C → 完整优雅关机（插件 save_state）→ 自然退出
 
 ## 格式说明
 
