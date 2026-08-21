@@ -8,7 +8,6 @@
 // ------------------------------------------------------------------
 
 #include "common/cluster_types.hpp"
-#include "framework_bootstrap.hpp"
 
 #include <caf/actor.hpp>
 #include <caf/actor_system.hpp>
@@ -16,7 +15,7 @@
 #include <chrono>
 #include <string>
 
-namespace caf_plugin_system {
+namespace caf_plugin_system { namespace cluster {
 
 /// 节点客户端配置（从 framework_config 的节点选项组装）。
 struct node_client_config {
@@ -41,4 +40,4 @@ caf::actor spawn_node_client(caf::actor_system& sys,
                              node_client_config config,
                              caf::actor local_monitor);
 
-} // namespace caf_plugin_system
+} } // namespace caf_plugin_system::cluster

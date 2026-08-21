@@ -8,10 +8,28 @@
 #include <vector>
 
 #include "framework_bootstrap.hpp"
+#include "cluster/bootstrap.hpp"
 #include "common/message_tags.hpp"
 #include "common/plugin_envelope.hpp"
 
 using namespace caf_plugin_system;
+
+// ------------------------------------------------------------------
+// 进程配置 = 插件框架（caf_plugin_core） + 集群节点（caf_plugin_cluster）
+// 两个模块正交，可按需组合：
+//   - 纯插件进程：--config-file=app.ini
+//   - 纯节点进程：--caf-plugin-system.node-kind=master|region|worker
+//   - 节点 + 插件：两者都配（region 上跑服务插件）
+// ------------------------------------------------------------------
+
+struct app_config : framework_config {
+    cluster::node_settings node_cfg;
+    app_config() : framework_config() {
+        // middleman 元对象注册 + 加载（必须在 actor_system 构造前）
+        cluster::init_node_io(*this);
+        cluster::add_node_options(*this, node_cfg);
+    }
+};
 
 // ------------------------------------------------------------------
 // 冒烟测试后门（--test-auto-shutdown）：验证 ACL 拦截、缓冲冲刷、
@@ -100,18 +118,30 @@ static void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
 }
 
 // ------------------------------------------------------------------
-// 每个进程的入口只需三行：引导（失败已触发关机）→ 业务 → 等待关机。
-// 框架引导/信号处理/插件加载全在 framework_bootstrap 里，多进程复用。
+// 每个进程的入口：节点引导（可选）→ 插件引导（可选）→ 等待关机。
+// 两个模块正交：node-kind 决定集群角色，entry-plugins 决定插件加载。
 // ------------------------------------------------------------------
 
-void caf_main(caf::actor_system& sys, const framework_config& cfg) {
+void caf_main(caf::actor_system& sys, const app_config& cfg) {
+    // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
+    cluster::BootstrapResult nb;
+    if (cfg.node_cfg.is_node()) {
+        if (!cluster::bootstrap_node(sys, cfg.node_cfg, {}, nb)) return;
+    }
+
+    // ---- 插件框架引导（可选；--caf-plugin-system.entry-plugins 非空时）----
     BootstrapResult fw;
-    if (!bootstrap_plugin_framework(sys, cfg, fw)) return;
+    if (!cfg.entry_plugins.empty()) {
+        if (!bootstrap_plugin_framework(sys, cfg, fw)) return;
+        if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
+    }
 
-    // ---- 业务代码 ----
-    if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
-
-    wait_for_shutdown(sys, fw);
+    // ---- 等待关机：插件模式等 shutdown_mgr；纯节点模式等节点 actor ----
+    if (!cfg.entry_plugins.empty()) {
+        wait_for_shutdown(sys, fw);
+    } else if (cfg.node_cfg.is_node()) {
+        cluster::wait_for_node_shutdown(sys, nb);
+    }
 }
 
 CAF_MAIN()

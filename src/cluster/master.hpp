@@ -8,7 +8,7 @@
 // 任意进程 spawn 它即成为 master（bootstrap 按节点配置决定）。
 // ------------------------------------------------------------------
 
-#include "cluster_membership.hpp"
+#include "membership_registry.hpp"
 
 #include <caf/event_based_actor.hpp>
 #include <caf/stateful_actor.hpp>
@@ -16,7 +16,7 @@
 #include <chrono>
 #include <string>
 
-namespace caf_plugin_system {
+namespace caf_plugin_system { namespace cluster {
 
 /// master 注册表 actor 的 state（stateful_actor<ClusterMasterState>）。
 class ClusterMasterState {
@@ -37,7 +37,7 @@ private:
 
   caf::event_based_actor* self;
   std::chrono::seconds lease_ttl;
-  node_membership nodes;
+  node_membership nodes;  // 节点注册
 };
 
 /// 以 stateful_actor 方式 spawn：sys.spawn(actor_from_state<ClusterMasterState>, ...)
@@ -45,4 +45,4 @@ caf::actor spawn_cluster_master(caf::actor_system& sys,
                                 node_manifest self_manifest,
                                 std::chrono::seconds lease_ttl);
 
-} // namespace caf_plugin_system
+} } // namespace caf_plugin_system::cluster

@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace caf_plugin_system {
+namespace caf_plugin_system { namespace cluster {
 
 using steady_clock_type = std::chrono::steady_clock;
 
@@ -54,6 +54,10 @@ public:
     node_manifest manifest;
     caf::actor monitor_actor;
     steady_clock_type::time_point expires_at = never_expires();
+    // monitor 地址快照：proxy 在断连 cleanup 后进入 fail-state，
+    // address() 不再可靠，down 匹配用注册时的快照（node+id 语义值）。
+    caf::node_id monitor_node;
+    caf::actor_id monitor_id = 0;
   };
 
   explicit node_membership(caf::event_based_actor* self) : self_(self) {}
@@ -75,6 +79,9 @@ public:
       self_->demonitor(s.monitor_actor);
     s.manifest = std::move(manifest);
     s.monitor_actor = monitor_actor;
+    s.monitor_node = monitor_actor ? monitor_actor.address().node()
+                                   : caf::node_id{};
+    s.monitor_id = monitor_actor ? monitor_actor.address().id() : 0;
     s.expires_at = lease_ttl.count() > 0 ? lease_deadline(lease_ttl)
                                          : never_expires();
     if (s.monitor_actor && !same_monitor)
@@ -100,13 +107,17 @@ public:
   }
 
   /// 按 monitor 句柄删除（down_msg 路径）；返回是否命中。
+  /// 用注册时快照的 node+id 语义比较——proxy 断连 cleanup 后
+  /// address() 失效，不能依赖运行时 address 相等。
   template <class LogFn>
   bool erase_by_monitor(const caf::actor_addr& source,
                         LogFn on_erase) {
     for (auto it = slots_.begin(); it != slots_.end(); ++it) {
-      if (!it->second.monitor_actor)
+      if (it->second.monitor_id == 0)
         continue;
-      if (it->second.monitor_actor.address() != source)
+      if (it->second.monitor_node != source.node())
+        continue;
+      if (it->second.monitor_id != source.id())
         continue;
       on_erase(it->second.manifest);
       erase(it, false);
@@ -159,4 +170,4 @@ private:
   slots_map slots_;
 };
 
-} // namespace caf_plugin_system
+} } // namespace caf_plugin_system::cluster

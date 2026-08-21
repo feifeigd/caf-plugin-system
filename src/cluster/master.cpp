@@ -1,4 +1,4 @@
-#include "cluster_master.hpp"
+#include "master.hpp"
 #include "common/message_tags.hpp"
 
 #include <caf/actor_from_state.hpp>
@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <iostream>
 
-namespace caf_plugin_system {
+namespace caf_plugin_system { namespace cluster {
 
 namespace {
 
@@ -42,11 +42,8 @@ caf::behavior ClusterMasterState::make_behavior() {
 
     [this](node_heartbeat_atom, const std::string& node_name) {
       prune_expired();
-      if (touch(node_name)) {
-        std::cout << "[ClusterMaster] heartbeat refreshed '" << node_name << "'"
-                  << std::endl;
+      if (touch(node_name))
         return register_reply{true, "node refreshed"};
-      }
       return register_reply{false, "node not found"};
     },
 
@@ -60,8 +57,6 @@ caf::behavior ClusterMasterState::make_behavior() {
     },
 
     [this](const caf::down_msg& msg) {
-      std::cout << "[ClusterMaster] down_msg reason=" << caf::to_string(msg.reason)
-                << std::endl;
       nodes.erase_by_monitor(msg.source, [this, msg](const node_manifest& manifest) {
         std::cout << "[ClusterMaster] node '" << manifest.node_name
                   << "' (" << to_string(manifest.kind) << ") went down: "
@@ -96,6 +91,7 @@ caf::behavior ClusterMasterState::make_behavior() {
       return snapshot;
     },
 
+    // 查找节点的连接地址
     [this](node_resolve_atom, const std::string& node_name,
            const std::string& actor_name) -> caf::result<actor_route> {
       prune_expired();
@@ -106,6 +102,7 @@ caf::behavior ClusterMasterState::make_behavior() {
                              manifest->exported_actors.end(), actor_name);
       if (found == manifest->exported_actors.end())
         return caf::make_error(caf::sec::no_such_key);
+      
       return actor_route{manifest->node_name, manifest->kind, manifest->host,
                          manifest->port, actor_name, manifest->parent};
     },
@@ -144,4 +141,4 @@ caf::actor spawn_cluster_master(caf::actor_system& sys,
                    std::move(self_manifest), lease_ttl);
 }
 
-} // namespace caf_plugin_system
+} } // namespace caf_plugin_system::cluster

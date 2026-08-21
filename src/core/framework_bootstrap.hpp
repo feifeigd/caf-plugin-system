@@ -38,23 +38,6 @@ struct framework_config : caf::actor_system_config {
     /// 启动完成后自动触发优雅关机（冒烟测试后门）
     bool test_auto_shutdown = false;
 
-    // ---- 集群节点模式（空 = 纯插件进程，不开节点）----
-    /// 节点角色："master" / "region" / "worker"（--node-kind）
-    std::string node_kind = "";
-    /// 节点名（全局唯一，--node-name）
-    std::string node_name = "";
-    /// 注册用 host（--node-host，默认 127.0.0.1）
-    std::string node_host = "127.0.0.1";
-    /// middleman 监听端口，0 = 自动分配（--node-port）
-    uint16_t node_port = 0;
-    /// master 地址（--master-host / --master-port，worker/region 必填）
-    std::string master_host = "127.0.0.1";
-    uint16_t master_port = 0;
-    /// lease 秒数，0 = 永不过期（--lease-seconds，默认 10）
-    int lease_seconds = 10;
-    /// 父节点名（--parent，region/worker 挂到哪个子树下，空 = 直属 master）
-    std::string parent = "";
-
     framework_config();
 };
 
@@ -64,12 +47,6 @@ struct BootstrapResult {
     caf::actor checkpoint_mgr;
     caf::actor plugin_mgr;
     caf::actor shutdown_mgr;
-    /// 本进程的 master 注册表 actor（node-kind=master 时非空）
-    caf::actor cluster_master;
-    /// 本进程的节点客户端 actor（非 master 节点模式时非空）
-    caf::actor node_client;
-    /// 实际监听的 middleman 端口（0 = 未开端口）
-    uint16_t node_port = 0;
     /// 按加载顺序的插件名；空 = 引导失败
     std::vector<std::string> load_order;
 };

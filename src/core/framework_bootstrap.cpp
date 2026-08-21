@@ -4,14 +4,10 @@
 #include "checkpoint_manager.hpp"
 #include "graceful_shutdown.hpp"
 #include "plugin_loader.hpp"
-#include "cluster_master.hpp"
-#include "cluster_client.hpp"
 #include "common/message_meta.hpp"
 #include "common/message_tags.hpp"
 
 #include <caf/all.hpp>
-#include <caf/actor_registry.hpp>
-#include <caf/io/middleman.hpp>
 #include <caf/logger.hpp>
 
 #include <algorithm>
@@ -33,62 +29,6 @@ namespace {
 caf::actor& shutdown_manager_ref() {
     static caf::actor mgr;
     return mgr;
-}
-
-/// 集群节点引导（在插件加载完成后调用）：
-///   - master 模式：spawn 扁平注册表 actor + 注册命名 + 开 middleman 端口
-///   - region/worker 模式：开端口 + spawn 节点客户端（注册/心跳/重连自愈）
-/// 返回 false = 节点配置非法（如 master 模式缺 node-name）。
-bool bootstrap_cluster_node(caf::actor_system& sys,
-                            const framework_config& cfg,
-                            BootstrapResult& out) {
-    if (cfg.node_kind.empty())
-        return true;  // 纯插件进程，不参与集群
-
-    node_kind kind;
-    if (!parse_node_kind(cfg.node_kind, kind)) {
-        CAF_LOG_ERROR("Invalid node-kind: " << cfg.node_kind);
-        return false;
-    }
-    if (cfg.node_name.empty()) {
-        CAF_LOG_ERROR("node-name is required when node-kind is set");
-        return false;
-    }
-
-    // 开 middleman 端口（所有节点模式；master 自身也需要被 connect）
-    auto port = sys.middleman().open(cfg.node_port, nullptr, false);
-    if (!port) {
-        CAF_LOG_ERROR("Failed to open middleman port: " << caf::to_string(port.error()));
-        return false;
-    }
-    out.node_port = *port;
-    CAF_LOG_INFO("Node '" << cfg.node_name << "' listening on port " << *port);
-
-    if (kind == node_kind::master) {
-        // master 扁平注册表：自身先注册，命名后供客户端 remote_lookup
-        node_manifest self_manifest{kind, cfg.node_name, cfg.node_host, *port,
-                                    "", {}};
-        out.cluster_master = spawn_cluster_master(
-            sys, std::move(self_manifest),
-            std::chrono::seconds(cfg.lease_seconds));
-        sys.registry().put("cluster.master", out.cluster_master);
-        return true;
-    }
-
-    // region/worker：接入 master（客户端 actor 后台自愈注册 + 心跳）
-    node_client_config cc;
-    cc.node_name = cfg.node_name;
-    cc.kind = kind;
-    cc.host = cfg.node_host;
-    cc.port = *port;
-    cc.parent = cfg.parent;
-    cc.master_host = cfg.master_host;
-    cc.master_port = cfg.master_port;
-    cc.lease_ttl = std::chrono::seconds(cfg.lease_seconds);
-    // 本地 monitor：进程内最稳定的 actor 是 shutdown_mgr（生命周期=进程）
-    out.node_client = spawn_node_client(sys, std::move(cc), out.shutdown_mgr);
-    caf::anon_send(out.node_client, init_atom_v);
-    return true;
 }
 
 #ifdef _WIN32
@@ -130,22 +70,7 @@ framework_config::framework_config() {
         .add(shutdown_order, "shutdown-order,s", "plugin shutdown order (reverse load order if empty)")
         .add(plugins_dir, "plugins-dir,p", "plugin scan directory (default ./plugins)")
         .add(test_auto_shutdown, "test-auto-shutdown",
-             "auto trigger graceful shutdown after startup (smoke test)")
-        // 集群节点模式选项（空 node-kind = 纯插件进程）
-        .add(node_kind, "node-kind", "node role: master/region/worker (empty = plugin-only process)")
-        .add(node_name, "node-name", "unique node name")
-        .add(node_host, "node-host", "host registered with master (default 127.0.0.1)")
-        .add(node_port, "node-port", "middleman listen port (0 = auto)")
-        .add(master_host, "master-host", "master host (default 127.0.0.1)")
-        .add(master_port, "master-port", "master middleman port")
-        .add(lease_seconds, "lease-seconds", "lease TTL in seconds (0 = never expire, default 10)")
-        .add(parent, "parent", "parent node name (empty = direct child of master)");
-
-    // CAF 1.1 的 middleman（caf::io）不是默认加载的模块：必须先在
-    // actor_system 构造前注册其元对象（node_id 等类型），再 load 模块。
-    // （CAF_MAIN(id_block, io::middleman) 的模块参数机制做的就是这两步）
-    caf::io::middleman::init_global_meta_objects();
-    load<caf::io::middleman>();
+             "auto trigger graceful shutdown after startup (smoke test)");
 }
 
 bool bootstrap_plugin_framework(caf::actor_system& sys,
@@ -183,15 +108,14 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
     // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
     self->send(out.plugin_mgr, shutdown_atom{}, out.shutdown_mgr);
 
-    // ---- 第 1 步：入口插件（集群节点模式允许无插件，纯节点进程）----
-    if (cfg.entry_plugins.empty() && cfg.node_kind.empty()) {
+    // ---- 第 1 步：入口插件 ----
+    if (cfg.entry_plugins.empty()) {
         CAF_LOG_ERROR("No entry plugins configured. Use --caf-plugin-system.entry-plugins=PluginA,PluginB"
                       " or --config-file=app.ini");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    if (!cfg.entry_plugins.empty()) {
     CAF_LOG_INFO("Entry plugins:" << [&]() {
         std::string s;
         for (const auto& name : cfg.entry_plugins) s += " " + name;
@@ -261,13 +185,6 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
 
     if (!healthy) {
         CAF_LOG_ERROR("One or more plugins failed to resolve");
-        self->send(out.shutdown_mgr, shutdown_atom{});
-        return false;
-    }
-    } // if (!cfg.entry_plugins.empty()) —— 纯节点进程跳过插件引导
-
-    // ---- 集群节点引导（master 注册表 / worker 客户端接入）----
-    if (!bootstrap_cluster_node(sys, cfg, out)) {
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }

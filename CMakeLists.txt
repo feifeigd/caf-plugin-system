@@ -24,6 +24,12 @@ project(caf-plugin-system VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# UTF-8 源码（中文注释/字符串）在 MSVC 默认 936 代码页下解析会错乱
+# （C4819 + 后续 C2065 误报）。/utf-8 让 MSVC 按 UTF-8 解析源码。
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # 如果没找到 vcpkg，给出清晰的提示
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE OR NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}")
     message(FATAL_ERROR

@@ -1,5 +1,5 @@
-#include "cluster_client.hpp"
-#include "cluster_membership.hpp"
+#include "client.hpp"
+#include "membership_registry.hpp"
 #include "common/message_tags.hpp"
 
 #include <caf/io/middleman.hpp>
@@ -8,7 +8,7 @@
 #include <iostream>
 #include <optional>
 
-namespace caf_plugin_system {
+namespace caf_plugin_system { namespace cluster {
 
 bool parse_node_kind(const std::string& s, node_kind& out) {
   if (s == "master") { out = node_kind::master; return true; }
@@ -138,4 +138,4 @@ caf::actor spawn_node_client(caf::actor_system& sys,
   });
 }
 
-} // namespace caf_plugin_system
+} } // namespace caf_plugin_system::cluster
