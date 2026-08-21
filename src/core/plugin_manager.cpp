@@ -33,6 +33,7 @@ caf::behavior PluginManager::make_behavior() {
     });
     
     return caf::behavior{
+        // 加载插件 dll
         [=, this](load_atom, const std::string& name, const std::string& path) -> caf::result<bool> {
             CAF_LOG_INFO("Loading plugin: " << name);
 

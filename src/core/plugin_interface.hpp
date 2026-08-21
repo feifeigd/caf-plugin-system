@@ -41,7 +41,7 @@ public:
     // 创建插件 Actor（这是唯一的工厂方法）
     virtual caf::actor spawn(
         caf::actor_system& sys,
-        const std::vector<caf::actor>& injected_deps,
+        const std::vector<caf::actor>& injected_deps,   // manifest.dependencies 的 actor 实例，injected_deps 顺序与 manifest.dependencies 一致
         const std::string& config) = 0;
 };
 

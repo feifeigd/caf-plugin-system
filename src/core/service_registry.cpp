@@ -179,6 +179,7 @@ caf::behavior ServiceRegistry::make_behavior() {
             std::cout << "[Registry] Unregistered: " << name << std::endl;
         },
 
+        // 返回 dll 的代理 actor
         [=, this](resolve_atom, const std::string& name) -> caf::actor {
             auto it = services_.find(name);
             return (it != services_.end()) ? it->second.proxy : caf::actor{};
