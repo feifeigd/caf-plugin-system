@@ -1,9 +1,9 @@
 #include "framework_bootstrap.hpp"
-#include "plugin_manager.hpp"
+#include "plugin/plugin_manager.hpp"
 #include "service_registry.hpp"
 #include "checkpoint_manager.hpp"
 #include "graceful_shutdown.hpp"
-#include "plugin_loader.hpp"
+#include "plugin/plugin_loader.hpp"
 #include "common/message_meta.hpp"
 #include "common/message_tags.hpp"
 

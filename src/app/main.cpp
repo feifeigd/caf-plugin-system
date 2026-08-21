@@ -123,17 +123,23 @@ static void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
 // ------------------------------------------------------------------
 
 void caf_main(caf::actor_system& sys, const app_config& cfg) {
-    // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
-    cluster::BootstrapResult nb;
-    if (cfg.node_cfg.is_node()) {
-        if (!cluster::bootstrap_node(sys, cfg.node_cfg, {}, nb)) return;
-    }
-
     // ---- 插件框架引导（可选；--caf-plugin-system.entry-plugins 非空时）----
+    // 先于节点引导：混合模式下 shutdown_mgr 作为节点 monitor 上报给 master
+    // （优雅关机/进程退出时 master 立即感知，无需等 lease 过期）。
     BootstrapResult fw;
     if (!cfg.entry_plugins.empty()) {
         if (!bootstrap_plugin_framework(sys, cfg, fw)) return;
         if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
+    }
+
+    // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
+    // 单节点（纯插件）与集群节点（含插件）都经此路径，正交组合。
+    cluster::BootstrapResult nb;
+    if (cfg.node_cfg.is_node()) {
+        // 混合模式传 shutdown_mgr 作 monitor；纯节点模式传空 →
+        // bootstrap_node 内部 spawn 进程哨兵 actor 兜底。
+        caf::actor monitor = fw.shutdown_mgr;
+        if (!cluster::bootstrap_node(sys, cfg.node_cfg, monitor, nb)) return;
     }
 
     // ---- 等待关机：插件模式等 shutdown_mgr；纯节点模式等节点 actor ----

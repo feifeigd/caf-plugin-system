@@ -1,5 +1,5 @@
 #pragma once
-#include "plugin_interface.hpp"
+#include "plugin/plugin_interface.hpp"
 #include "graceful_shutdown.hpp" // drain_atom
 #include <functional>
 #include <map>

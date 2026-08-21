@@ -1,5 +1,5 @@
 #include "graceful_shutdown.hpp"
-#include "plugin_manager.hpp"
+#include "plugin/plugin_manager.hpp"
 #include "checkpoint_manager.hpp"
 #include <iostream>
 
