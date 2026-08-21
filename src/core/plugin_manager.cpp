@@ -5,6 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 
 namespace {
 /// 插件 DLL 句柄池（进程级常驻）。见 LoadedPlugin::lib 注释：
@@ -99,7 +100,7 @@ caf::behavior PluginManager::make_behavior() {
                 self->send(actor, restore_state_atom{}, state_data);
             }
 
-			self->monitor(actor);   // actor 退出，self 会收到 down_msg
+            self->monitor(actor);   // actor 退出，self 会收到 down_msg
             self->send(actor, init_atom{}, self, "");
 
             for (const auto& svc : manifest.provides) {
@@ -183,6 +184,19 @@ caf::behavior PluginManager::make_behavior() {
                                        "Reloaded manifest name mismatch: " + manifest.name);
             }
 
+            // 服务契约约束：热更新只允许【新增】服务，不允许删除——删除
+            // 会让旧服务代理永久静默、registry 台账指向已退役 actor。
+            // 改名/删除服务清单请走 卸载 → 重载。
+            for (const auto& svc : it->second.manifest.provides) {
+                if (std::find(manifest.provides.begin(), manifest.provides.end(),
+                              svc) == manifest.provides.end()) {
+                    destroy(new_plugin);
+                    return caf::make_error(
+                        caf::sec::invalid_argument,
+                        "Reload rejected: service removed from provides: " + svc);
+                }
+            }
+
             // 依赖解析（与 load 相同）
             std::vector<caf::actor> deps;
             caf::scoped_actor blocking{self->system()};
@@ -214,7 +228,7 @@ caf::behavior PluginManager::make_behavior() {
                                  [](caf::error&) {});
                 }
 
-				// 代理静默失败：回滚已静默的代理，销毁新插件，返回错误
+                // 代理静默失败：回滚已静默的代理，销毁新插件，返回错误
                 if (!paused) {
                     for (auto& p : proxies)
                         self->send(p, resume_atom{}, it->second.actor);
@@ -238,12 +252,41 @@ caf::behavior PluginManager::make_behavior() {
             if (!state_data.empty()) {
                 self->send(new_actor, restore_state_atom{}, state_data);
             }
-			self->monitor(new_actor);  // 新 actor 退出，self 会收到 down_msg
+            self->monitor(new_actor);  // 新 actor 退出，self 会收到 down_msg
             self->send(new_actor, init_atom{}, self, "");
 
-            // registry 台账（impl 引用与版本号）
+            // 新服务 ACL 白名单（提前收集：plugins_ 里依赖插件 actor 地址）
+            std::vector<caf::actor_addr> new_svc_allowed;
+            if (!manifest.acl_allow.empty()) {
+                for (const auto& pname : manifest.acl_allow) {
+                    auto pit = plugins_.find(pname);
+                    if (pit != plugins_.end()) {
+                        new_svc_allowed.push_back(pit->second.actor->address());
+                    } else {
+                        CAF_LOG_WARNING("ACL: unknown plugin in acl_allow of "
+                                        << name << ": " << pname);
+                    }
+                }
+            }
+
+            // registry 台账：旧服务 hot_reload 换实现（impl 引用 + 版本号）；
+            // 新服务（provides 新增）register 补注册——自动建 proxy 指向
+            // new_actor，无旧实例、无状态交接问题；声明了 acl_allow 则补发
+            // ACL。热更新不重发旧服务 ACL（白名单记的是调用方，与实现
+            // 无关，原样保留）。
             for (const auto& svc : manifest.provides) {
-                self->send(registry_, hot_reload_atom{}, svc, new_actor);
+                bool is_new = std::find(it->second.manifest.provides.begin(),
+                                        it->second.manifest.provides.end(), svc)
+                              == it->second.manifest.provides.end();
+                if (is_new) {
+                    self->send(registry_, register_atom{}, svc, new_actor, name);
+                    if (!new_svc_allowed.empty()) {
+                        self->send(registry_, set_service_acl_atom{}, svc,
+                                   new_svc_allowed);
+                    }
+                } else {
+                    self->send(registry_, hot_reload_atom{}, svc, new_actor);
+                }
             }
             // 恢复流量：代理切到新实现并冲刷静默期缓冲的调用。
             // ACL 白名单记的是【调用方】，与被切换的实现无关，热切换后原样保留；

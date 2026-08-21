@@ -242,6 +242,8 @@ self->request(plugin_mgr, caf::infinite, reload_atom{}, name, 新DLL路径);
 | ✅ | 内部状态结构 | 只要 save/restore 字节格式跨版本兼容（移交是直接内存拷贝） |
 | ✅ | 对**已注册类型**新增 handler | 类型系统没动，行为随便改 |
 | ✅ | 同名服务实现切换 | 代理 quiesce/resume 静默切换 + 缓冲冲刷，在途请求不丢；ACL 白名单记的是调用方，热切换后原样保留 |
+| ✅ | **新增** provides 服务 | 新服务走 register 补注册（自动建 proxy 指向新 actor，无旧实例无交接问题）；声明了 `acl_allow` 则补发 ACL |
+| ❌ | **删除** provides 服务 / 改名 | 只增不减：删除会让旧服务代理永久静默、registry 台账指向已退役 actor；改服务清单请走 卸载 → 重载 |
 | ❌ | **新增未注册的 type_id（协议号）** | 元对象必须在 actor_system 构造前注册；热更新路径调新 DLL 的 `register_meta_objects` 会因重复注册同一段直接 abort |
 | ❌ | C ABI / PluginEntry 接口 | create/destroy/manifest/spawn 签名必须兼容 |
 | ❌ | manifest.name | reload 按名匹配 |
