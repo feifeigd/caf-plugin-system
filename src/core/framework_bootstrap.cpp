@@ -36,16 +36,6 @@ caf::actor& shutdown_manager_ref() {
     return mgr;
 }
 
-/// 强退兜底：优雅关机链路有任何 actor 未停（如集群节点 actor），
-/// actor_system 析构会永久挂起。触发关机后 3 秒仍未退出则强制退出。
-void arm_force_exit_fallback() {
-    std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        std::cout << "[System] Shutdown fallback: force exit" << std::endl;
-        std::_Exit(0);
-    }).detach();
-}
-
 /// stdin 管道 EOF 哨兵（WSL interop）：Ctrl+C 只杀 bash，exe 变孤儿；
 /// 父进程/终端消失 → 管道写端关闭 → EOF → 触发优雅关机。
 /// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发。
@@ -71,7 +61,6 @@ void install_stdin_watchdog(caf::actor target) {
         if (total == 0)
             return;
         caf::anon_send(target, shutdown_atom{});
-        arm_force_exit_fallback();
     }).detach();
 }
 
@@ -81,7 +70,6 @@ BOOL WINAPI console_handler(DWORD signal) {
         || signal == CTRL_CLOSE_EVENT) {
         if (shutdown_manager_ref()) {
             caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
-            arm_force_exit_fallback();
         }
         return TRUE;
     }
@@ -91,7 +79,6 @@ BOOL WINAPI console_handler(DWORD signal) {
 void signal_handler(int) {
     if (shutdown_manager_ref()) {
         caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
-        arm_force_exit_fallback();
     }
 }
 #endif

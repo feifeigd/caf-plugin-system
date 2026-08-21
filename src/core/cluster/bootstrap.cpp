@@ -37,23 +37,12 @@ caf::actor& node_ctl_ref() {
     return ctl;
 }
 
-/// 强退兜底：纯节点模式下 actor_system 析构可能等哨兵 actor 挂起，
-/// 触发关机 3 秒后仍未退出则强制退出。
-void arm_force_exit_fallback() {
-    std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        std::cout << "[Cluster] Shutdown fallback: force exit" << std::endl;
-        std::_Exit(0);
-    }).detach();
-}
-
 #ifdef _WIN32
 BOOL WINAPI console_handler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT
         || signal == CTRL_CLOSE_EVENT) {
         if (node_ctl_ref()) {
             caf::anon_send_exit(node_ctl_ref(), caf::exit_reason::user_shutdown);
-            arm_force_exit_fallback();
         }
         return TRUE;
     }
@@ -63,7 +52,6 @@ BOOL WINAPI console_handler(DWORD signal) {
 void signal_handler(int) {
     if (node_ctl_ref()) {
         caf::anon_send_exit(node_ctl_ref(), caf::exit_reason::user_shutdown);
-        arm_force_exit_fallback();
     }
 }
 #endif
@@ -142,12 +130,22 @@ bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
     // 纯节点模式没有 shutdown_mgr 可传，spawn 一个进程哨兵 actor 兜底
     // （master 持其强引用，进程退出时必然收到 down_msg，不用等 lease 过期）。
     caf::actor monitor = std::move(local_monitor);
+    bool is_local_sentinel = !monitor;
     if (!monitor) {
-        monitor = sys.spawn([](caf::event_based_actor*) -> caf::behavior {
-            return {[](int) {}};  // 有 handler 即常驻；不匹配消息默认丢弃
+        // 进程哨兵：master 监控它感知本进程退出；同时监控 client，
+        // client 退出（优雅关机）时哨兵收到 down_msg 自动 quit——
+        // 否则 actor_system 析构会等常驻哨兵永久挂起。
+        monitor = sys.spawn([](caf::event_based_actor* self) -> caf::behavior {
+            return {
+                [self](caf::actor target) { self->monitor(target); },
+                [self](const caf::down_msg&) { self->quit(); },
+                [](int) {}  // 兜底 handler：不匹配消息默认丢弃
+            };
         });
     }
-    out.client = spawn_node_client(sys, std::move(cc), std::move(monitor));
+    out.client = spawn_node_client(sys, std::move(cc), monitor);
+    if (is_local_sentinel)
+        caf::anon_send(monitor, out.client);  // 哨兵监控 client
     caf::anon_send(out.client, init_atom_v);
     return true;
 }
@@ -173,7 +171,6 @@ void install_stdin_watchdog(caf::actor target) {
         if (total == 0)
             return;
         caf::anon_send_exit(target, caf::exit_reason::user_shutdown);
-        arm_force_exit_fallback();
     }).detach();
 #else
     struct stat st;
