@@ -1,4 +1,5 @@
 #include "plugin_interface.hpp"
+#include "plugin_lifecycle.hpp"
 #include "graceful_shutdown.hpp"
 #include "checkpoint_manager.hpp"
 #include "plugin_manager.hpp"
@@ -40,10 +41,8 @@ public:
 
             self->state() = 0;
 
-            return caf::behavior{
-                [=](init_atom, caf::actor, const std::string&) {
-                    SPDLOG_INFO("LoggerPlugin initialized");
-                },
+            // 私有业务（log_atom）在前，公共生命周期 behavior 兜底
+            caf::message_handler business{
                 [=](log_atom, const std::string& source,
                     const std::string& level, const std::string& msg) {
 
@@ -65,28 +64,29 @@ public:
                     else if (level == "ERROR") logger->error(msg);
                     else                       logger->info(msg);
                 },
-                [=](drain_atom, caf::actor coordinator) {
-                    spdlog::info("LoggerPlugin draining...");
-                    self->send(coordinator, drain_atom{}, self->address());
+            };
+            return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
+                .on_init = [](caf::actor, const std::string&) {
+                    SPDLOG_INFO("LoggerPlugin initialized");
                 },
-                [=](save_state_atom) -> std::vector<std::byte> {
+                // drain：无排空动作，回执由框架统一
+                .on_save = [self]() -> std::vector<std::byte> {
                     int count = self->state();
                     std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &count, sizeof(int));
                     return data;
                 },
-                [=](restore_state_atom, const std::vector<std::byte>& data) {
+                .on_restore = [self](const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
                         std::memcpy(&self->state(), data.data(), sizeof(int));
                         spdlog::info("LoggerPlugin restored count={}", self->state());
                     }
                 },
-                [=](shutdown_atom) {
+                .on_shutdown = []() {
                     spdlog::info("LoggerPlugin shutdown");
-                    spdlog::shutdown();
-                    self->quit();
-                }
-            };
+                    spdlog::shutdown();   // 插件特有的清理：spdlog 全局关闭
+                },
+            }))};
         });
     }
 };

@@ -1,4 +1,5 @@
 #include "plugin_interface.hpp"
+#include "plugin_lifecycle.hpp"
 #include "graceful_shutdown.hpp"
 #include "checkpoint_manager.hpp"
 #include "plugin_manager.hpp"
@@ -63,24 +64,10 @@ public:
             self->state() = 0;
             auto plugin_mgr = std::make_shared<caf::actor>();
 
-            return caf::behavior{
-                [=](init_atom, caf::actor manager, const std::string&) {
-                    *plugin_mgr = manager;
-                    LOG_INFO(logger, "BusinessPlugin initialized ({})", BIZ_VERSION_STR);
-                    // 方式一·私有类型：验证元对象自注册生效（创建→投递→析构
-                    // 全链路，若 register_meta_objects 没被调用，这条消息会崩进程）
-                    self->send(self, biz_ping_atom{});
-                    // 方式二·公共信封：不占号段、不用自注册，但载荷要自己编码
-                    {
-                        const char* text = "hello-envelope";
-                        plugin_envelope env;
-                        env.sub_proto = biz_env_hello;
-                        env.payload.assign(
-                            reinterpret_cast<const std::byte*>(text),
-                            reinterpret_cast<const std::byte*>(text) + std::strlen(text));
-                        self->send(self, env);
-                    }
-                },
+            // 私有业务 handler 在前（高频消息一次命中），公共生命周期
+            // behavior 兜底（plugin_lifecycle：drain 回执 / shutdown quit
+            // 框架统一，状态序列化走 hooks 回调）。
+            caf::message_handler business{
                 [=](biz_ping_atom) {
                     LOG_INFO(logger, "Private meta round-trip OK");
                 },
@@ -124,26 +111,41 @@ public:
                     return "processed: " + cmd;
 #endif
                 },
-                [=](drain_atom, caf::actor coordinator) {
-                    LOG_INFO(logger, "Draining...");
-                    self->send(coordinator, drain_atom{}, self->address());
+            };
+            return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
+                // 初始化：记录 manager + 私有消息自测（回调可捕获 self）
+                .on_init = [logger, plugin_mgr, self](caf::actor manager,
+                                                      const std::string&) {
+                    *plugin_mgr = manager;
+                    LOG_INFO(logger, "BusinessPlugin initialized ({})", BIZ_VERSION_STR);
+                    // 方式一·私有类型：验证元对象自注册生效（创建→投递→析构
+                    // 全链路，若 register_meta_objects 没被调用，这条消息会崩进程）
+                    self->send(self, biz_ping_atom{});
+                    // 方式二·公共信封：不占号段、不用自注册，但载荷要自己编码
+                    {
+                        const char* text = "hello-envelope";
+                        plugin_envelope env;
+                        env.sub_proto = biz_env_hello;
+                        env.payload.assign(
+                            reinterpret_cast<const std::byte*>(text),
+                            reinterpret_cast<const std::byte*>(text) + std::strlen(text));
+                        self->send(self, env);
+                    }
                 },
-                [=](save_state_atom) -> std::vector<std::byte> {
+                // drain：无排空动作，回执由框架统一（不注册 on_drain）
+                .on_save = [self]() -> std::vector<std::byte> {
                     std::vector<std::byte> data(sizeof(int));
                     std::memcpy(data.data(), &self->state(), sizeof(int));
                     return data;
                 },
-                [=](restore_state_atom, const std::vector<std::byte>& data) {
+                .on_restore = [self, logger](const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
                         std::memcpy(&self->state(), data.data(), sizeof(int));
                         LOG_INFO(logger, "Restored count={}", self->state());
                     }
                 },
-                [=](shutdown_atom) {
-                    LOG_INFO(logger, "Shutdown");
-                    self->quit();
-                }
-            };
+                // shutdown：无清理动作，quit 由框架统一
+            }))};
         });
     }
 };
