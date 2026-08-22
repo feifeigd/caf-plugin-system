@@ -3,6 +3,7 @@
 
 add_executable(caf_plugin_app
     main.cpp
+    app_tests.cpp
 )
 
 target_link_libraries(caf_plugin_app PRIVATE caf_plugin_core)

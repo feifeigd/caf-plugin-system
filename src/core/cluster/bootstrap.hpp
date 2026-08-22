@@ -76,10 +76,9 @@ void add_node_options(caf::actor_system_config& cfg, node_settings& settings);
 /// region/worker：spawn 客户端接入 master（注册/心跳/自愈后台进行）。
 /// local_monitor 非空时随注册上报给 master（如插件框架的 shutdown_mgr，
 /// master 监控它感知本进程退出）。返回 false = 配置非法（已打日志）。
+/// 注：OpsActor 是系统组件，由 main 统一 spawn（不在此函数内），
+/// master 的注册表句柄经 BootstrapResult::master 返回供其注入。
 bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
                     caf::actor local_monitor, BootstrapResult& out);
-
-/// 阻塞直到节点关机（Ctrl+C / 节点 actor down / sys.shutdown()）。
-void wait_for_node_shutdown(caf::actor_system& sys, const BootstrapResult& nb);
 
 } } // namespace caf_plugin_system::cluster

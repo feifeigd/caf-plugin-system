@@ -106,3 +106,14 @@ X_TAG(service_resolve_atom, 257)  // 按服务名解析：master 返回导出该
 X_REG(service_route, (caf_plugin_system::service_route), 258, "service_route")
 X_TAG(cross_call_ex_atom, 259)    // 跨节点调用（有界重试）：attempts 次尝试，间隔可中断等待
 X_TAG(remote_retry_tick_atom, 260) // RemoteCaller 内部：per-key 重试定时器（event-based 状态机）
+
+// -- 运维（OpsActor，见 src/core/cluster/ops_actor.*）---------------------
+// 内核固定协议（与集群协议同级，非插件 envelope）：远程热更 + 本地控制台。
+// 双模式：dll_bytes 推送（master 读本地 DLL 发节点，节点落盘 updates/ 新路径）
+//         或 dll_path 已就位（DLL 已通过其他渠道到达节点本地）。
+X_TAG(remote_reload_atom, 261)    // master→节点 OpsActor：远程热更（载荷 reload_request）
+X_REG(reload_request, (caf_plugin_system::reload_request), 262, "reload_request")
+X_REG(reload_result, (caf_plugin_system::reload_result), 263, "reload_result")
+X_TAG(console_cmd_atom, 264)      // 本地控制台：stdin 线程 → OpsActor（命令字符串）
+X_TAG(list_plugins_atom, 265)     // 查询本机插件列表 → vector<string>
+X_TAG(register_cluster_atom, 266) // 节点引导后：把 master/client 句柄注册给 shutdown_mgr（关机统一终止）

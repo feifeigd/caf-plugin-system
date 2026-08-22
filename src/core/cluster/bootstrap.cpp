@@ -29,34 +29,9 @@
 
 namespace caf_plugin_system { namespace cluster {
 
-namespace {
-
-/// 当前节点 actor（master 或 client）——信号处理用。进程级，bootstrap 时赋值。
-caf::actor& node_ctl_ref() {
-    static caf::actor ctl;
-    return ctl;
-}
-
-#ifdef _WIN32
-BOOL WINAPI console_handler(DWORD signal) {
-    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT
-        || signal == CTRL_CLOSE_EVENT) {
-        if (node_ctl_ref()) {
-            caf::anon_send_exit(node_ctl_ref(), caf::exit_reason::user_shutdown);
-        }
-        return TRUE;
-    }
-    return FALSE;
-}
-#else
-void signal_handler(int) {
-    if (node_ctl_ref()) {
-        caf::anon_send_exit(node_ctl_ref(), caf::exit_reason::user_shutdown);
-    }
-}
-#endif
-
-} // namespace
+// 关机统一由 shutdown_mgr 处理（停插件 + 集群 + 组件），cluster 层不再
+// 注册自己的信号处理/stdin 哨兵——Ctrl+C / EOF 都经 framework 的
+// console_handler / install_stdin_watchdog 发 shutdown_atom 给 shutdown_mgr。
 
 void init_node_io(caf::actor_system_config& cfg) {
     // CAF 1.1 的 middleman（caf::io）不是默认加载的模块：必须先注册其
@@ -127,9 +102,12 @@ bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
     cc.lease_ttl = std::chrono::seconds(settings.lease_seconds);
     cc.master_registry_name = settings.master_registry_name;
     cc.exported_actors = settings.exported_actors;
+    // 运维 actor 随节点导出：master 可 node_resolve(node, "ops") 远程热更
+    cc.exported_actors.push_back("ops");
     // local_monitor：master 监控它感知本进程退出（优雅关机时立即 down）。
-    // 纯节点模式没有 shutdown_mgr 可传，spawn 一个进程哨兵 actor 兜底
-    // （master 持其强引用，进程退出时必然收到 down_msg，不用等 lease 过期）。
+    // 常规调用方传 shutdown_mgr（系统组件，所有进程都有）；未提供时
+    // spawn 进程哨兵 actor 兜底（master 持其强引用，进程退出时必然收到
+    // down_msg，不用等 lease 过期）。
     caf::actor monitor = std::move(local_monitor);
     bool is_local_sentinel = !monitor;
     if (!monitor) {
@@ -149,62 +127,6 @@ bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
         caf::anon_send(monitor, out.client);  // 哨兵监控 client
     caf::anon_send(out.client, init_atom_v);
     return true;
-}
-
-// stdin 管道 EOF 哨兵：WSL interop 下 Ctrl+C 只杀 bash，exe 变孤儿；
-// 父进程/终端消失 → 管道写端关闭 → 读 EOF → 触发优雅关机。
-// 仅监视 FIFO stdin（WSL 管道）；控制台/重定向/devnull 不监视。
-// 启动 1.5s 宽限，避免后台启动时空管道立即 EOF 误触发。
-void install_stdin_watchdog(caf::actor target) {
-#ifdef _WIN32
-    struct _stat64 st;
-    if (_fstat64(_fileno(stdin), &st) != 0
-        || (st.st_mode & _S_IFMT) != _S_IFIFO)
-        return;
-    std::thread([target] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        char buf[64];
-        size_t total = 0;
-        while (fread(buf, 1, sizeof buf, stdin) > 0)
-            total += sizeof buf;
-        // 只有"读过数据后 EOF"才算父进程/终端消失；启动即 EOF 的空管道
-        // （如 WSL→PowerShell 继承的空 stdin）不触发，避免误关机。
-        if (total == 0)
-            return;
-        caf::anon_send_exit(target, caf::exit_reason::user_shutdown);
-    }).detach();
-#else
-    struct stat st;
-    if (fstat(STDIN_FILENO, &st) != 0 || !S_ISFIFO(st.st_mode))
-        return;
-    std::thread([target] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        char buf[64];
-        while (fread(buf, 1, sizeof buf, stdin) > 0) {
-        }
-        caf::anon_send_exit(target, caf::exit_reason::user_shutdown);
-    }).detach();
-#endif
-}
-
-void wait_for_node_shutdown(caf::actor_system& sys, const BootstrapResult& nb) {
-    // 信号 → send_exit 节点 actor → wait_for 返回（Ctrl+C / 关窗）
-    node_ctl_ref() = nb.master ? nb.master : nb.client;
-#ifdef _WIN32
-    SetConsoleCtrlHandler(console_handler, TRUE);
-#else
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-#endif
-    install_stdin_watchdog(node_ctl_ref());
-
-    caf::scoped_actor self{sys};
-    // master/client 至少有一个（bootstrap_node 成功时）
-    if (nb.master)
-        self->wait_for(nb.master);
-    else if (nb.client)
-        self->wait_for(nb.client);
-    CAF_LOG_INFO("node shutdown complete");
 }
 
 } } // namespace caf_plugin_system::cluster

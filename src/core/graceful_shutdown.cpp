@@ -23,6 +23,25 @@ caf::behavior GracefulShutdown::make_behavior() {
     auto checkpoint_mgr = checkpoint_mgr_;
     auto get_stop_order = get_stop_order_;
 
+    // 统一终止集群节点 actor（master/client，register_cluster_atom 注册的）
+    auto stop_cluster = [=, this] {
+        for (auto& ctl : cluster_ctls_)
+            if (ctl)
+                self->send_exit(ctl, caf::exit_reason::user_shutdown);
+    };
+
+    // 完成关机：杀集群 → 杀组件 → 标记 stopped → quit。
+    // 插件必须在调用前已全部保存（无插件时 remaining 为空即视为完成）。
+    auto finish_shutdown = [=, this] {
+        stop_cluster();
+        self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
+        self->send_exit(registry, caf::exit_reason::user_shutdown);
+        self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
+        state_.state = SystemState::stopped;
+        std::cout << "[System] State: STOPPED" << std::endl;
+        self->quit();
+    };
+
     // 逐个停插件的公共流程：resolve -> drain -> save_state -> checkpoint -> shutdown
     auto stop_next = [=, this](const std::string& name) {
         self->request(plugin_mgr, caf::infinite, resolve_plugin_atom{}, name)
@@ -68,11 +87,7 @@ caf::behavior GracefulShutdown::make_behavior() {
                 // 否则 actor_system 析构会等核心 actor 永久挂起。
                 if (state_.state != SystemState::stopped) {
                     std::cout << "[Shutdown] Not ready, forcing exit..." << std::endl;
-                    self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
-                    self->send_exit(registry, caf::exit_reason::user_shutdown);
-                    self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
-                    state_.state = SystemState::stopped;
-                    self->quit();
+                    finish_shutdown();
                 }
                 return;
             }
@@ -84,9 +99,13 @@ caf::behavior GracefulShutdown::make_behavior() {
 
             if (!state_.remaining_plugins.empty()) {
                 stop_next(state_.remaining_plugins.back());
+                self->delayed_send(self, config_.drain_timeout, force_exit_atom{});
+            } else {
+                // 无插件（纯节点/组件进程）：立即完成，不等 force_exit 兜底
+                std::cout << "[Shutdown] No plugins to stop. Stopping cluster + registry..."
+                          << std::endl;
+                finish_shutdown();
             }
-
-            self->delayed_send(self, config_.drain_timeout, force_exit_atom{});
         },
 
         [=, this](plugin_saved_atom, const std::string& plugin_name, bool) {
@@ -96,14 +115,10 @@ caf::behavior GracefulShutdown::make_behavior() {
             if (!remaining.empty()) {
                 stop_next(remaining.back());
             } else {
-                std::cout << "[Shutdown] All plugins saved. Stopping registry..." << std::endl;
-                // 停掉全部核心 actor，否则 actor_system 析构会一直等它们退出
-                self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
-                self->send_exit(registry, caf::exit_reason::user_shutdown);
-                self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
-                state_.state = SystemState::stopped;
-                std::cout << "[System] State: STOPPED" << std::endl;
-                self->quit();
+                std::cout << "[Shutdown] All plugins saved. Stopping cluster + registry..." << std::endl;
+                // 统一关机链：插件已保存 → 集群节点（master/client）→ 核心组件。
+                // 全部停掉，否则 actor_system 析构会一直等它们退出。
+                finish_shutdown();
             }
         },
 
@@ -117,11 +132,13 @@ caf::behavior GracefulShutdown::make_behavior() {
         [=, this](force_exit_atom) {
             if (state_.state == SystemState::stopped) return;
             std::cout << "[Shutdown] TIMEOUT! Force exiting..." << std::endl;
-            self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
-            self->send_exit(registry, caf::exit_reason::user_shutdown);
-            self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
-            state_.state = SystemState::stopped;
-            self->quit();
+            finish_shutdown();
+        },
+
+        // 集群节点 actor 注册（main 在 bootstrap_node 后调用）：关机统一终止
+        [=, this](register_cluster_atom, const caf::actor& ctl) {
+            if (ctl)
+                cluster_ctls_.push_back(ctl);
         },
 
         [=, this](health_check_atom) -> SystemState {

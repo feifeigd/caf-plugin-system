@@ -35,6 +35,9 @@ private:
     caf::actor plugin_mgr_;
     caf::actor registry_;
     caf::actor checkpoint_mgr_;
+    /// 集群节点 actor（master/client，经 register_cluster_atom 注册）：
+    /// 关机时统一终止（插件保存后 → 集群 → 组件），main 不再手动杀。
+    std::vector<caf::actor> cluster_ctls_;
     std::function<std::vector<std::string>()> get_stop_order_;
     State state_;
 };

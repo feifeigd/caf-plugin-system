@@ -36,11 +36,18 @@ caf::actor& shutdown_manager_ref() {
     return mgr;
 }
 
-/// stdin 管道 EOF 哨兵（WSL interop）：Ctrl+C 只杀 bash，exe 变孤儿；
-/// 父进程/终端消失 → 管道写端关闭 → EOF → 触发优雅关机。
-/// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发。
-void install_stdin_watchdog(caf::actor target) {
+} // namespace
+
+void install_stdin_watchdog(caf::actor shutdown_mgr) {
 #ifdef _WIN32
+    // 交互控制台（含 ConPTY 伪终端）不装 watchdog：用户可直接 Ctrl+C，
+    // console_handler 走优雅关机。只有非交互 stdin 才需要 EOF 哨兵。
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+        return;
+    // 非交互：仅 FIFO（管道）装哨兵；文件重定向（REG）不装——EOF 是正常
+    // 结束不是父进程消失。
     struct _stat64 st;
     if (_fstat64(_fileno(stdin), &st) != 0
         || (st.st_mode & _S_IFMT) != _S_IFIFO)
@@ -50,7 +57,10 @@ void install_stdin_watchdog(caf::actor target) {
     if (fstat(STDIN_FILENO, &st) != 0 || !S_ISFIFO(st.st_mode))
         return;
 #endif
-    std::thread([target] {
+    // 框架日志可能静默丢失（CAF logger 输出目标不定），哨兵状态用 cout。
+    std::cout << "[Watchdog] stdin EOF watchdog armed (pipe stdin)"
+              << std::endl;
+    std::thread([shutdown_mgr] {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         char buf[64];
         size_t total = 0;
@@ -60,14 +70,37 @@ void install_stdin_watchdog(caf::actor target) {
         // （如 WSL→PowerShell 继承的空 stdin）不触发，避免误关机。
         if (total == 0)
             return;
-        caf::anon_send(target, shutdown_atom{});
+        // 统一关机：EOF = 父进程消失 → shutdown_mgr 优雅关机链
+        caf::anon_send(shutdown_mgr, shutdown_atom{});
     }).detach();
+}
+
+namespace {
+
+/// 禁用控制台 QuickEdit/选择模式：Windows 控制台默认开启快速编辑，
+/// 鼠标划过/选中文本后 Ctrl+C 会被劫持成"复制选中内容"而不是中断信号
+/// （程序收不到 CTRL_C_EVENT，表现为 Ctrl+C 无法退出）。运维工具
+/// 必须保证 Ctrl+C 语义 = 优雅关机。
+void disable_quick_edit() {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        mode &= ~ENABLE_QUICK_EDIT_MODE;
+        mode &= ~ENABLE_INSERT_MODE;  // 顺带关掉插入模式（防误触）
+        SetConsoleMode(h, mode);
+    }
+#endif
 }
 
 #ifdef _WIN32
 BOOL WINAPI console_handler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT
         || signal == CTRL_CLOSE_EVENT) {
+        // 诊断日志（信号线程）：fprintf 单次调用原子，不会与主线程交错；
+        // 若按了 Ctrl+C 但窗口无此输出 = 被 QuickEdit 选中模式劫持。
+        fprintf(stderr, "[Signal] %s received, triggering graceful shutdown\n",
+                signal == CTRL_C_EVENT ? "Ctrl+C" : "Ctrl+Break/Close");
         if (shutdown_manager_ref()) {
             caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
         }
@@ -111,20 +144,27 @@ framework_config::framework_config() {
         .add(test_cross_call, "test-cross-call",
              "cross-node call this service after node registration (cluster test)")
         .add(test_cross_call_ex, "test-cross-call-ex",
-             "cross-node call this service with bounded retry (15x1s) after node registration");
+             "cross-node call this service with bounded retry (15x1s) after node registration")
+        .add(test_remote_reload, "test-remote-reload",
+             "master: remote hot-reload <node>,<plugin>,<path> after node registration (ops test)")
+        .add(test_quit, "test-quit",
+             "trigger ops quit after startup (verify graceful shutdown, process must exit 0)")
+        .add(test_ctrl_c, "test-ctrl-c",
+             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)");
 }
 
-bool bootstrap_plugin_framework(caf::actor_system& sys,
-                                const framework_config& cfg,
-                                BootstrapResult& out) {
-    CAF_LOG_INFO("framework startup begin");
+bool bootstrap_system_components(caf::actor_system& sys,
+                                 const framework_config& cfg,
+                                 BootstrapResult& out) {
+    CAF_LOG_INFO("system components startup");
 
     out.registry = sys.spawn<ServiceRegistry>(cfg.allow_cross_node);
     out.checkpoint_mgr
         = sys.spawn<CheckpointManager>(std::filesystem::path{"./checkpoints"});
     out.plugin_mgr = sys.spawn<PluginManager>(out.registry, out.checkpoint_mgr);
 
-    // 关机顺序：显式配置优先，否则加载反序（依赖者先停）
+    // 关机顺序：显式配置优先，否则加载反序（依赖者先停）。load_order 由
+    // bootstrap_plugins 填充（组件引导阶段尚无插件）。
     auto get_stop_order = [&]() -> std::vector<std::string> {
         if (!cfg.shutdown_order.empty()) return cfg.shutdown_order;
         auto rev = out.load_order;
@@ -137,6 +177,8 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
         get_stop_order);
     shutdown_manager_ref() = out.shutdown_mgr;
 
+    // 保证 Ctrl+C 语义 = 中断信号（QuickEdit 会劫持成复制）
+    disable_quick_edit();
 #ifdef _WIN32
     SetConsoleCtrlHandler(console_handler, TRUE);
 #else
@@ -149,12 +191,21 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
     // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
     self->send(out.plugin_mgr, shutdown_atom{}, out.shutdown_mgr);
 
+    // 组件就绪（任何进程都 ready：纯节点无 bootstrap_plugins 不会发 ready，
+    // 否则 quit 时 GracefulShutdown 走 "Not ready, forcing exit" 强杀路径）
+    self->send(out.shutdown_mgr, ready_atom{});
+
+    CAF_LOG_INFO("system components ready");
+    return true;
+}
+
+bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
+                       BootstrapResult& out) {
+    caf::scoped_actor self{sys};
+
     // ---- 第 1 步：入口插件 ----
     if (cfg.entry_plugins.empty()) {
-        CAF_LOG_ERROR("No entry plugins configured. Use --caf-plugin-system.entry-plugins=PluginA,PluginB"
-                      " or --config-file=caf-application.conf");
-        self->send(out.shutdown_mgr, shutdown_atom{});
-        return false;
+        return true;  // 无插件：合法（纯节点/纯组件进程）
     }
 
     CAF_LOG_INFO("Entry plugins:" << [&]() {
@@ -236,12 +287,9 @@ bool bootstrap_plugin_framework(caf::actor_system& sys,
 }
 
 void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
-#ifdef _WIN32
-    SetConsoleCtrlHandler(console_handler, TRUE);
-#else
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-#endif
+    // 信号处理已在 bootstrap_system_components 注册（console_handler /
+    // signal_handler），不重复注册（SetConsoleCtrlHandler 重复注册会让
+    // handler 被调用两次 → 双 shutdown_atom）。
     install_stdin_watchdog(fw.shutdown_mgr);
     caf::scoped_actor self{sys};
     self->wait_for(fw.shutdown_mgr);

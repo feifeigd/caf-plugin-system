@@ -33,6 +33,14 @@ caf::behavior PluginManager::make_behavior() {
     });
     
     return caf::behavior{
+        // 插件清单查询（OpsActor 本地 list / 远程巡检用）
+        [this](list_plugins_atom) -> std::vector<std::string> {
+            std::vector<std::string> names;
+            names.reserve(plugins_.size());
+            for (const auto& [name, plugin] : plugins_)
+                names.push_back(name);
+            return names;
+        },
         // 加载插件 dll
         [=, this](load_atom, const std::string& name, const std::string& path) -> caf::result<bool> {
             CAF_LOG_INFO("Loading plugin: " << name);

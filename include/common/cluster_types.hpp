@@ -226,4 +226,45 @@ bool inspect(Inspector& f, shutdown_request& x) {
   );
 }
 
+// ------------------------------------------------------------------
+// 运维协议：远程热更 + 本地控制台（见 src/core/cluster/ops_actor.*）
+// 内核固定类型（message_tags.def 262-263），与集群协议同级显式注册。
+// ------------------------------------------------------------------
+
+/// 远程热更请求：master → 目标节点 OpsActor（remote_reload_atom 载荷）。
+/// 双模式：
+///   - dll_bytes 非空 = 字节流推送：节点落盘到 updates/<plugin>/<ts>/ 新路径，
+///     天然避开 Windows 文件锁与 LoadLibrary 同路径缓存（见 hot-reload-procedure.md）；
+///   - 否则 = dll_path 已就位：DLL 已通过其他渠道（CI/CD/共享盘）到达节点本地。
+struct reload_request {
+  std::string plugin_name;             // PluginManager 台账 key
+  std::string file_name;               // 落盘文件名（字节流模式；空 = <plugin>.dll）
+  std::vector<std::byte> dll_bytes;    // DLL 二进制（空 = 已就位路径模式）
+  std::string dll_path;                // 已就位模式：节点本地 DLL 路径
+};
+
+template <class Inspector>
+bool inspect(Inspector& f, reload_request& x) {
+  return f.object(x).fields(
+    f.field("plugin_name", x.plugin_name),
+    f.field("file_name", x.file_name),
+    f.field("dll_bytes", x.dll_bytes),
+    f.field("dll_path", x.dll_path)
+  );
+}
+
+/// 热更回执：节点 → master（remote_reload_atom 的响应）。
+struct reload_result {
+  bool ok = false;
+  std::string message;                 // 成功描述 / 失败原因
+};
+
+template <class Inspector>
+bool inspect(Inspector& f, reload_result& x) {
+  return f.object(x).fields(
+    f.field("ok", x.ok),
+    f.field("message", x.message)
+  );
+}
+
 } // namespace caf_plugin_system
