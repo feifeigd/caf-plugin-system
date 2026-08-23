@@ -6,6 +6,7 @@
 
 #include "common/cluster_types.hpp"
 #include "common/message_tags.hpp"
+#include "../framework_log.hpp"
 
 #include <caf/actor_cast.hpp>
 #include <caf/all.hpp>
@@ -39,9 +40,9 @@ namespace {
 
 constexpr auto k_ops_timeout = std::chrono::seconds(10);
 
-/// 控制台命令 → stdout 统一前缀（框架日志可能静默丢失，必须 cout + endl）。
+/// 控制台命令输出统一走 fw_log（logging_service > CAF log > cout）。
 void ops_print(const std::string& msg) {
-    std::cout << "[Ops] " << msg << std::endl;
+    fw_log("INFO", "[Ops] " + msg);
 }
 
 std::vector<std::string> split_ws(const std::string& s) {
@@ -507,7 +508,7 @@ caf::actor spawn_ops_actor(caf::actor_system& sys, std::string node_name,
                                std::move(updates_dir));
 }
 
-void start_console_thread(caf::actor_system& sys, caf::actor ops) {
+void start_console_thread(caf::actor ops) {
     // 交互判定：GetConsoleMode 成功 = 真实控制台或 ConPTY 伪终端（VS Code
     // external/integratedTerminal 都是 ConPTY，stdin 底层是命名管道，fstat
     // 会误报 FIFO 而跳过——ConPTY 同样支持 console API，必须按交互处理）。
@@ -526,13 +527,16 @@ void start_console_thread(caf::actor_system& sys, caf::actor ops) {
         return;
 #endif
     ops_print("console ready: type 'help' for commands");
-    std::thread([&sys, ops = std::move(ops)] {
-        caf::scoped_actor self{sys};
+    std::thread([ops = std::move(ops)] {
+        // 关键：绝不能用 scoped_actor——线程阻塞在 getline 等键盘输入，
+        // 其持有的 scoped_actor（本身是 CAF actor）永不退出，actor_system
+        // 析构等它导致进程挂起（quit 能退而 Ctrl+C 卡死的根因之一）。
+        // anon_send 不需要调用者上下文，任意线程安全。
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty())
                 continue;
-            self->send(ops, console_cmd_atom_v, line);
+            caf::anon_send(ops, console_cmd_atom_v, line);
         }
     }).detach();
 }

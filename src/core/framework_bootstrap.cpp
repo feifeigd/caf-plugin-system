@@ -3,6 +3,7 @@
 #include "service_registry.hpp"
 #include "checkpoint_manager.hpp"
 #include "graceful_shutdown.hpp"
+#include "framework_log.hpp"
 #include "plugin/plugin_loader.hpp"
 #include "common/message_meta.hpp"
 #include "common/message_tags.hpp"
@@ -11,14 +12,24 @@
 #include <caf/logger.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -36,7 +47,40 @@ caf::actor& shutdown_manager_ref() {
     return mgr;
 }
 
+/// 控制台销毁标志：CTRL_CLOSE_EVENT（点窗口 X）时置 true。
+/// 关机链的 std::cout 必须跳过（写销毁中的控制台句柄会阻塞，拖死关机链
+/// 直到 5 秒窗口耗尽被系统强杀），日志一律走 shutdown-trace.log 落盘。
+std::atomic<bool> g_console_closing{false};
+
+/// 关机链完成信号（点 X 场景）：GracefulShutdown::finish_shutdown 完成后
+/// notify_shutdown_complete()；CTRL_CLOSE handler 阻塞在 cv 上等待，
+/// 链完成才 ExitProcess(0)。详见 hpp 声明处的实测依据。
+std::mutex g_shutdown_done_mutex;
+std::condition_variable g_shutdown_done_cv;
+bool g_shutdown_done = false;
+
 } // namespace
+
+bool console_closing() {
+    return g_console_closing.load();
+}
+
+void notify_shutdown_complete() {
+    std::lock_guard<std::mutex> lock(g_shutdown_done_mutex);
+    g_shutdown_done = true;
+    g_shutdown_done_cv.notify_all();
+}
+
+bool wait_for_shutdown_complete(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(g_shutdown_done_mutex);
+    return g_shutdown_done_cv.wait_for(lock, timeout,
+                                       [] { return g_shutdown_done; });
+}
+
+std::mutex& trace_file_mutex() {
+    static std::mutex m;
+    return m;
+}
 
 void install_stdin_watchdog(caf::actor shutdown_mgr) {
 #ifdef _WIN32
@@ -57,9 +101,8 @@ void install_stdin_watchdog(caf::actor shutdown_mgr) {
     if (fstat(STDIN_FILENO, &st) != 0 || !S_ISFIFO(st.st_mode))
         return;
 #endif
-    // 框架日志可能静默丢失（CAF logger 输出目标不定），哨兵状态用 cout。
-    std::cout << "[Watchdog] stdin EOF watchdog armed (pipe stdin)"
-              << std::endl;
+    // 哨兵状态走统一日志（logging_service > CAF log > cout）。
+    fw_log_info("[Watchdog] stdin EOF watchdog armed (pipe stdin)");
     std::thread([shutdown_mgr] {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         char buf[64];
@@ -94,19 +137,123 @@ void disable_quick_edit() {
 }
 
 #ifdef _WIN32
+// 信号落盘证据：点 X 时控制台正在销毁，fprintf(stderr) 可能写不进（句柄
+// 关闭中），且用户看不到——写文件是唯一可靠证据。与 graceful_shutdown.cpp
+// 的 shutdown-trace.log 同一文件（追加，进程工作目录 = exe 目录）。
+// 带时间戳：区分"用户点 X 晚"vs"handler 之后处理慢"（曾误判为关机链卡）。
+// 实现用 Windows API 显式共享（同 trace_shutdown，见其注释：MSVC ofstream
+// 并发打开会阻塞——handler 线程卡住会拖死 shutdown_mgr 的 trace 写入）。
+void trace_signal(const char* msg) {
+    std::lock_guard<std::mutex> lock(caf_plugin_system::trace_file_mutex());
+#ifdef _WIN32
+    HANDLE h = CreateFileA("shutdown-trace.log", FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    char buf[32];
+    std::time_t t = std::time(nullptr);
+    std::strftime(buf, sizeof buf, "%H:%M:%S", std::localtime(&t));
+    std::string line = "[" + std::string(buf) + "] [signal] " + msg + "\r\n";
+    DWORD written = 0;
+    WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(h);
+#else
+    std::ofstream f("shutdown-trace.log", std::ios::app);
+    if (!f)
+        return;
+    char buf[32];
+    std::time_t t = std::time(nullptr);
+    std::strftime(buf, sizeof buf, "%H:%M:%S", std::localtime(&t));
+    f << "[" << buf << "] [signal] " << msg << std::endl;
+#endif
+}
+
 BOOL WINAPI console_handler(DWORD signal) {
-    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT
-        || signal == CTRL_CLOSE_EVENT) {
-        // 诊断日志（信号线程）：fprintf 单次调用原子，不会与主线程交错；
-        // 若按了 Ctrl+C 但窗口无此输出 = 被 QuickEdit 选中模式劫持。
-        fprintf(stderr, "[Signal] %s received, triggering graceful shutdown\n",
-                signal == CTRL_C_EVENT ? "Ctrl+C" : "Ctrl+Break/Close");
+    // 顺序铁律：先发 shutdown_atom 再打印——打印只是诊断（控制台销毁时
+    // 可能写不进/阻塞），绝不能让输出阻塞关机信号。
+    // 若按了 Ctrl+C 但窗口无此输出 = 被 QuickEdit 选中模式劫持。
+    // CTRL_CLOSE_EVENT：用户点窗口 X / 控制台关闭——默认行为是
+    // TerminateProcess（拉电闸），注册 handler 后系统给约 5 秒窗口期，
+    // 期间走完整优雅关机链（保存数据），超时才被系统兜底强杀。
+    // CTRL_LOGOFF/SHUTDOWN_EVENT：系统注销/关机，同样走优雅链。
+    switch (signal) {
+    case CTRL_C_EVENT:
+        if (shutdown_manager_ref())
+            caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+        fprintf(stderr, "[Signal] Ctrl+C received, triggering graceful shutdown\n");
+        return TRUE;
+    case CTRL_BREAK_EVENT:
+        if (shutdown_manager_ref())
+            caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+        fprintf(stderr, "[Signal] Ctrl+Break received, triggering graceful shutdown\n");
+        return TRUE;
+    case CTRL_CLOSE_EVENT:
+        // 控制台销毁中：先设标志（后续 std::cout 全跳过，防止写销毁中的
+        // 控制台句柄阻塞拖死关机链）+ 落盘 + 发信号，stderr 打印放最后。
+        g_console_closing = true;
+        // 终极兜底：fd 层面重定向 stdout/stderr → NUL。销毁中的控制台句柄
+        // 写入会永久阻塞——spdlog 的 stdout sink 持有构造时的 FILE*（freopen
+        // 改全局 stdout 对已捕获指针无效），但所有 FILE* 共享底层 fd：
+        // _dup2 换掉 fd 1/2 后任何写入（spdlog fwrite / cout / printf /
+        // fprintf）都落 NUL 立即返回，物理上杜绝阻塞。
+        // 注意：插件 DLL 无法感知 exe 的 g_console_closing（静态库复制），
+        // 只能靠这招全局兜底。
+        {
+            int nul = _open("NUL", _O_WRONLY);
+            if (nul >= 0) {
+                _dup2(nul, 1);
+                _dup2(nul, 2);
+                _close(nul);
+            }
+        }
+        trace_signal("CTRL_CLOSE_EVENT: close button (X) pressed");
         if (shutdown_manager_ref()) {
             caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+            trace_signal("shutdown_atom sent to shutdown_mgr");
+        } else {
+            trace_signal("shutdown_manager_ref() EMPTY - cannot send shutdown");
         }
-        return TRUE;
+        // 铁律（2026-08-23 实测）：CTRL_CLOSE 的 handler 绝不能立即返回！
+        // conhost 在 handler 返回后 ~0ms 就 TerminateProcess（0xC000013A），
+        // 异步关机链根本没时间跑——此前所有"点 X 拉闸"的根因。只有 handler
+        // 阻塞时 conhost 才给约 5 秒宽限（对照实验：阻塞 8s 存活 4.6s）。
+        // 因此：阻塞等关机链完成（graceful_shutdown 的 finish_shutdown 会
+        // notify），然后 ExitProcess(0) 主动退出——数据已保存，退出码干净。
+        // 超时（链异常卡住）也 ExitProcess 兜底，总比被 conhost 强杀体面。
+        if (wait_for_shutdown_complete(std::chrono::seconds(4))) {
+            trace_signal("shutdown chain completed; ExitProcess(0)");
+        } else {
+            trace_signal("shutdown chain TIMEOUT 4s; ExitProcess(0) fallback");
+        }
+        fprintf(stderr, "[Signal] Console close: graceful shutdown done\n");
+        ExitProcess(0);
+    case CTRL_LOGOFF_EVENT:
+        trace_signal("CTRL_LOGOFF_EVENT: user logoff");
+        if (shutdown_manager_ref())
+            caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+        // 同 CTRL_CLOSE：阻塞等链完成再退出（系统注销窗口期同样有限）。
+        if (wait_for_shutdown_complete(std::chrono::seconds(4))) {
+            trace_signal("logoff: chain completed; ExitProcess(0)");
+        } else {
+            trace_signal("logoff: chain TIMEOUT 4s; ExitProcess(0) fallback");
+        }
+        fprintf(stderr, "[Signal] User logoff, exiting\n");
+        ExitProcess(0);
+    case CTRL_SHUTDOWN_EVENT:
+        trace_signal("CTRL_SHUTDOWN_EVENT: system shutdown");
+        if (shutdown_manager_ref())
+            caf::anon_send(shutdown_manager_ref(), shutdown_atom{});
+        if (wait_for_shutdown_complete(std::chrono::seconds(4))) {
+            trace_signal("system shutdown: chain completed; ExitProcess(0)");
+        } else {
+            trace_signal("system shutdown: chain TIMEOUT 4s; ExitProcess(0) fallback");
+        }
+        fprintf(stderr, "[Signal] System shutdown, exiting\n");
+        ExitProcess(0);
+    default:
+        return FALSE;
     }
-    return FALSE;
 }
 #else
 void signal_handler(int) {
@@ -127,8 +274,10 @@ framework_config::framework_config() {
     // register_meta_objects()。注册了元对象的插件 DLL 自此常驻。
     preregister_plugin_meta(plugins_dir);
 
-    // CAF 1.1 框架日志配置：控制台 + 文件双输出
-    set("caf.logger.console.verbosity", "info");
+    // CAF 1.1 框架日志配置：console 关闭（单一写者原则——console 只允许
+    // logging_service 的 spdlog 写，否则与 CAF logger 双写者并发 → 乱序），
+    // 文件保留 debug 全量记录。
+    set("caf.logger.console.verbosity", "quiet");
     set("caf.logger.file.verbosity", "debug");
     set("caf.logger.file.path", "logs/caf-framework.log");
     set("caf.logger.console.colored", true);  // 带颜色的控制台输出

@@ -30,6 +30,8 @@
 
 #include <caf/actor_system_config.hpp>
 
+#include <chrono>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -101,5 +103,31 @@ void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw);
 /// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发；
 /// 只有"读过数据后 EOF"才触发（空管道不误报，后台启动不误关机）。
 void install_stdin_watchdog(caf::actor shutdown_mgr);
+
+/// 控制台是否正在销毁（用户点窗口 X 触发 CTRL_CLOSE_EVENT 后为 true）。
+/// 关机链的 stdout 输出必须检查此标志：写正在销毁的控制台句柄会阻塞，
+/// 拖死关机链直到 5 秒窗口耗尽被系统强杀——日志应优先落盘（shutdown-trace.log）。
+bool console_closing();
+
+/// shutdown-trace.log 的跨文件写入锁：graceful_shutdown.cpp 的 trace_shutdown
+/// 与 framework_bootstrap.cpp 的 trace_signal 并发写同一文件——MSVC ofstream
+/// 默认 FILE_SHARE_READ 共享模式，并发打开会失败/阻塞（曾导致关机链卡住、
+/// trace 缺行、5 秒窗口耗尽被强杀）。必须用同一把锁串行化。
+std::mutex& trace_file_mutex();
+
+/// 关机链完成信号（点窗口 X 场景专用）：GracefulShutdown::finish_shutdown
+/// 在链走完（STOPPED + 数据已落盘）后调用 notify_shutdown_complete()。
+///
+/// 为什么需要：实测（2026-08-23，控制台关闭按钮 X）CTRL_CLOSE_EVENT 的
+/// handler 若立即返回 TRUE，conhost 在 ~0ms 内 TerminateProcess 进程
+///（退出码 0xC000013A）——异步关机链根本没时间跑完；只有 handler 阻塞时
+/// conhost 才给约 5 秒宽限（对照实验：handler 阻塞 8s，进程存活 4.6s 才被杀）。
+/// 因此 CTRL_CLOSE/LOGOFF/SHUTDOWN 的 handler 必须阻塞等关机链完成，然后
+/// ExitProcess(0) 主动退出（此时 checkpoints 已落盘，不丢数据）。
+void notify_shutdown_complete();
+
+/// 阻塞等待关机链完成（点 X 的 handler 线程调用）；超时返回 false
+///（调用方应 ExitProcess 兜底——总比被 conhost 0xC000013A 强杀干净）。
+bool wait_for_shutdown_complete(std::chrono::milliseconds timeout);
 
 } // namespace caf_plugin_system

@@ -43,9 +43,10 @@ caf::actor spawn_ops_actor(caf::actor_system& sys, std::string node_name,
                            caf::actor shutdown_mgr,
                            std::string updates_dir = "./updates");
 
-/// 启动 stdin 控制台线程（所有节点）：读取命令行 → send console_cmd_atom。
+/// 启动 stdin 控制台线程：读取命令行 → anon_send console_cmd_atom。
 /// 管道 stdin（WSL interop / 重定向）自动跳过——install_stdin_watchdog
 /// 接管 EOF 检测，避免两线程抢读同一管道。
-void start_console_thread(caf::actor_system& sys, caf::actor ops);
+/// 注意：线程内不得使用 scoped_actor（getline 阻塞导致析构挂起）。
+void start_console_thread(caf::actor ops);
 
 }} // namespace caf_plugin_system::cluster

@@ -3,6 +3,7 @@
 #include "graceful_shutdown.hpp"
 #include "checkpoint_manager.hpp"
 #include "plugin/plugin_manager.hpp"
+#include "framework_bootstrap.hpp"
 #include "services/logging_service.hpp"
 #include <spdlog/spdlog.h>
 #include <spdlog/pattern_formatter.h>
@@ -45,6 +46,13 @@ public:
             caf::message_handler business{
                 [=](log_atom, const std::string& source,
                     const std::string& level, const std::string& msg) {
+
+                    // 控制台销毁中（用户点窗口 X）：spdlog 写销毁中的控制台
+                    // 句柄会永久阻塞——占住调度线程 → 拖死整个关机链（曾实测
+                    // shutdown_atom 延迟 36 秒才被处理、关机链卡死被强杀）。
+                    // 此时直接丢弃日志（关机链关键信息在 shutdown-trace.log）。
+                    if (caf_plugin_system::console_closing())
+                        return;
 
                     self->state()++;
 

@@ -1,5 +1,6 @@
 #include "master.hpp"
 #include "common/message_tags.hpp"
+#include "../framework_log.hpp"
 
 #include <caf/actor_from_state.hpp>
 #include <caf/logger.hpp>
@@ -34,9 +35,9 @@ caf::behavior ClusterMasterState::make_behavior() {
       auto kind = manifest.kind;
       auto parent = manifest.parent.empty() ? "<root>" : manifest.parent;
       upsert(std::move(manifest), std::move(registration.monitor_actor));
-      std::cout << "[ClusterMaster] " << (existed ? "updated" : "registered")
-                << " node '" << node_name << "' (" << to_string(kind)
-                << ") parent=" << parent << std::endl;
+      fw_log_info(std::string("[ClusterMaster] ") + (existed ? "updated" : "registered")
+                  + " node '" + node_name + "' (" + to_string(kind)
+                  + ") parent=" + parent);
       return register_reply{true, existed ? "node updated" : "node registered"};
     },
 
@@ -49,8 +50,7 @@ caf::behavior ClusterMasterState::make_behavior() {
 
     [this](node_unregister_atom, const std::string& node_name) {
       if (nodes.erase(node_name, true)) {
-        std::cout << "[ClusterMaster] unregistered node '" << node_name << "'"
-                  << std::endl;
+        fw_log_info(std::string("[ClusterMaster] unregistered node '") + node_name + "'");
         return register_reply{true, "node removed"};
       }
       return register_reply{false, "node not found"};
@@ -58,9 +58,9 @@ caf::behavior ClusterMasterState::make_behavior() {
 
     [this](const caf::down_msg& msg) {
       nodes.erase_by_monitor(msg.source, [this, msg](const node_manifest& manifest) {
-        std::cout << "[ClusterMaster] node '" << manifest.node_name
-                  << "' (" << to_string(manifest.kind) << ") went down: "
-                  << caf::to_string(msg.reason) << std::endl;
+        fw_log_info(std::string("[ClusterMaster] node '") + manifest.node_name
+                    + "' (" + to_string(manifest.kind) + ") went down: "
+                    + caf::to_string(msg.reason));
       });
     },
 
@@ -138,8 +138,8 @@ void ClusterMasterState::prune_expired() {
     steady_clock_type::now(),
     [](const node_manifest& m) { return m.kind == node_kind::master; },
     [this](const node_manifest& m) {
-      std::cout << "[ClusterMaster] expired node '" << m.node_name
-                << "' (" << to_string(m.kind) << ")" << std::endl;
+      fw_log_info(std::string("[ClusterMaster] expired node '") + m.node_name
+                  + "' (" + to_string(m.kind) + ")");
     });
 }
 

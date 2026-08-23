@@ -1,4 +1,5 @@
 #include "plugin_loader.hpp"
+#include "../framework_log.hpp"
 #include <caf/logger.hpp>
 #include <deque>
 #include <iostream>
@@ -35,9 +36,9 @@ void preregister_plugin_meta(const std::filesystem::path& root) {
             if (!reg) continue;      // 无该导出：插件没有私有消息类型，句柄随作用域释放
 
             reg();  // 插件自注册私有类型的元对象（此时任何 actor_system 都还不存在）
-            // 注意：此刻 CAF logger 尚未创建，CAF_LOG_* 会被丢弃，只能用 std::cout
-            std::cout << "[Loader] Plugin self-registered meta objects: "
-                      << file.path().string() << std::endl;
+            // 注意：此刻 CAF logger 尚未创建、fw_logger 未注入，fw_log 走 cout 兜底
+            caf_plugin_system::fw_log_info("[Loader] Plugin self-registered meta objects: "
+                                           + file.path().string());
             meta_lib_pool().push_back(std::move(*lib_opt));
         }
     }

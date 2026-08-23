@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "framework_bootstrap.hpp"
+#include "framework_log.hpp"
 #include "app_tests.hpp"
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
@@ -62,6 +63,12 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
     }
 
+    // ---- 统一日志注入 ----
+    // LoggerPlugin 已加载 → logging_service 在 CAF registry 中；fw_log 优先
+    // 走它（console 单一写者 → 全局有序），否则 CAF log / cout 兜底。
+    fw_set_logger(
+        caf::actor_cast<caf::actor>(sys.registry().get("logging_service")));
+
     // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
     // 单节点（纯插件）与集群节点（含插件）都经此路径，正交组合。
     cluster::BootstrapResult nb;
@@ -111,7 +118,7 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         //（进程不退出——quit 能退而 Ctrl+C 不能退的根因）。
         caf::scoped_actor self{sys};
         self->send(fw.shutdown_mgr, register_cluster_atom_v, ops);
-        cluster::start_console_thread(sys, ops);
+        cluster::start_console_thread(ops);
     }
 
     // ---- 集群验证后门：跨节点调用（resolve → connect → lookup → call）----

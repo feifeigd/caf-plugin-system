@@ -10,6 +10,7 @@ add_library(caf_plugin_core STATIC
     checkpoint_manager.cpp
     graceful_shutdown.cpp
     framework_bootstrap.cpp
+    framework_log.cpp
     # ---- 插件子系统 ----
     plugin/plugin_manager.cpp
     plugin/plugin_loader.cpp
