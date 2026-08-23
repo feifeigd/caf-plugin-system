@@ -49,7 +49,7 @@ struct app_config : framework_config {
 // 两个模块正交：node-kind 决定集群角色，entry-plugins 决定插件加载。
 // ------------------------------------------------------------------
 
-void caf_main(caf::actor_system& sys, const app_config& cfg) {
+int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // 构建标识：双击测试时一眼确认 exe 新旧（旧实例窗口不会随代码更新）
     std::cout << "[App] caf_plugin_app build " << __DATE__ << " " << __TIME__
               << std::endl;
@@ -62,6 +62,7 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     // 优雅路径（Ctrl+C / --test-ctrl-c）才是泄露检测的有效样本。
     // 判读：泄露字节数与活动量无关（冒烟测试版与普通版同为 206 块/19857B）
     // = 进程生命周期静态分配（CAF meta 注册表/插件 meta/spdlog），非真泄露。
+    // 初始化放 try 外：主体异常时 dump 也必须触发（见下方 try 说明）。
     if (cfg.test_ctrl_c) {
         _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
         _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -69,17 +70,25 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     }
 #endif
 
+    // ---- 主体包 try：任何未捕获异常 → FATAL → return 1 ----
+    // 意图：异常绝不能绕过析构链/泄露检测。actor_system 是 exec_main 的栈
+    // 对象——只要 caf_main 正常返回（含 catch 后返回），exec_main 就正常
+    // 收尾：actor_system 析构 join 全部存活 actor（有残留则挂死=泄露信号），
+    // main 正常返回后 CRT dump 触发（_CRTDBG_LEAK_CHECK_DF）。未捕获异常
+    // 会冒泡到 main → terminate/abort，析构与 dump 全部跳过（检测失效）。
+    // 退出码语义：正常 0；异常 1（exec_main 支持 int 返回值传播）。
+    try {
     // ---- 系统级组件引导（任何进程都执行）----
     // registry/checkpoint_mgr/plugin_mgr/shutdown_mgr 是系统组件，必然存在；
     // 节点模式同样依赖它们（exported_actors 收集、shutdown_mgr 作 monitor）。
     BootstrapResult fw;
-    if (!bootstrap_system_components(sys, cfg, fw)) return;
+    if (!bootstrap_system_components(sys, cfg, fw)) return 0;
 
     // ---- 插件加载（可选；entry-plugins 非空时）----
     // 先于节点引导：混合模式下 shutdown_mgr 作为节点 monitor 上报给 master
     // （优雅关机/进程退出时 master 立即感知，无需等 lease 过期）。
     if (!cfg.entry_plugins.empty()) {
-        if (!bootstrap_plugins(sys, cfg, fw)) return;
+        if (!bootstrap_plugins(sys, cfg, fw)) return 0;
         if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
     }
 
@@ -110,7 +119,7 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
                           << caf::to_string(err) << std::endl;
             });
         if (!cluster::bootstrap_node(sys, node_cfg, monitor, nb))
-            return;
+            return 0;
         // 集群节点 actor 注册给 shutdown_mgr：关机统一终止
         //（插件保存后 → 集群 → 组件，main 不再手动 send_exit）
         if (nb.master)
@@ -225,6 +234,16 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
         std::cout << "[LeakCheck] actors remaining after shutdown: " << remaining
                   << std::endl;
     }
+    return 0;
+    } catch (const std::exception& e) {
+        // FATAL 走 stderr：与 CRT dump 同流，异常路径下泄露报告紧随其后
+        std::cerr << "[FATAL] unhandled exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[FATAL] unknown exception" << std::endl;
+    }
+    // 异常路径：非 0 退出码 + 正常 return → actor_system 析构 join 全部
+    // actor + CRT dump 照常触发（未捕获异常会 terminate 跳过这一切）。
+    return 1;
 }
 
 CAF_MAIN()
