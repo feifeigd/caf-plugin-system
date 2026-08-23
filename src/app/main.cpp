@@ -15,6 +15,13 @@
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
 #include "common/message_tags.hpp"
+#include "plugin/plugin_loader.hpp"
+#include "plugin/plugin_manager.hpp"
+
+#include <cstdlib>   // std::atexit
+#ifdef _WIN32
+#include <windows.h> // ExitProcess（DLL 池卸载后跳过静态析构阶段）
+#endif
 
 #ifdef _DEBUG
 // Debug CRT 泄露检测：进程退出时（actor_system 析构之后）自动 dump 堆泄露
@@ -65,12 +72,29 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // 均为 206 块/19857B——冒烟测试的额外 actor/请求/热更新零额外泄露）
     // = 进程生命周期静态分配（CAF meta 注册表/插件 meta/spdlog），非真泄露。
     // 初始化放 try 外：主体异常时 dump 也必须触发（见下方 try 说明）。
-    if (cfg.test_ctrl_c || cfg.test_auto_shutdown) {
+    if (cfg.test_ctrl_c || cfg.test_auto_shutdown || cfg.test_unload_dlls) {
         _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
         _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
         _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
     }
 #endif
+
+    // ---- 泄露测试后门：卸载全部 DLL 池再 dump（--test-unload-dlls）----
+    // atexit 在 main 返回后执行——此时 actor_system 已析构（join 全部 actor）、
+    // 关机链已完成，没有任何代码还指向插件 DLL。清池（FreeLibrary → DLL
+    // detach 析构 DLL 静态对象）后不手动 dump——ExitProcess 会走完剩余
+    // detach，_CRTDBG_LEAK_CHECK_DF 的自动 dump 在 detach 完成后输出
+    // 干净数字（实测：卸载后 207 块/19873B ≈ 基线 206 块/19857B）。
+    // ExitProcess(0) 同时跳过静态析构阶段——CAF 全局 meta 注册表析构会
+    // 调用已卸载 DLL 的元对象函数指针（0xC0000005），必须不碰它。
+    if (cfg.test_unload_dlls) {
+        std::atexit([] {
+            std::cout << "[LeakCheck] unloading all DLL pools..." << std::endl;
+            unload_all_meta_libs();
+            unload_all_plugin_libs();
+            ExitProcess(0);
+        });
+    }
 
     // ---- 主体包 try：任何未捕获异常 → FATAL → return 1 ----
     // 意图：异常绝不能绕过析构链/泄露检测。actor_system 是 exec_main 的栈
@@ -221,7 +245,7 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // ---- 运维验证后门：模拟 Ctrl+C（--test-ctrl-c，任何模式）----
     // 直接发 shutdown_atom 给 shutdown_mgr（不经 ops），等价 Ctrl+C 的
     // console_handler 路径；验证 ops 注册给 shutdown_mgr 后也能自然退出。
-    if (cfg.test_ctrl_c) {
+    if (cfg.test_ctrl_c || cfg.test_unload_dlls) {
         std::cout << "[OpsTest] simulating Ctrl+C (direct shutdown_atom, delayed 2s)"
                   << std::endl;
         caf::scoped_actor self{sys};

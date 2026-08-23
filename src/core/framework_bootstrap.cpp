@@ -300,7 +300,9 @@ framework_config::framework_config() {
         .add(test_quit, "test-quit",
              "trigger ops quit after startup (verify graceful shutdown, process must exit 0)")
         .add(test_ctrl_c, "test-ctrl-c",
-             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)");
+             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)")
+        .add(test_unload_dlls, "test-unload-dlls",
+             "unload all plugin/meta DLL pools before CRT leak dump (leak test)");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,

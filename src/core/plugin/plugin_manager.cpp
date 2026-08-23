@@ -18,6 +18,12 @@ std::deque<DynamicLibrary>& plugin_lib_pool() {
 }
 } // namespace
 
+// 泄露测试专用：卸载全部插件库（见头文件注释）。调用时机同样必须晚于
+// 所有插件 actor 消亡，否则 vtable/函数指针指向已卸载代码段。
+void unload_all_plugin_libs() {
+    plugin_lib_pool().clear();
+}
+
 PluginManager::PluginManager(caf::actor_config& cfg, caf::actor registry, caf::actor checkpoint_mgr)
     : caf::event_based_actor(cfg), registry_(registry), checkpoint_mgr_(checkpoint_mgr) {}
 
