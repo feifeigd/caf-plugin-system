@@ -276,9 +276,10 @@ framework_config::framework_config() {
 
     // CAF 1.1 框架日志配置：console 关闭（单一写者原则——console 只允许
     // logging_service 的 spdlog 写，否则与 CAF logger 双写者并发 → 乱序），
-    // 文件保留 debug 全量记录。
+    // 文件 info 级（debug 全是 caf.core 调度噪音，曾实测 1.2MB 里 99%
+    // 无用；info 保留启动/加载/关机诊断 + 错误）。
     set("caf.logger.console.verbosity", "quiet");
-    set("caf.logger.file.verbosity", "debug");
+    set("caf.logger.file.verbosity", "info");
     set("caf.logger.file.path", "logs/caf-framework.log");
     set("caf.logger.console.colored", true);  // 带颜色的控制台输出
 
@@ -305,7 +306,7 @@ framework_config::framework_config() {
 bool bootstrap_system_components(caf::actor_system& sys,
                                  const framework_config& cfg,
                                  BootstrapResult& out) {
-    CAF_LOG_INFO("system components startup");
+    fw_log_info("[Bootstrap] system components startup");
 
     out.registry = sys.spawn<ServiceRegistry>(cfg.allow_cross_node);
     out.checkpoint_mgr
@@ -344,7 +345,7 @@ bool bootstrap_system_components(caf::actor_system& sys,
     // 否则 quit 时 GracefulShutdown 走 "Not ready, forcing exit" 强杀路径）
     self->send(out.shutdown_mgr, ready_atom{});
 
-    CAF_LOG_INFO("system components ready");
+    fw_log_info("[Bootstrap] system components ready");
     return true;
 }
 
@@ -357,7 +358,7 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
         return true;  // 无插件：合法（纯节点/纯组件进程）
     }
 
-    CAF_LOG_INFO("Entry plugins:" << [&]() {
+    fw_log_info("Entry plugins:" + [&]() {
         std::string s;
         for (const auto& name : cfg.entry_plugins) s += " " + name;
         return s;
@@ -366,22 +367,24 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     // ---- 第 2 步：扫描 ----
     auto all_plugins = scan_all_plugins(cfg.plugins_dir);
     if (all_plugins.empty()) {
-        CAF_LOG_ERROR("No plugins found in " << cfg.plugins_dir);
+        fw_log_error("No plugins found in " + cfg.plugins_dir);
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    CAF_LOG_INFO("Scanned " << all_plugins.size() << " plugin(s) in " << cfg.plugins_dir);
+    fw_log_info("Scanned " + std::to_string(all_plugins.size())
+                + " plugin(s) in " + cfg.plugins_dir);
 
     // ---- 第 3 步：依赖解析 ----
     auto required = resolve_dependencies(cfg.entry_plugins, all_plugins);
     if (required.empty()) {
-        CAF_LOG_ERROR("Failed to resolve dependencies");
+        fw_log_error("Failed to resolve dependencies");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    CAF_LOG_INFO("Resolved " << required.size() << " plugin(s) to load:" << [&]() {
+    fw_log_info("Resolved " + std::to_string(required.size())
+                + " plugin(s) to load:" + [&]() {
         std::string s;
         for (const auto& p : required) s += " " + p.name;
         return s;
@@ -390,12 +393,12 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     // ---- 第 4 步：拓扑排序 ----
     auto load_order = compute_load_order(required);
     if (load_order.empty()) {
-        CAF_LOG_ERROR("Circular dependency detected");
+        fw_log_error("Circular dependency detected");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    CAF_LOG_INFO("Load order:" << [&]() {
+    fw_log_info("Load order:" + [&]() {
         std::string s;
         for (const auto& name : load_order) s += " " + name;
         return s;
@@ -410,8 +413,8 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
         auto it = info_map.find(name);
         if (it == info_map.end()) continue;
         self->request(out.plugin_mgr, caf::infinite, load_atom{}, name, it->second.path.string())
-            .receive([](bool ok) { CAF_LOG_INFO("Load result: " << ok); },
-                     [](const caf::error& e) { CAF_LOG_ERROR("Load err: " << to_string(e)); });
+            .receive([](bool ok) { fw_log_info("Load result: " + std::string(ok ? "OK" : "FAILED")); },
+                     [](const caf::error& e) { fw_log_error("Load err: " + caf::to_string(e)); });
     }
 
     // ---- 健康检查：所有目标插件必须可 resolve ----
@@ -425,13 +428,13 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     }
 
     if (!healthy) {
-        CAF_LOG_ERROR("One or more plugins failed to resolve");
+        fw_log_error("One or more plugins failed to resolve");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
     self->send(out.shutdown_mgr, ready_atom{});
-    CAF_LOG_INFO("Startup complete. Press Ctrl+C to shutdown.");
+    fw_log_info("Startup complete. Press Ctrl+C to shutdown.");
     return true;
 }
 
@@ -442,7 +445,7 @@ void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     install_stdin_watchdog(fw.shutdown_mgr);
     caf::scoped_actor self{sys};
     self->wait_for(fw.shutdown_mgr);
-    CAF_LOG_INFO("framework shutdown complete");
+    fw_log_info("framework shutdown complete");
 }
 
 } // namespace caf_plugin_system
