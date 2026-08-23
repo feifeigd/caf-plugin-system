@@ -16,6 +16,11 @@
 #include "cluster/ops_actor.hpp"
 #include "common/message_tags.hpp"
 
+#ifdef _DEBUG
+// Debug CRT 泄露检测：进程退出时（actor_system 析构之后）自动 dump 堆泄露
+#include <crtdbg.h>
+#endif
+
 using namespace caf_plugin_system;
 
 // ------------------------------------------------------------------
@@ -48,6 +53,21 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     // 构建标识：双击测试时一眼确认 exe 新旧（旧实例窗口不会随代码更新）
     std::cout << "[App] caf_plugin_app build " << __DATE__ << " " << __TIME__
               << std::endl;
+
+#ifdef _DEBUG
+    // 泄露检测（Debug 专用，随 --test-ctrl-c 后门启用，日常运行不打扰）：
+    // _CRTDBG_LEAK_CHECK_DF 让 CRT 在进程退出（正常 return 路径，
+    // actor_system 析构之后）自动输出泄露报告；报告路由到 stderr 便于捕获。
+    // 注意：点 X 路径走 ExitProcess(0) 不经 CRT 终止流程，dump 不触发——\
+    // 优雅路径（Ctrl+C / --test-ctrl-c）才是泄露检测的有效样本。
+    // 判读：泄露字节数与活动量无关（冒烟测试版与普通版同为 206 块/19857B）
+    // = 进程生命周期静态分配（CAF meta 注册表/插件 meta/spdlog），非真泄露。
+    if (cfg.test_ctrl_c) {
+        _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+        _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+    }
+#endif
 
     // ---- 系统级组件引导（任何进程都执行）----
     // registry/checkpoint_mgr/plugin_mgr/shutdown_mgr 是系统组件，必然存在；
@@ -194,6 +214,17 @@ void caf_main(caf::actor_system& sys, const app_config& cfg) {
     // ops quit / 插件请求 / --test-quit）都发 shutdown_atom 给它，
     // main 只等它退出——进程必须自己自然退出，不许外部强杀。
     wait_for_shutdown(sys, fw);
+
+    // ---- 关机泄露诊断（随 --test-ctrl-c 启用）----
+    // actor_system 析构会 join 所有存活 actor——若有 actor 不退出，进程会
+    // 挂死在析构（EXIT 非 0 或超时）。running() 是关机链走完后仍存活的
+    // actor 数：跨多次关机必须恒定（实测 7↔8，是 send_exit 异步排空的
+    // 时序抖动而非累积；不增长 = 无 actor 泄露）。
+    if (cfg.test_ctrl_c) {
+        auto remaining = sys.registry().running();
+        std::cout << "[LeakCheck] actors remaining after shutdown: " << remaining
+                  << std::endl;
+    }
 }
 
 CAF_MAIN()

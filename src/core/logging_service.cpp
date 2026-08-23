@@ -25,7 +25,7 @@ caf::actor spawn_logging_service(caf::actor_system& sys) {
         "logs/app.log", true);
 
     auto formatter = std::make_unique<spdlog::pattern_formatter>(
-        std::string("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v"));
+        std::string("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v"));
     console_sink->set_formatter(formatter->clone());
     file_sink->set_formatter(std::move(formatter));
 
@@ -75,10 +75,20 @@ caf::actor spawn_logging_service(caf::actor_system& sys) {
                 auto who = self->current_sender();
                 if (who) {
                     auto actor_id = who->id();
+                    // 跨节点识别：actor_addr::node() 给出 actor 来源节点。
+                    // 仅当来源节点非本节点时才显示 @node（本地日志保持干净）。
+                    // 已知限制（CAF 1.1 实测）：同机多进程 node_id 相同
+                    // （host_id 基于 IP），同机部署区分不了外部进程；跨进程
+                    // sender 还可能解析失败 → current_sender() 为空 → 走
+                    // else 退化分支（仅 source，无追踪）。
+                    std::string origin;
+                    if (who->node() != self->system().node())
+                        origin = "@" + caf::to_string(who->node());
                     auto addr = caf::to_string(who);
                     if (addr_names->find(addr) == addr_names->end())
                         (*addr_names)[addr] = source;
-                    do_log(source + "#" + std::to_string(actor_id), level, msg);
+                    do_log(source + "#" + std::to_string(actor_id) + origin,
+                           level, msg);
                 } else {
                     do_log(source, level, msg);
                 }
