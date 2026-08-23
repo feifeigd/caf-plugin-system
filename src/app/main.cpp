@@ -55,15 +55,17 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
               << std::endl;
 
 #ifdef _DEBUG
-    // 泄露检测（Debug 专用，随 --test-ctrl-c 后门启用，日常运行不打扰）：
+    // 泄露检测（Debug 专用，随 --test-ctrl-c / --test-auto-shutdown 后门启用，
+    // 日常运行不打扰）：
     // _CRTDBG_LEAK_CHECK_DF 让 CRT 在进程退出（正常 return 路径，
     // actor_system 析构之后）自动输出泄露报告；报告路由到 stderr 便于捕获。
     // 注意：点 X 路径走 ExitProcess(0) 不经 CRT 终止流程，dump 不触发——\
     // 优雅路径（Ctrl+C / --test-ctrl-c）才是泄露检测的有效样本。
-    // 判读：泄露字节数与活动量无关（冒烟测试版与普通版同为 206 块/19857B）
+    // 判读：泄露字节数与活动量无关（有效对照实测：普通版与冒烟全量版
+    // 均为 206 块/19857B——冒烟测试的额外 actor/请求/热更新零额外泄露）
     // = 进程生命周期静态分配（CAF meta 注册表/插件 meta/spdlog），非真泄露。
     // 初始化放 try 外：主体异常时 dump 也必须触发（见下方 try 说明）。
-    if (cfg.test_ctrl_c) {
+    if (cfg.test_ctrl_c || cfg.test_auto_shutdown) {
         _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
         _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
         _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
@@ -89,7 +91,18 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // （优雅关机/进程退出时 master 立即感知，无需等 lease 过期）。
     if (!cfg.entry_plugins.empty()) {
         if (!bootstrap_plugins(sys, cfg, fw)) return 0;
-        if (cfg.test_auto_shutdown) run_smoke_tests(sys, fw);
+        if (cfg.test_auto_shutdown) {
+            run_smoke_tests(sys, fw);
+            // 冒烟测试跑完自动关机（选项名即语义）：走 shutdown_mgr 统一
+            // 关机链（插件保存 → 集群 → 组件 → logging_service 最后退出）。
+            // 注意：重构把关机统一到 shutdown_mgr 后，此触发必须显式发
+            // shutdown_atom——曾漏接导致冒烟测试跑完进程挂死在等输入。
+            std::cout << "[OpsTest] auto shutdown after smoke tests (delayed 2s)"
+                      << std::endl;
+            caf::scoped_actor self{sys};
+            self->delayed_send(fw.shutdown_mgr, std::chrono::seconds(2),
+                               shutdown_atom{});
+        }
     }
 
     // 注：日志无注入环节——logging_service 是系统组件，bootstrap_system_components
@@ -224,12 +237,12 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // main 只等它退出——进程必须自己自然退出，不许外部强杀。
     wait_for_shutdown(sys, fw);
 
-    // ---- 关机泄露诊断（随 --test-ctrl-c 启用）----
+    // ---- 关机泄露诊断（随 --test-ctrl-c / --test-auto-shutdown 启用）----
     // actor_system 析构会 join 所有存活 actor——若有 actor 不退出，进程会
     // 挂死在析构（EXIT 非 0 或超时）。running() 是关机链走完后仍存活的
     // actor 数：跨多次关机必须恒定（实测 7↔8，是 send_exit 异步排空的
     // 时序抖动而非累积；不增长 = 无 actor 泄露）。
-    if (cfg.test_ctrl_c) {
+    if (cfg.test_ctrl_c || cfg.test_auto_shutdown) {
         auto remaining = sys.registry().running();
         std::cout << "[LeakCheck] actors remaining after shutdown: " << remaining
                   << std::endl;
