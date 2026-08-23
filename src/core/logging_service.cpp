@@ -67,20 +67,18 @@ caf::actor spawn_logging_service(caf::actor_system& sys) {
                 if (console_closing())
                     return;
 
-                // actor 级追踪：非匿名发送方 → 名字带 actor 短 ID
-                //（如 shutdown_mgr#12345）。anon_send 匿名发送则仅用 source。
+                // actor 级追踪：非匿名发送方 → 名字带 actor 唯一 ID
+                //（如 shutdown_mgr#4、business#6——进程内自增，每个 actor 不同）。
+                // 坑：caf::to_string(actor_addr) 渲染的是 node 级标识，同进程
+                // 所有 actor 相同（实测恒等于进程 PID 段，如 #15316），不是
+                // actor id！必须用 actor_addr::id()（actor_control_block 的 id）。
                 auto who = self->current_sender();
                 if (who) {
-                    auto id = caf::to_string(who);
-                    auto pos = id.rfind('#');
-                    if (pos != std::string::npos)
-                        id = id.substr(pos + 1);
-                    if (id.empty())
-                        id = caf::to_string(who);
+                    auto actor_id = who->id();
                     auto addr = caf::to_string(who);
                     if (addr_names->find(addr) == addr_names->end())
                         (*addr_names)[addr] = source;
-                    do_log(source + "#" + id, level, msg);
+                    do_log(source + "#" + std::to_string(actor_id), level, msg);
                 } else {
                     do_log(source, level, msg);
                 }
