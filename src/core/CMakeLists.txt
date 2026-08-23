@@ -6,11 +6,11 @@
 
 add_library(caf_plugin_core STATIC
     # ---- 内核服务 ----
+    logging_service.cpp
     service_registry.cpp
     checkpoint_manager.cpp
     graceful_shutdown.cpp
     framework_bootstrap.cpp
-    framework_log.cpp
     # ---- 插件子系统 ----
     plugin/plugin_manager.cpp
     plugin/plugin_loader.cpp
@@ -29,8 +29,8 @@ target_include_directories(caf_plugin_core PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# cluster 需要 CAF::io（middleman）
-target_link_libraries(caf_plugin_core PUBLIC CAF::core CAF::io fmt::fmt)
+# cluster 需要 CAF::io（middleman）；日志服务需要 spdlog（sinks 归 logging_service）
+target_link_libraries(caf_plugin_core PUBLIC CAF::core CAF::io fmt::fmt spdlog::spdlog)
 
 if(WIN32)
     target_compile_options(caf_plugin_core PRIVATE /FS)

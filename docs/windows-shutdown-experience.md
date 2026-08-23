@@ -83,35 +83,74 @@ printf 全中招），必须逐层防御：
 
 ---
 
-## 3. 日志体系（fw_log 优先级 + 文件收敛）
+## 3. 日志体系（2026-08-23 重构：logging_service 系统组件 + 唯一头文件）
 
-### 3.1 日志优先级（用户拍板）
+### 3.0 架构演进（LoggerPlugin → 核心组件）
 
-**logger（logging_service 插件，spdlog）> CAF log > cout**
+**LoggerPlugin 已删除。** 日志服务是 `bootstrap_system_components` **最先 spawn** 的系统组件
+（进程第一个 actor），`finish_shutdown` **最后 send_exit**（exit_msg 里 flush 再 quit），
+spdlog console + `logs/app.log` 归它独占。插件 manifest 的 `logging_service` 依赖由
+**核心内置服务**满足（`resolve_dependencies` 对 `{"logging_service", "@core"}` 跳过插件
+加载；`plugin_manager` 从 ServiceRegistry 解析到核心 actor）。
 
-- `fw_log(level, msg)` 统一入口：logging_service 可用 → `anon_send(log_atom)`（console
-  单一写者 → 全局有序）；否则 CAF_LOG（文件）；再否则 cout/cerr（保可见）。
-- `console_closing()==true` 直接跳过（点 X 防卡）。
-- CAF logger `console.verbosity=quiet`：console 只允许 spdlog 写，避免双写者乱序。
-- **命名空间坑**：不在 `caf_plugin_system` 命名空间内的文件（service_registry.cpp /
-  graceful_shutdown.cpp / plugin_loader.cpp）调 fw_log 必须全限定
-  `caf_plugin_system::fw_log_info`。
+### 3.1 唯一日志头：`include/services/logging_service.hpp`
 
-### 3.2 CAF_LOG_* 死代码发现（2026-08-23）
+**两个 `logging_service.hpp` 已合并为一个**（曾因 DLL 隔离存在两个：核心单例在静态库
+`caf_plugin_core` 里，被 exe 和每个插件 DLL 各链一份 → 插件够不到 exe 的单例，只能靠
+依赖注入）。合并方案是**每模块单例**（inline 函数 static 局部变量按模块实例化，spdlog
+注册表同款机制）：
 
-**应用侧 52 处 `CAF_LOG_*` 全是死代码**——编译时未定义 `CAF_LOG_LEVEL`，宏被编掉
-（`strings -a exe` 验证字符串不在二进制里）。启动诊断从未落过任何日志。
+```cpp
+inline caf::actor& current_logger() { static caf::actor l; return l; }  // exe/各DLL 各一份
+inline void set_logger(const caf::actor& a) { current_logger() = a; }
+```
 
-已转换 27 处到 fw_log（framework_bootstrap 14 / plugin_loader 9 / cluster/bootstrap 4）：
-启动期走 cout 控制台可见，logger 注入后进 app.log。
+- exe 侧：`spawn_logging_service` 内部自动 `set_logger()`；插件侧：spawn 时
+  `set_logger(deps[0])` + `set_log_source(PLUGIN_NAME)`（business/platform 已内置）。
+- 宏：`LOG_INFO/LOG_WARN/LOG_ERROR(msg或fmt串, args...)` + `LOG_*_SELF(self, ...)`
+  （self->send，日志服务记录发送方 actor）+ `LOG_FROM(self, level, msg)`（关机链用，
+  同 sender FIFO 保证 STOPPED 日志先落再 exit）。
+- **行号自动嵌入**：`[文件名:行号]` 前缀（`log_loc(__FILE__, __LINE__)`）。
+- **变参拆分**：`__VA_ARGS__` 无法在预处理器拆分 → 模板 helper `log_fmt(first, args...)`：
+  0 参原样返回（运行时拼接串），1+ 参 = 首参格式串 + 其余参数。`fmt::runtime` 绕过
+  fmt v12 的 consteval 要求（C7595：format string 必须是编译期常量），类型不匹配在
+  运行时抛异常 → try/catch 兜底为 `<log format error>`。
+- **格式串坑（C7595）**：`fmt::format("x " + var)` 编译不过（fmt v12 consteval）；
+  必须走 `log_fmt` 或 `fmt::format(fmt::runtime(...))`。
+- 日志服务 actor 按 source 建 per-source spdlog logger 缓存（sink 共享）；
+  `current_sender()` 非空时显示 `source#<actor_id>`（actor 级追踪）。
 
-### 3.3 日志文件收敛（43 → 2）
+### 3.2 核心内置服务（非插件提供的服务依赖）
+
+`plugin_loader::resolve_dependencies` 预置 `{"logging_service", "@core"}`：
+插件依赖声明 `"logging_service"` 不要求插件提供者；加载时 `plugin_manager` 从
+ServiceRegistry resolve 到核心 actor（bootstrap 里 `register_atom{}` 注册，注册后
+ServiceRegistry 建 proxy 并镜像到 CAF `sys.registry()`）。ACL 的 `acl_allow` 也可引用
+核心服务名（plugin_manager 查 plugins_ 未命中时回退到 ServiceRegistry resolve）。
+
+### 3.3 CAF_LOG_* 死代码（已清零）
+
+应用侧 52 处 `CAF_LOG_*` 全是死代码（编译时未定义 `CAF_LOG_LEVEL`，宏被编掉，
+`strings -a exe` 验证）。2026-08-23 全部转换：27 处→fw_log（旧），plugin_manager 22 处
+→LOG_*（重构时），fw_log 本体删除后核心/插件一律 LOG_*。
+
+### 3.4 日志文件收敛（43 → 2）
 
 | 文件 | 来源 | 状态 |
 |---|---|---|
-| `logs/app.log` | spdlog（basic_file_sink，**truncate=true 每次启动重写**） | **主日志**（业务 + core 运行时） |
+| `logs/app.log` | logging_service 的 spdlog（basic_file_sink，**truncate=true 每次启动重写**） | **主日志**（业务 + core 运行时 + 关机链，带行号与 actor 追踪） |
 | `shutdown-trace.log` | Windows API 追加写 | **关机证据**（控制台销毁时唯一可靠，必须独立） |
 | `logs/caf-framework.log` | CAF file logger | **已消失**：verbosity debug→info 后无内容可写（原 1.2MB 99% 是 caf.core 调度 DEBUG 噪音） |
+
+### 3.5 VS Code F12 跳转（IntelliSense）
+
+VS 生成器（vcxproj）不支持 `CMAKE_EXPORT_COMPILE_COMMANDS` → 需要独立的 Ninja
+配置目录专供 IntelliSense：
+
+- `setup_intellisense.bat`（仓库根）：vcvars64 + Ninja + `cmake -B out/intellisense -G Ninja
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`，生成 `out/intellisense/compile_commands.json`。
+- `.vscode/c_cpp_properties.json`：`compileCommands` 指向该文件，`intelliSenseMode:
+  windows-msvc-x64`。改 CMakeLists 后重跑 bat + `C/C++: Reset IntelliSense Database`。
 
 ---
 

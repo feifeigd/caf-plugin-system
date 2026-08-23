@@ -3,7 +3,7 @@
 #include "service_registry.hpp"
 #include "checkpoint_manager.hpp"
 #include "graceful_shutdown.hpp"
-#include "framework_log.hpp"
+#include "services/logging_service.hpp"
 #include "plugin/plugin_loader.hpp"
 #include "common/message_meta.hpp"
 #include "common/message_tags.hpp"
@@ -102,7 +102,7 @@ void install_stdin_watchdog(caf::actor shutdown_mgr) {
         return;
 #endif
     // 哨兵状态走统一日志（logging_service > CAF log > cout）。
-    fw_log_info("[Watchdog] stdin EOF watchdog armed (pipe stdin)");
+    LOG_INFO("[Watchdog] stdin EOF watchdog armed (pipe stdin)");
     std::thread([shutdown_mgr] {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         char buf[64];
@@ -306,7 +306,13 @@ framework_config::framework_config() {
 bool bootstrap_system_components(caf::actor_system& sys,
                                  const framework_config& cfg,
                                  BootstrapResult& out) {
-    fw_log_info("[Bootstrap] system components startup");
+    // ---- 日志服务最先 spawn（进程第一个 actor）----
+    // 系统组件（registry/shutdown_mgr 等）从创建起就要打日志；插件也依赖
+    // "logging_service" 核心内置服务。spdlog 在此创建 sinks 并常驻到关机链
+    // 最后（finish_shutdown 最后 send_exit 它，exit_msg 里 flush 再 quit）。
+    out.logging_service = spawn_logging_service(sys);
+    // 日志单例已在 spawn 内注册（logging_service() 访问器），启动期诊断全进 app.log
+    LOG_INFO("[Bootstrap] logging service up");
 
     out.registry = sys.spawn<ServiceRegistry>(cfg.allow_cross_node);
     out.checkpoint_mgr
@@ -324,7 +330,7 @@ bool bootstrap_system_components(caf::actor_system& sys,
 
     out.shutdown_mgr = sys.spawn<GracefulShutdown>(
         ShutdownConfig{}, out.plugin_mgr, out.registry, out.checkpoint_mgr,
-        get_stop_order);
+        out.logging_service, get_stop_order);
     shutdown_manager_ref() = out.shutdown_mgr;
 
     // 保证 Ctrl+C 语义 = 中断信号（QuickEdit 会劫持成复制）
@@ -341,11 +347,17 @@ bool bootstrap_system_components(caf::actor_system& sys,
     // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
     self->send(out.plugin_mgr, shutdown_atom{}, out.shutdown_mgr);
 
+    // 核心内置服务注册：插件 manifest 依赖可直接引用 logging_service。
+    // ServiceRegistry 会为它建 proxy + 镜像到 CAF sys.registry()，
+    // 插件 deps[0]（proxy）与核心 current_logger()（原始 actor）殊途同归。
+    self->send(out.registry, register_atom{}, "logging_service",
+               out.logging_service, "@core");
+
     // 组件就绪（任何进程都 ready：纯节点无 bootstrap_plugins 不会发 ready，
     // 否则 quit 时 GracefulShutdown 走 "Not ready, forcing exit" 强杀路径）
     self->send(out.shutdown_mgr, ready_atom{});
 
-    fw_log_info("[Bootstrap] system components ready");
+    LOG_INFO("[Bootstrap] system components ready");
     return true;
 }
 
@@ -358,7 +370,7 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
         return true;  // 无插件：合法（纯节点/纯组件进程）
     }
 
-    fw_log_info("Entry plugins:" + [&]() {
+    LOG_INFO("Entry plugins:" + [&]() {
         std::string s;
         for (const auto& name : cfg.entry_plugins) s += " " + name;
         return s;
@@ -367,23 +379,23 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     // ---- 第 2 步：扫描 ----
     auto all_plugins = scan_all_plugins(cfg.plugins_dir);
     if (all_plugins.empty()) {
-        fw_log_error("No plugins found in " + cfg.plugins_dir);
+        LOG_ERROR("No plugins found in " + cfg.plugins_dir);
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    fw_log_info("Scanned " + std::to_string(all_plugins.size())
+    LOG_INFO("Scanned " + std::to_string(all_plugins.size())
                 + " plugin(s) in " + cfg.plugins_dir);
 
     // ---- 第 3 步：依赖解析 ----
     auto required = resolve_dependencies(cfg.entry_plugins, all_plugins);
     if (required.empty()) {
-        fw_log_error("Failed to resolve dependencies");
+        LOG_ERROR("Failed to resolve dependencies");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    fw_log_info("Resolved " + std::to_string(required.size())
+    LOG_INFO("Resolved " + std::to_string(required.size())
                 + " plugin(s) to load:" + [&]() {
         std::string s;
         for (const auto& p : required) s += " " + p.name;
@@ -393,12 +405,12 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     // ---- 第 4 步：拓扑排序 ----
     auto load_order = compute_load_order(required);
     if (load_order.empty()) {
-        fw_log_error("Circular dependency detected");
+        LOG_ERROR("Circular dependency detected");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
-    fw_log_info("Load order:" + [&]() {
+    LOG_INFO("Load order:" + [&]() {
         std::string s;
         for (const auto& name : load_order) s += " " + name;
         return s;
@@ -413,8 +425,8 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
         auto it = info_map.find(name);
         if (it == info_map.end()) continue;
         self->request(out.plugin_mgr, caf::infinite, load_atom{}, name, it->second.path.string())
-            .receive([](bool ok) { fw_log_info("Load result: " + std::string(ok ? "OK" : "FAILED")); },
-                     [](const caf::error& e) { fw_log_error("Load err: " + caf::to_string(e)); });
+            .receive([](bool ok) { LOG_INFO("Load result: " + std::string(ok ? "OK" : "FAILED")); },
+                     [](const caf::error& e) { LOG_ERROR("Load err: " + caf::to_string(e)); });
     }
 
     // ---- 健康检查：所有目标插件必须可 resolve ----
@@ -428,13 +440,13 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     }
 
     if (!healthy) {
-        fw_log_error("One or more plugins failed to resolve");
+        LOG_ERROR("One or more plugins failed to resolve");
         self->send(out.shutdown_mgr, shutdown_atom{});
         return false;
     }
 
     self->send(out.shutdown_mgr, ready_atom{});
-    fw_log_info("Startup complete. Press Ctrl+C to shutdown.");
+    LOG_INFO("Startup complete. Press Ctrl+C to shutdown.");
     return true;
 }
 
@@ -445,7 +457,7 @@ void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     install_stdin_watchdog(fw.shutdown_mgr);
     caf::scoped_actor self{sys};
     self->wait_for(fw.shutdown_mgr);
-    fw_log_info("framework shutdown complete");
+    LOG_INFO("framework shutdown complete");
 }
 
 } // namespace caf_plugin_system

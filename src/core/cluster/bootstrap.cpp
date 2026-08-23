@@ -7,7 +7,7 @@
 #include "client.hpp"
 #include "master.hpp"
 #include "common/message_tags.hpp"
-#include "../framework_log.hpp"
+#include "services/logging_service.hpp"
 
 #include <caf/actor_registry.hpp>
 #include <caf/actor_system.hpp>
@@ -62,22 +62,22 @@ bool bootstrap_node(caf::actor_system& sys, const node_settings& settings,
 
     node_kind kind;
     if (!from_string(settings.node_kind, kind)) {
-        fw_log_error("Invalid node-kind: " + settings.node_kind);
+        LOG_ERROR("Invalid node-kind: " + settings.node_kind);
         return false;
     }
     if (settings.node_name.empty()) {
-        fw_log_error("node-name is required when node-kind is set");
+        LOG_ERROR("node-name is required when node-kind is set");
         return false;
     }
 
     // 开 middleman 端口（所有节点模式；master 自身也需要被 connect）
     auto port = sys.middleman().open(settings.node_port, nullptr, false);
     if (!port) {
-        fw_log_error("Failed to open middleman port: " + caf::to_string(port.error()));
+        LOG_ERROR("Failed to open middleman port: " + caf::to_string(port.error()));
         return false;
     }
     out.port = *port;
-    fw_log_info("Node '" + settings.node_name + "' listening on port "
+    LOG_INFO("Node '" + settings.node_name + "' listening on port "
                 + std::to_string(*port));
 
     if (kind == node_kind::master) {

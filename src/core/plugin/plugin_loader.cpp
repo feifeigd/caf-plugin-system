@@ -1,5 +1,5 @@
 #include "plugin_loader.hpp"
-#include "../framework_log.hpp"
+#include "services/logging_service.hpp"
 #include <caf/logger.hpp>
 #include <deque>
 #include <iostream>
@@ -37,7 +37,7 @@ void preregister_plugin_meta(const std::filesystem::path& root) {
 
             reg();  // 插件自注册私有类型的元对象（此时任何 actor_system 都还不存在）
             // 注意：此刻 CAF logger 尚未创建、fw_logger 未注入，fw_log 走 cout 兜底
-            caf_plugin_system::fw_log_info("[Loader] Plugin self-registered meta objects: "
+            LOG_INFO("[Loader] Plugin self-registered meta objects: "
                                            + file.path().string());
             meta_lib_pool().push_back(std::move(*lib_opt));
         }
@@ -56,7 +56,7 @@ std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path) {
     auto manifest = plugin->manifest();
     destroy(plugin);
 
-    caf_plugin_system::fw_log_info("Probed plugin: " + manifest.name + " version=" + manifest.version
+    LOG_INFO("Probed plugin: " + manifest.name + " version=" + manifest.version
                 + " deps=" + std::to_string(manifest.dependencies.size())
                 + " provides=" + std::to_string(manifest.provides.size()));
 
@@ -66,11 +66,11 @@ std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path) {
 std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root) {
     std::vector<PluginInfo> result;
     if (!std::filesystem::exists(root)) {
-        caf_plugin_system::fw_log_info("Plugin directory not found: " + root.string());
+        LOG_INFO("Plugin directory not found: " + root.string());
         return result;
     }
 
-    caf_plugin_system::fw_log_info("Scanning plugin directory: " + root.string());
+    LOG_INFO("Scanning plugin directory: " + root.string());
 
     for (const auto& entry : std::filesystem::directory_iterator(root)) {
         if (!entry.is_directory()) continue;
@@ -87,7 +87,7 @@ std::vector<PluginInfo> scan_all_plugins(const std::filesystem::path& root) {
         }
     }
 
-    caf_plugin_system::fw_log_info("Scan complete: " + std::to_string(result.size()) + " plugin(s) found");
+    LOG_INFO("Scan complete: " + std::to_string(result.size()) + " plugin(s) found");
     return result;
 }
 
@@ -95,7 +95,15 @@ std::vector<PluginInfo> resolve_dependencies(
     const std::vector<std::string>& entry_plugins,
     const std::vector<PluginInfo>& all_plugins) {
 
+    // 核心内置服务（非插件提供，注册在 ServiceRegistry）：插件 manifest
+    // 依赖可直接引用，解析时视为已满足（provider 标记 @core，不加载插件）。
+    static const std::unordered_map<std::string, std::string> core_services = {
+        {"logging_service", "@core"},
+    };
+
     std::unordered_map<std::string, std::string> service_to_plugin;
+    for (const auto& [svc, provider] : core_services)
+        service_to_plugin[svc] = provider;
     for (const auto& p : all_plugins) {
         for (const auto& svc : p.manifest.provides) {
             service_to_plugin[svc] = p.name;
@@ -120,7 +128,7 @@ std::vector<PluginInfo> resolve_dependencies(
 
         auto it = plugin_map.find(name);
         if (it == plugin_map.end()) {
-            caf_plugin_system::fw_log_error("Unknown plugin: " + name);
+            LOG_ERROR("Unknown plugin: " + name);
             continue;
         }
 
@@ -129,15 +137,17 @@ std::vector<PluginInfo> resolve_dependencies(
         for (const auto& dep_svc : it->second->manifest.dependencies) {
             auto svc_it = service_to_plugin.find(dep_svc);
             if (svc_it == service_to_plugin.end()) {
-                caf_plugin_system::fw_log_error("No provider for service: " + dep_svc
+                LOG_ERROR("No provider for service: " + dep_svc
                              + " (required by " + name + ")");
                 continue;
             }
+            if (svc_it->second == "@core")
+                continue;  // 核心内置服务：无需加载插件
             stack.push_back(svc_it->second);
         }
     }
 
-    caf_plugin_system::fw_log_info("Resolved " + std::to_string(resolved.size()) + " plugin(s) from "
+    LOG_INFO("Resolved " + std::to_string(resolved.size()) + " plugin(s) from "
                 + std::to_string(entry_plugins.size()) + " entry point(s)");
     return resolved;
 }
@@ -156,12 +166,12 @@ std::vector<std::string> compute_load_order(const std::vector<PluginInfo>& plugi
 
     for (const auto& p : plugins) {
         if (graph.has_cycle_from(p.name)) {
-            caf_plugin_system::fw_log_error("Circular dependency detected involving: " + p.name);
+            LOG_ERROR("Circular dependency detected involving: " + p.name);
             return {};
         }
     }
 
     auto order = graph.topological_order();
-    caf_plugin_system::fw_log_info("Computed load order: " + std::to_string(order.size()) + " plugin(s)");
+    LOG_INFO("Computed load order: " + std::to_string(order.size()) + " plugin(s)");
     return order;
 }

@@ -6,7 +6,7 @@
 
 #include "common/cluster_types.hpp"
 #include "common/message_tags.hpp"
-#include "../framework_log.hpp"
+#include "services/logging_service.hpp"
 
 #include <caf/actor_cast.hpp>
 #include <caf/all.hpp>
@@ -40,9 +40,9 @@ namespace {
 
 constexpr auto k_ops_timeout = std::chrono::seconds(10);
 
-/// 控制台命令输出统一走 fw_log（logging_service > CAF log > cout）。
+/// 控制台命令输出统一走 log_info（logging_service 系统组件）。
 void ops_print(const std::string& msg) {
-    fw_log("INFO", "[Ops] " + msg);
+    LOG_INFO("[Ops] " + msg);
 }
 
 std::vector<std::string> split_ws(const std::string& s) {

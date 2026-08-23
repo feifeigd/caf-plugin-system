@@ -73,6 +73,9 @@ struct framework_config : caf::actor_system_config {
 
 /// 引导结果：内核 actor 句柄 + 最终加载顺序（含解析出的依赖）。
 struct BootstrapResult {
+    /// 核心日志服务（系统组件，最先 spawn）：spdlog console + logs/app.log，
+    /// 注册进 ServiceRegistry（插件依赖可引用），关机链最后退出。
+    caf::actor logging_service;
     caf::actor registry;
     caf::actor checkpoint_mgr;
     caf::actor plugin_mgr;

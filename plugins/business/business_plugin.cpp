@@ -48,10 +48,11 @@ constexpr std::uint16_t biz_env_v2_ping = 2;
 class BusinessPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
-        // acl_allow 演示：business_service 进入受限策略，只接受 LoggerPlugin
+        // acl_allow 演示：business_service 进入受限策略，信任核心日志服务（logging_service
+    // 为核心内置服务，plugin_manager 的 ACL 解析会回退到 ServiceRegistry）
         // 的调用，其余 sender（包括外部/入口 actor）在代理处被 ACL 拦截
         return {"BusinessPlugin", BIZ_VERSION_STR, {"logging_service"}, {"business_service"},
-                0, {"LoggerPlugin"}};
+                0, {"logging_service"}};
     }
 
     // 返回值代表整个 DLL 的 actor 实例，deps 是依赖的 actor 列表，最后一个参数是插件的配置字符串
@@ -59,8 +60,11 @@ public:
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
         caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
+        // 注册为本插件模块（DLL）的日志单例：本文件所有 LOG_* 宏直接生效
+        caf_plugin_system::set_logger(logger);
+        caf_plugin_system::set_log_source(PLUGIN_NAME);
 
-        return sys.spawn([logger](caf::stateful_actor<int>* self) -> caf::behavior {
+        return sys.spawn([](caf::stateful_actor<int>* self) -> caf::behavior {
             self->state() = 0;
             auto plugin_mgr = std::make_shared<caf::actor>();
 
@@ -69,7 +73,7 @@ public:
             // 框架统一，状态序列化走 hooks 回调）。
             caf::message_handler business{
                 [=](biz_ping_atom) {
-                    LOG_INFO(logger, "Private meta round-trip OK");
+                    LOG_INFO_SELF(self, "Private meta round-trip OK");
                 },
                 // 信封 handler：失去类型匹配，统一入口 + 手工 switch 二级分发，
                 // 这正是 plugin_envelope.hpp 头注释里"弊"的具体样子
@@ -79,7 +83,7 @@ public:
                             std::string text(
                                 reinterpret_cast<const char*>(env.payload.data()),
                                 env.payload.size());
-                            LOG_INFO(logger, "Envelope round-trip OK: {}", text);
+                            LOG_INFO_SELF(self, "Envelope round-trip OK: {}", text);
                             // 响应式：request 调用方（如跨节点 RemoteCaller）
                             // 拿回执；纯 send 调用无副作用（void handler）
                             if (self->current_message_id().is_request()) {
@@ -91,11 +95,11 @@ public:
 #ifdef BIZ_HOT_V2
                         case biz_env_v2_ping:
                             // 热更新新增的子协议号：走信封不需要新 type_id/元对象注册
-                            LOG_INFO(logger, "v2 envelope pong (hot-added sub_proto=2)");
+                            LOG_INFO_SELF(self, "v2 envelope pong (hot-added sub_proto=2)");
                             break;
 #endif
                         default:
-                            LOG_INFO(logger, "Unknown envelope sub_proto={}",
+                            LOG_INFO_SELF(self, "Unknown envelope sub_proto={}",
                                      static_cast<int>(env.sub_proto));
                             break;
                     }
@@ -105,11 +109,11 @@ public:
                     if (cmd == "shutdown") {
                         if (*plugin_mgr) {
                             self->send(*plugin_mgr, request_shutdown_atom{});
-                            LOG_INFO(logger, "Shutdown requested by command");
+                            LOG_INFO_SELF(self, "Shutdown requested by command");
                         }
                         return "shutdown requested";
                     }
-                    LOG_DEBUG(logger, "Command received: {}", cmd);
+                    LOG_DEBUG_SELF(self, "Command received: {}", cmd);
 #ifdef BIZ_HOT_V2
                     // v2 行为差异：热更新生效的运行时证据
                     return "processed by v2: " + cmd;
@@ -120,10 +124,10 @@ public:
             };
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 // 初始化：记录 manager + 私有消息自测（回调可捕获 self）
-                .on_init = [logger, plugin_mgr, self](caf::actor manager,
+                .on_init = [plugin_mgr, self](caf::actor manager,
                                                       const std::string&) {
                     *plugin_mgr = manager;
-                    LOG_INFO(logger, "BusinessPlugin initialized ({})", BIZ_VERSION_STR);
+                    LOG_INFO_SELF(self, "BusinessPlugin initialized ({})", BIZ_VERSION_STR);
                     // 方式一·私有类型：验证元对象自注册生效（创建→投递→析构
                     // 全链路，若 register_meta_objects 没被调用，这条消息会崩进程）
                     self->send(self, biz_ping_atom{});
@@ -144,10 +148,10 @@ public:
                     std::memcpy(data.data(), &self->state(), sizeof(int));
                     return data;
                 },
-                .on_restore = [self, logger](const std::vector<std::byte>& data) {
+                .on_restore = [self](const std::vector<std::byte>& data) {
                     if (data.size() >= sizeof(int)) {
                         std::memcpy(&self->state(), data.data(), sizeof(int));
-                        LOG_INFO(logger, "Restored count={}", self->state());
+                        LOG_INFO_SELF(self, "Restored count={}", self->state());
                     }
                 },
                 // shutdown：无清理动作，quit 由框架统一

@@ -10,7 +10,7 @@
 #include <chrono>
 #include <deque>
 #include <iostream>
-#include "../framework_log.hpp"
+#include "services/logging_service.hpp"
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -185,7 +185,7 @@ private:
             return;
         }
         // 全部候选 unhealthy：清缓存，下次尝试重新 resolve 拿最新拓扑
-        fw_log_info(std::string("[RemoteCaller] all candidates unhealthy for '") + ks.svc
+        LOG_INFO(std::string("[RemoteCaller] all candidates unhealthy for '") + ks.svc
                     + "', re-resolving");
         ks.routes.clear();
         resolve(ks);
@@ -195,7 +195,7 @@ private:
     /// 调用方只有在所有尝试都失败后才会收到错误。
     void retry_or_fail(KeyState& ks, caf::error err) {
         if (--ks.attempts_left > 0) {
-            fw_log_info(std::string("[RemoteCaller] attempt failed for '") + ks.svc
+            LOG_INFO(std::string("[RemoteCaller] attempt failed for '") + ks.svc
                         + "' (" + caf::to_string(err) + "), retrying in "
                         + std::to_string(k_retry_interval.count()) + "s ("
                         + std::to_string(ks.attempts_left) + " left)");
@@ -230,13 +230,13 @@ private:
                                             "service not registered on any node"));
                       return;
                   }
-                  fw_log_info(std::string("[RemoteCaller] resolved '") + ks.svc
+                  LOG_INFO(std::string("[RemoteCaller] resolved '") + ks.svc
                               + "' -> " + std::to_string(ks.routes.size())
                               + " candidate(s)");
                   try_route(ks);
               },
               [this, &ks](caf::error& err) {
-                  fw_log_info(std::string("[RemoteCaller] service resolve '") + ks.svc
+                  LOG_INFO(std::string("[RemoteCaller] service resolve '") + ks.svc
                               + "' failed: " + caf::to_string(err));
                   retry_or_fail(ks, std::move(err));
               });
@@ -249,12 +249,12 @@ private:
               [this, &ks](actor_route& route) {
                   ks.routes.clear();
                   ks.routes.push_back(Route{std::move(route), {}, true});
-                  fw_log_info(std::string("[RemoteCaller] resolved '") + ks.svc
+                  LOG_INFO(std::string("[RemoteCaller] resolved '") + ks.svc
                               + "' -> node '" + ks.node_name + "'");
                   try_route(ks);
               },
               [this, &ks](caf::error& err) {
-                  fw_log_info(std::string("[RemoteCaller] resolve '") + ks.svc
+                  LOG_INFO(std::string("[RemoteCaller] resolve '") + ks.svc
                               + "' on node '" + ks.node_name + "' failed: "
                               + caf::to_string(err));
                   retry_or_fail(ks, std::move(err));
@@ -277,7 +277,7 @@ private:
                   auto ptr = this->system().middleman().remote_lookup(
                     r.info.actor_name, nid);
                   if (!ptr) {
-                      fw_log_info(std::string("[RemoteCaller] lookup '") + r.info.actor_name
+                      LOG_INFO(std::string("[RemoteCaller] lookup '") + r.info.actor_name
                                   + "' at " + r.info.node_name + " failed");
                       r.healthy = false;
                       try_route(ks);
@@ -287,7 +287,7 @@ private:
                   do_call(ks, idx);
               },
               [this, &ks, idx](caf::error& err) {
-                  fw_log_info(std::string("[RemoteCaller] connect to ") + ks.routes[idx].info.node_name
+                  LOG_INFO(std::string("[RemoteCaller] connect to ") + ks.routes[idx].info.node_name
                               + " failed: " + caf::to_string(err));
                   ks.routes[idx].healthy = false;
                   try_route(ks);
@@ -304,7 +304,7 @@ private:
                   finish(ks);
               },
               [this, &ks, idx](caf::error& err) {
-                  fw_log_info(std::string("[RemoteCaller] call to '") + ks.routes[idx].info.node_name
+                  LOG_INFO(std::string("[RemoteCaller] call to '") + ks.routes[idx].info.node_name
                               + "' failed (" + caf::to_string(err) + "), failover");
                   ks.routes[idx].healthy = false;
                   try_route(ks);

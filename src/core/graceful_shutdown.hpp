@@ -21,6 +21,7 @@ public:
                      caf::actor plugin_mgr,
                      caf::actor registry,
                      caf::actor checkpoint_mgr,
+                     caf::actor logging_service,
                      std::function<std::vector<std::string>()> get_stop_order);
 
     caf::behavior make_behavior() override;
@@ -35,6 +36,9 @@ private:
     caf::actor plugin_mgr_;
     caf::actor registry_;
     caf::actor checkpoint_mgr_;
+    /// 核心日志服务（系统组件）：关机链最后退出（flush 后 quit），
+    /// 保证最后一刻的日志（STOPPED）也能落盘。
+    caf::actor logging_service_;
     /// 集群节点 actor（master/client，经 register_cluster_atom 注册）：
     /// 关机时统一终止（插件保存后 → 集群 → 组件），main 不再手动杀。
     std::vector<caf::actor> cluster_ctls_;

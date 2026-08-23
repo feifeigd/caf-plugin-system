@@ -1,6 +1,6 @@
 #include "service_registry.hpp"
 #include "common/message_tags.hpp"
-#include "framework_log.hpp"
+#include "services/logging_service.hpp"
 #include <caf/actor_registry.hpp>
 #include <algorithm>
 #include <iostream>
@@ -71,7 +71,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                     && from.node() != self->system().node())
                     trusted = true;
                 if (!trusted) {
-                    caf_plugin_system::fw_log_info("[Proxy] ACL blocked a call to the service");
+                    LOG_INFO("[Proxy] ACL blocked a call to the service");
                     // 返回 error：带 promise 的 request 会收到错误响应，
                     // 不会挂到超时；纯 send 的则被 CAF 丢弃（良性日志）
                     return caf::make_error(caf::sec::invalid_request,
@@ -88,7 +88,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 auto& s = self->state();
                 s.allowed = std::move(allowed);
                 s.restricted = true;
-                caf_plugin_system::fw_log_info("[Proxy] ACL enabled, " + std::to_string(s.allowed.size())
+                LOG_INFO("[Proxy] ACL enabled, " + std::to_string(s.allowed.size())
                             + " trusted sender(s)");
             },
 
@@ -98,7 +98,7 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
             // 旧 actor 已处理完全部在途工作（先排空后快照，无丢失窗口）。
             [=](quiesce_atom) -> bool {
                 self->state().paused = true;    // 暂停转发，新消息进缓冲
-                caf_plugin_system::fw_log_info("[Proxy] quiesced, buffering new calls");
+                LOG_INFO("[Proxy] quiesced, buffering new calls");
                 return true;    // 设置暂停成功
             },
 
@@ -113,13 +113,13 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 s.current = new_target;
                 s.version++;
                 s.paused = false;
-                caf_plugin_system::fw_log_info("[Proxy] v" + std::to_string(s.version) + " resumed, flushing "
+                LOG_INFO("[Proxy] v" + std::to_string(s.version) + " resumed, flushing "
                             + std::to_string(s.buffered.size()) + " buffered call(s)");
                 for (auto& b : s.buffered) {
                     if (s.restricted
                         && std::find(s.allowed.begin(), s.allowed.end(), b.from)
                                == s.allowed.end()) {
-                        caf_plugin_system::fw_log_info("[Proxy] ACL blocked a buffered call");
+                        LOG_INFO("[Proxy] ACL blocked a buffered call");
                         if (b.promise.pending()) {
                             b.promise.deliver(caf::make_error(
                                 caf::sec::invalid_request,
@@ -153,7 +153,7 @@ caf::behavior ServiceRegistry::make_behavior() {
         [=, this](register_atom, const std::string& name, caf::actor impl,
             const std::string& plugin) {
             if (services_.count(name)) {
-                caf_plugin_system::fw_log_error("[Registry] Service already registered: " + name
+                LOG_ERROR("[Registry] Service already registered: " + name
                               + ". Use hot_reload to switch implementation.");
                 return;
             }
@@ -165,7 +165,7 @@ caf::behavior ServiceRegistry::make_behavior() {
             // middleman remote_lookup(name, node) 直接调用本服务代理。
             self->system().registry().put(name, proxy);
             exported_.push_back(name);
-            caf_plugin_system::fw_log_info("[Registry] Registered: " + name + " (v1) exported");
+            LOG_INFO("[Registry] Registered: " + name + " (v1) exported");
         },
 
         // 查询本进程已导出到 CAF registry 的服务名（节点上报 exported_actors 用）
@@ -178,12 +178,12 @@ caf::behavior ServiceRegistry::make_behavior() {
         [=, this](hot_reload_atom, const std::string& name, caf::actor new_impl) {
             auto it = services_.find(name);
             if (it == services_.end()) {
-                caf_plugin_system::fw_log_error("[Registry] Hot-reload failed, service not found: " + name);
+                LOG_ERROR("[Registry] Hot-reload failed, service not found: " + name);
                 return;
             }
             it->second.version++;
             it->second.impl = new_impl;
-            caf_plugin_system::fw_log_info("[Registry] Hot-reloaded: " + name + " (v"
+            LOG_INFO("[Registry] Hot-reloaded: " + name + " (v"
                         + std::to_string(it->second.version) + ")");
         },
 
@@ -198,7 +198,7 @@ caf::behavior ServiceRegistry::make_behavior() {
             // 安全退出 proxy，通知所有调用方
             self->send_exit(it->second.proxy, caf::exit_reason::user_shutdown);
             services_.erase(it);
-            caf_plugin_system::fw_log_info("[Registry] Unregistered: " + name);
+            LOG_INFO("[Registry] Unregistered: " + name);
         },
 
         // 返回 dll 的代理 actor
@@ -222,7 +222,7 @@ caf::behavior ServiceRegistry::make_behavior() {
             auto it = services_.find(name);
             if (it == services_.end()) return;
             self->send(it->second.proxy, set_acl_atom{}, allowed);
-            caf_plugin_system::fw_log_info("[Registry] ACL set for: " + name + " ("
+            LOG_INFO("[Registry] ACL set for: " + name + " ("
                         + std::to_string(allowed.size()) + " trusted sender(s))");
         },
 

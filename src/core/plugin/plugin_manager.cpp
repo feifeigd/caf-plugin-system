@@ -1,6 +1,6 @@
 #include "plugin_manager.hpp"
 #include "checkpoint_manager.hpp"
-#include <caf/logger.hpp>
+#include "services/logging_service.hpp"
 #include <deque>
 #include <vector>
 #include <iostream>
@@ -28,7 +28,7 @@ caf::behavior PluginManager::make_behavior() {
     // 宿主 actor，不能因协议毛刺被杀死。
     self->set_default_handler([](caf::scheduled_actor*, caf::message& msg)
                               -> caf::skippable_result {
-        CAF_LOG_WARNING("PluginManager discarding unexpected message: " << caf::to_string(msg));
+        LOG_WARN("PluginManager discarding unexpected message: " + caf::to_string(msg));
         return caf::make_message();
     });
     
@@ -43,31 +43,31 @@ caf::behavior PluginManager::make_behavior() {
         },
         // 加载插件 dll
         [=, this](load_atom, const std::string& name, const std::string& path) -> caf::result<bool> {
-            CAF_LOG_INFO("Loading plugin: " << name);
+            LOG_INFO("Loading plugin: " + name);
 
             if (plugins_.count(name)) {
-                CAF_LOG_ERROR("Plugin already loaded: " << name);
+                LOG_ERROR("Plugin already loaded: " + name);
                 return caf::make_error(caf::sec::invalid_argument, "Already loaded");
             }
 
             auto lib_opt = DynamicLibrary::open(path);
             if (!lib_opt) {
-                CAF_LOG_ERROR("Failed to load library: " << path);
+                LOG_ERROR("Failed to load library: " + path);
                 return caf::make_error(caf::sec::invalid_argument, "Failed to load library");
             }
 
             auto create  = lib_opt->symbol<CreatePluginFunc>("create_plugin");
             auto destroy = lib_opt->symbol<DestroyPluginFunc>("destroy_plugin");
             if (!create || !destroy) {
-                CAF_LOG_ERROR("Missing create/destroy symbols in: " << path);
+                LOG_ERROR("Missing create/destroy symbols in: " + path);
                 return false;
             }
 
             PluginEntry* plugin = create();
             auto manifest = plugin->manifest();
-            CAF_LOG_INFO("Plugin manifest: " << manifest.name
-                         << " deps=" << manifest.dependencies.size()
-                         << " provides=" << manifest.provides.size());
+            LOG_INFO("Plugin manifest: " + manifest.name
+                     + " deps=" + std::to_string(manifest.dependencies.size())
+                     + " provides=" + std::to_string(manifest.provides.size()));
 
             for (const auto& svc : manifest.provides) {
                 dep_graph_.register_service(svc, name);
@@ -75,7 +75,7 @@ caf::behavior PluginManager::make_behavior() {
             dep_graph_.add_plugin(name, manifest.dependencies);
 
             if (dep_graph_.has_cycle_from(name)) {
-                CAF_LOG_ERROR("Circular dependency detected for: " << name);
+                LOG_ERROR("Circular dependency detected for: " + name);
                 destroy(plugin);
                 return caf::make_error(caf::sec::invalid_argument, "Circular dependency");
             }
@@ -83,13 +83,13 @@ caf::behavior PluginManager::make_behavior() {
             std::vector<caf::actor> deps;
             caf::scoped_actor blocking{self->system()};
             for (const auto& dep : manifest.dependencies) {
-                CAF_LOG_INFO("Resolving dependency: " << dep << " for " << name);
+                LOG_INFO("Resolving dependency: " + dep + " for " + name);
                 caf::actor dep_actor;
                 blocking->request(registry_, caf::infinite, resolve_atom{}, dep)
                     .receive([&dep_actor](const caf::actor& a) { dep_actor = a; },
                              [](caf::error&) {});
                 if (!dep_actor) {
-                    CAF_LOG_ERROR("Missing dependency: " << dep << " for " << name);
+                    LOG_ERROR("Missing dependency: " + dep + " for " + name);
                     destroy(plugin);
                     return caf::make_error(caf::sec::invalid_argument, "Missing dep: " + dep);
                 }
@@ -105,7 +105,7 @@ caf::behavior PluginManager::make_behavior() {
             auto actor = plugin->spawn(self->system(), deps, "");
 
             if (!state_data.empty()) {
-                CAF_LOG_INFO("Restoring state for: " << name);
+                LOG_INFO("Restoring state for: " + name);
                 self->send(actor, restore_state_atom{}, state_data);
             }
 
@@ -127,9 +127,20 @@ caf::behavior PluginManager::make_behavior() {
                     if (pit != plugins_.end()) {
                         allowed.push_back(pit->second.actor->address());
                     } else {
-                        // 拓扑序保证依赖已加载；找不到说明清单写错了
-                        CAF_LOG_WARNING("ACL: unknown plugin in acl_allow of "
-                                        << name << ": " << pname);
+                        // 可能是核心内置服务（如 logging_service，注册在
+                        // ServiceRegistry 而非 plugins_）：解析其 actor 地址
+                        // 作为信任方；仍找不到才是清单写错。
+                        caf::actor svc_actor;
+                        blocking->request(registry_, caf::infinite,
+                                          resolve_atom{}, pname)
+                            .receive([&svc_actor](const caf::actor& a) { svc_actor = a; },
+                                     [](caf::error&) {});
+                        if (svc_actor) {
+                            allowed.push_back(svc_actor->address());
+                        } else {
+                            LOG_WARN("ACL: unknown plugin/core service in acl_allow of "
+                                     + name + ": " + pname);
+                        }
                     }
                 }
                 for (const auto& svc : manifest.provides) {
@@ -141,7 +152,7 @@ caf::behavior PluginManager::make_behavior() {
             plugins_.emplace(name, LoadedPlugin{
                 &plugin_lib_pool().back(), plugin, actor, manifest, destroy
             });
-            CAF_LOG_INFO("Plugin loaded successfully: " << name);
+            LOG_INFO("Plugin loaded successfully: " + name);
             return true;
         },
 
@@ -272,8 +283,18 @@ caf::behavior PluginManager::make_behavior() {
                     if (pit != plugins_.end()) {
                         new_svc_allowed.push_back(pit->second.actor->address());
                     } else {
-                        CAF_LOG_WARNING("ACL: unknown plugin in acl_allow of "
-                                        << name << ": " << pname);
+                        // 核心内置服务回退：从 ServiceRegistry 解析（见上）
+                        caf::actor svc_actor;
+                        blocking->request(registry_, caf::infinite,
+                                          resolve_atom{}, pname)
+                            .receive([&svc_actor](const caf::actor& a) { svc_actor = a; },
+                                     [](caf::error&) {});
+                        if (svc_actor) {
+                            new_svc_allowed.push_back(svc_actor->address());
+                        } else {
+                            LOG_WARN("ACL: unknown plugin/core service in acl_allow of "
+                                     + name + ": " + pname);
+                        }
                     }
                 }
             }
@@ -323,15 +344,15 @@ caf::behavior PluginManager::make_behavior() {
                 &plugin_lib_pool().back(), new_plugin, new_actor, manifest, destroy
             };
 
-            CAF_LOG_INFO("Plugin hot-reloaded: " << name << " -> " << path);
+            LOG_INFO("Plugin hot-reloaded: " + name + " -> " + path);
             return true;
         },
 
         [=, this](unload_atom, const std::string& name) -> bool {
-            CAF_LOG_INFO("Unloading plugin: " << name);
+            LOG_INFO("Unloading plugin: " + name);
             auto it = plugins_.find(name);
             if (it == plugins_.end()) {
-                CAF_LOG_WARNING("Plugin not found for unload: " << name);
+                LOG_WARN("Plugin not found for unload: " + name);
                 return false;
             }
 
@@ -374,7 +395,7 @@ caf::behavior PluginManager::make_behavior() {
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
             retired_.push_back(std::move(it->second));
             plugins_.erase(it);
-            CAF_LOG_INFO("Plugin unloaded: " << name);
+            LOG_INFO("Plugin unloaded: " + name);
             return true;
         },
 
@@ -391,15 +412,15 @@ caf::behavior PluginManager::make_behavior() {
 
         [=, this](shutdown_atom, caf::actor mgr) {
             shutdown_mgr_ = mgr;
-            CAF_LOG_INFO("Shutdown manager registered");
+            LOG_INFO("Shutdown manager registered");
         },
 
         [=, this](request_shutdown_atom) {
             if (shutdown_mgr_) {
-                CAF_LOG_INFO("Forwarding shutdown request to GracefulShutdown");
+                LOG_INFO("Forwarding shutdown request to GracefulShutdown");
                 self->send(shutdown_mgr_, shutdown_atom{});
             } else {
-                CAF_LOG_ERROR("Shutdown manager not set");
+                LOG_ERROR("Shutdown manager not set");
             }
         },
 
@@ -407,7 +428,7 @@ caf::behavior PluginManager::make_behavior() {
             // 热更新退役的旧 actor 退出：正常销毁旧实例，不算崩溃
             for (auto rit = retired_.begin(); rit != retired_.end(); ++rit) {
                 if (rit->actor && rit->actor->address() == dm.source) {
-                    CAF_LOG_INFO("Retired instance cleaned up (hot-reload/unload)");
+                    LOG_INFO("Retired instance cleaned up (hot-reload/unload)");
                     if (rit->destroy) {
                         rit->destroy(rit->instance);
                     }
@@ -417,7 +438,7 @@ caf::behavior PluginManager::make_behavior() {
             }
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
-                    CAF_LOG_ERROR("Plugin crashed: " << it->first);
+                    LOG_ERROR("Plugin crashed: " + it->first);
 
                     for (const auto& svc : it->second.manifest.provides) {
                         self->send(registry_, unregister_atom{}, svc);
