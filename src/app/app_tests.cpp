@@ -205,8 +205,14 @@ void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
 
 void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
                           const std::string& local_node_name,
-                          const std::string& node_name) {
+                          const std::string& node_name,
+                          caf::actor shutdown_mgr) {
     auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
+    // 注册给 shutdown_mgr：重试循环（最长 60×4s）若撞上 EOF 关机，
+    // 关机链统一 send_exit → request 立即失败 → 循环快速退出。
+    // 否则 caller 残活 → actor_system 析构 join 挂起（实测）。
+    if (shutdown_mgr)
+        caf::anon_send(shutdown_mgr, register_cluster_atom_v, caller);
     plugin_envelope env;
     env.sub_proto = k_env_hello;
     const char* text = "bridge-ping";

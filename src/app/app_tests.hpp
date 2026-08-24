@@ -34,8 +34,13 @@ void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
 /// bridge 验证（--test-bridge-call=<节点名>，master 进程执行）：
 /// 跨节点调用指定节点的 external_echo（服务 handler 在外部进程，
 /// bridge 转发）——验证 集群→bridge→外部进程 完整链路。
+/// shutdown_mgr：caller 注册进去，关机时统一 send_exit——
+/// 重试循环若撞上 EOF 关机（最长 4 分钟），request 立即失败
+/// 快速退出，避免 RemoteCaller 残活导致 actor_system 析构 join 挂起
+/// （实测：无外部客户端时循环跑满，LeakCheck actors remaining: 1）。
 void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
                           const std::string& local_node_name,
-                          const std::string& node_name);
+                          const std::string& node_name,
+                          caf::actor shutdown_mgr);
 
 } // namespace caf_plugin_system

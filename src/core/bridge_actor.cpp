@@ -100,11 +100,77 @@ struct WriteQueue {
 };
 
 // ------------------------------------------------------------------
+// 当前活动连接：actor 写 socket 的唯一入口 + 全部资源句柄。
+// 坑 1：若 actor 直接捕获"主 wq"，而写线程消费的是每连接新建的 wq，
+//       则 respond/REQ 全进无人消费的队列 → 外部进程永远等不到响应
+//       （实测：Python 15s 超时、master 跨节点 request_timeout）。
+//       因此 actor 必须经 active->push() 转发到【当前连接】的 wq。
+// 坑 2：detached 线程在进程退出时被强杀不 unwind → 栈上 shared_ptr
+//       不析构 → CRT dump 报泄露（实测 "REQ 53 ..." 残留在 WriteQueue）。
+//       因此线程全部登记到 active，bridge actor exit 时 shutdown_and_join：
+//       close 所有 fd + wq->close() → 线程阻塞点返回 → join → 0 泄露。
+// ------------------------------------------------------------------
+struct ActiveConn {
+    std::mutex m;
+    std::shared_ptr<WriteQueue> wq;
+    socket_t listener = k_invalid_socket;
+    std::vector<socket_t> conns;
+    std::vector<std::thread> threads;
+    bool shutting_down = false;
+
+    void set_listener(socket_t s) {
+        std::lock_guard<std::mutex> g(m);
+        listener = s;
+    }
+    void set_wq(std::shared_ptr<WriteQueue> w) {
+        std::lock_guard<std::mutex> g(m);
+        wq = std::move(w);
+    }
+    void add_conn(socket_t fd) {
+        std::lock_guard<std::mutex> g(m);
+        conns.push_back(fd);
+    }
+    void add_thread(std::thread t) {
+        std::lock_guard<std::mutex> g(m);
+        threads.push_back(std::move(t));
+    }
+    void push(const std::string& line) {
+        std::lock_guard<std::mutex> g(m);
+        if (wq)
+            wq->push(line);
+    }
+    bool is_shutting_down() {
+        std::lock_guard<std::mutex> g(m);
+        return shutting_down;
+    }
+    void shutdown_and_join() {
+        std::vector<std::thread> ts;
+        {
+            std::lock_guard<std::mutex> g(m);
+            if (!shutting_down) {
+                shutting_down = true;
+                if (listener != k_invalid_socket)
+                    close_socket(listener);
+                for (auto fd : conns)
+                    close_socket(fd);
+                if (wq)
+                    wq->close();
+            }
+            ts = std::move(threads);
+        }
+        for (auto& t : ts)
+            if (t.joinable())
+                t.join();
+    }
+};
+
+// ------------------------------------------------------------------
 // 带缓冲的行读取器（阻塞 recv）
 // ------------------------------------------------------------------
 struct LineReader {
     socket_t fd;
     std::string buf;
+    std::shared_ptr<ActiveConn> active; // 优雅关闭标志查询（recv 失败门控）
 
     // 读一行（含 \n）；EOF/错误返回 false
     bool read_line(std::string& out) {
@@ -118,14 +184,19 @@ struct LineReader {
             char tmp[4096];
             int n = recv(fd, tmp, static_cast<int>(sizeof tmp), 0);
             if (n <= 0) {
+                // 优雅关闭时 shutdown_and_join() 主动 close 全部 fd，
+                // recv 失败（WSAECONNABORTED）是预期行为，不刷噪音；
+                // 非关闭期的失败才打（客户端异常断开，调试有用）。
+                if (!active || !active->is_shutting_down()) {
 #ifdef _WIN32
-                fprintf(stderr, "[Bridge] recv failed, err=%d n=%d\n",
-                        WSAGetLastError(), n);
+                    fprintf(stderr, "[Bridge] recv failed, err=%d n=%d\n",
+                            WSAGetLastError(), n);
 #else
-                fprintf(stderr, "[Bridge] recv failed, errno=%d n=%d\n",
-                        errno, n);
+                    fprintf(stderr, "[Bridge] recv failed, errno=%d n=%d\n",
+                            errno, n);
 #endif
-                fflush(stderr);
+                    fflush(stderr);
+                }
                 return false;
             }
             buf.append(tmp, static_cast<size_t>(n));
@@ -188,8 +259,9 @@ std::vector<std::byte> string_to_bytes(const std::string& s) {
 // 发送前升级——线程被进程退出强杀时不 unwind，强引用会保活 actor。
 // ------------------------------------------------------------------
 void conn_read_loop(socket_t fd, caf::actor_addr bridge_addr,
-                    caf::actor_addr impl_addr) {
-    LineReader reader{fd, {}};
+                    caf::actor_addr impl_addr,
+                    std::shared_ptr<ActiveConn> active) {
+    LineReader reader{fd, {}, active};
     std::string head;
     while (reader.read_line(head)) {
         // 头部：<KIND> <id> [<status>] <len>\n
@@ -271,67 +343,6 @@ void conn_write_loop(socket_t fd, std::shared_ptr<WriteQueue> wq) {
 }
 
 // ------------------------------------------------------------------
-// 当前活动连接：actor 写 socket 的唯一入口 + 全部资源句柄。
-// 坑 1：若 actor 直接捕获"主 wq"，而写线程消费的是每连接新建的 wq，
-//       则 respond/REQ 全进无人消费的队列 → 外部进程永远等不到响应
-//       （实测：Python 15s 超时、master 跨节点 request_timeout）。
-//       因此 actor 必须经 active->push() 转发到【当前连接】的 wq。
-// 坑 2：detached 线程在进程退出时被强杀不 unwind → 栈上 shared_ptr
-//       不析构 → CRT dump 报泄露（实测 "REQ 53 ..." 残留在 WriteQueue）。
-//       因此线程全部登记到 active，bridge actor exit 时 shutdown_and_join：
-//       close 所有 fd + wq->close() → 线程阻塞点返回 → join → 0 泄露。
-// ------------------------------------------------------------------
-struct ActiveConn {
-    std::mutex m;
-    std::shared_ptr<WriteQueue> wq;
-    socket_t listener = k_invalid_socket;
-    std::vector<socket_t> conns;
-    std::vector<std::thread> threads;
-    bool shutting_down = false;
-
-    void set_listener(socket_t s) {
-        std::lock_guard<std::mutex> g(m);
-        listener = s;
-    }
-    void set_wq(std::shared_ptr<WriteQueue> w) {
-        std::lock_guard<std::mutex> g(m);
-        wq = std::move(w);
-    }
-    void add_conn(socket_t fd) {
-        std::lock_guard<std::mutex> g(m);
-        conns.push_back(fd);
-    }
-    void add_thread(std::thread t) {
-        std::lock_guard<std::mutex> g(m);
-        threads.push_back(std::move(t));
-    }
-    void push(const std::string& line) {
-        std::lock_guard<std::mutex> g(m);
-        if (wq)
-            wq->push(line);
-    }
-    void shutdown_and_join() {
-        std::vector<std::thread> ts;
-        {
-            std::lock_guard<std::mutex> g(m);
-            if (!shutting_down) {
-                shutting_down = true;
-                if (listener != k_invalid_socket)
-                    close_socket(listener);
-                for (auto fd : conns)
-                    close_socket(fd);
-                if (wq)
-                    wq->close();
-            }
-            ts = std::move(threads);
-        }
-        for (auto& t : ts)
-            if (t.joinable())
-                t.join();
-    }
-};
-
-// ------------------------------------------------------------------
 // listener 线程：accept → 每连接一对读写线程；连接 wq 注册给 active
 // ------------------------------------------------------------------
 void listener_loop(socket_t listener, caf::actor_addr bridge_addr,
@@ -342,13 +353,18 @@ void listener_loop(socket_t listener, caf::actor_addr bridge_addr,
     while (true) {
         socket_t fd = accept(listener, nullptr, nullptr);
         if (fd == k_invalid_socket) {
+            // 优雅关闭：shutdown_and_join() close listener 打断阻塞的
+            // accept（WSAEINTR），预期行为，不打噪音；非关闭期的
+            // accept 失败才打（端口耗尽等，调试有用）。
+            if (!active->is_shutting_down()) {
 #ifdef _WIN32
-            fprintf(stderr, "[Bridge] accept failed, err=%d\n",
-                    WSAGetLastError());
+                fprintf(stderr, "[Bridge] accept failed, err=%d\n",
+                        WSAGetLastError());
 #else
-            fprintf(stderr, "[Bridge] accept failed, errno=%d\n", errno);
+                fprintf(stderr, "[Bridge] accept failed, errno=%d\n", errno);
 #endif
-            fflush(stderr);
+                fflush(stderr);
+            }
             break;
         }
         auto wq = std::make_shared<WriteQueue>();
@@ -356,7 +372,7 @@ void listener_loop(socket_t listener, caf::actor_addr bridge_addr,
         active->add_conn(fd);
         active->add_thread(std::thread(conn_write_loop, fd, wq));
         active->add_thread(
-            std::thread(conn_read_loop, fd, bridge_addr, impl_addr));
+            std::thread(conn_read_loop, fd, bridge_addr, impl_addr, active));
     }
     close_socket(listener);
 }
@@ -499,6 +515,14 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
     if (listener == k_invalid_socket) {
         LOG_ERROR("[Bridge] socket() failed, bridge disabled");
         return bridge; // actor 仍在，只是无连接
+    }
+    // SO_REUSEADDR：强杀/崩溃后 TIME_WAIT 残留端口，bind 立即复用。
+    // 否则测试中 Stop-Process 强杀 → 立刻重跑脚本 → WSAEADDRINUSE
+    // （实测：bind/listen on 127.0.0.1:48060 failed）。
+    {
+        int reuse = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&reuse), sizeof(reuse));
     }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

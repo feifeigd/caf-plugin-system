@@ -173,7 +173,7 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // （--test-bridge-call=<节点名>，验证 集群→bridge→外部进程 链路）
     if (!cfg.test_bridge_call.empty() && nb.master) {
         run_bridge_call_test(sys, nb.master, cfg.node_cfg.node_name,
-                             cfg.test_bridge_call);
+                             cfg.test_bridge_call, fw.shutdown_mgr);
     }
 
     // ---- 运维验证后门：远程热更（--test-remote-reload=<node>,<plugin>,<path>）----
