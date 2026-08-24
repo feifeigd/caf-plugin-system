@@ -338,6 +338,10 @@ bool bootstrap_system_components(caf::actor_system& sys,
         out.logging_service, get_stop_order);
     shutdown_manager_ref() = out.shutdown_mgr;
     sys.registry().put("shutdown_mgr", out.shutdown_mgr);
+    // 暴露 ServiceRegistry 句柄：插件可查询服务清单（如 cluster_admin 的
+    // system.services）。与 shutdown_mgr 同款模式（见 plugin_interface.hpp
+    // 的注入说明：sys.registry().get("service_registry")）。
+    sys.registry().put("service_registry", out.registry);
 
     // 保证 Ctrl+C 语义 = 中断信号（QuickEdit 会劫持成复制）
     disable_quick_edit();

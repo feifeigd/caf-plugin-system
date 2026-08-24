@@ -114,7 +114,8 @@ caf::behavior GracefulShutdown::make_behavior() {
     // 逐个停插件的公共流程：resolve -> drain -> save_state -> checkpoint -> shutdown
     auto stop_next = [=, this](const std::string& name) {
         trace_shutdown("stop_next: resolving " + name);
-        self->request(plugin_mgr, caf::infinite, resolve_plugin_atom{}, name)
+        self->request(plugin_mgr, std::chrono::seconds(5),
+                      resolve_plugin_atom{}, name)
             .then([=, this](const caf::actor& actor) {
                 trace_shutdown("stop_next: resolved " + name);
                 if (!actor) {
@@ -147,6 +148,14 @@ caf::behavior GracefulShutdown::make_behavior() {
                             self->send(self, plugin_saved_atom{}, name, false);
                         }
                     );
+            },
+            // resolve 失败/超时也必须推进关机链：plugin_mgr 若已退出或不
+            // 响应，infinite+无 error handler 会让整个关机链永久卡死
+            //（实测：多插件场景卡在 "resolving"，LeakCheck 残留 7-9）。
+            [=, this](const caf::error& e) {
+                trace_shutdown("stop_next: resolve FAILED for " + name
+                               + " (" + caf::to_string(e) + ")");
+                self->send(self, plugin_saved_atom{}, name, false);
             });
     };
 

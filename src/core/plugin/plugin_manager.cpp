@@ -410,6 +410,8 @@ caf::behavior PluginManager::make_behavior() {
 
         [=, this](resolve_plugin_atom, const std::string& name) -> caf::actor {
             auto it = plugins_.find(name);
+            LOG_INFO("[PluginManager] resolve_plugin '{}' -> {}",
+                     name, it != plugins_.end() ? "hit" : "miss");
             return (it != plugins_.end()) ? it->second.actor : caf::actor{};
         },
 

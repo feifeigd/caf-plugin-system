@@ -3,6 +3,7 @@
 #include "common/message_tags.hpp"
 
 #include <caf/io/middleman.hpp>
+#include <caf/actor_registry.hpp>
 #include <caf/logger.hpp>
 
 #include <iostream>
@@ -71,6 +72,10 @@ caf::actor spawn_node_client(caf::actor_system& sys,
         schedule_retry(self, std::chrono::seconds(1));
         return;
       }
+      // 暴露 master 句柄（远程 proxy）：插件可查集群拓扑（如 cluster_admin
+      // 的 system.nodes）。master 节点自身在 cluster/bootstrap.cpp 已 put
+      // 同名 key（本地 actor）；worker/region 在这里 put 远程 proxy。
+      self->system().registry().put("cluster.master", *master);
       node_manifest manifest{cfg.kind, cfg.node_name, cfg.host, cfg.port,
                              cfg.parent, cfg.exported_actors};
       self->request(*master, std::chrono::seconds(5), node_register_atom_v,
