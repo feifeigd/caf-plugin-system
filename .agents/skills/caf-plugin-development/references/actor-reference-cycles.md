@@ -48,13 +48,50 @@ plugin_manager.cpp：
   指针形态 `10 89 A3 C1 FE 7F 00 00`，疑似 registry/静态残留）
 - 优雅关机链完整：Graceful shutdown initiated → All plugins saved → STOPPED，EXIT 0
 
-## 剩余 TODO（完整版清零还需三刀，2026-08-24 未实施）
+## 剩余 TODO（~~完整版清零还需三刀~~ —— 已解决，2026-08-24 后续分析推翻）
 
-1. ops 侧：`ops_actor.cpp:496` 的 `caf::actor shutdown_mgr_;` 同款改瞬时/弱引用
-   （ops 注册进 cluster_ctls_ 形成第二个环）
-2. `GracefulShutdown::finish_shutdown`：quit 前清 `plugin_mgr_/registry_/checkpoint_mgr_/cluster_ctls_`（现从不释放）
-3. `framework_bootstrap.cpp:463` 取消注释 `shutdown_manager_ref() = caf::actor{};`
-   （wait_for 返回后清静态，安全——进程即将退出，handler 不会再触发）
+~~1. ops 侧：`ops_actor.cpp:496` 的 `caf::actor shutdown_mgr_;` 同款改瞬时/弱引用~~
+~~2. `GracefulShutdown::finish_shutdown`：quit 前清 `plugin_mgr_/registry_/checkpoint_mgr_/cluster_ctls_`~~
+~~3. `framework_bootstrap.cpp:463` 取消注释 `shutdown_manager_ref() = caf::actor{};`~~
+
+**不需要了**：正常 return 路径下静态析构（[basic.start.term]）在 CRT dump 前执行，从根
+（`shutdown_manager_ref()` 静态）递归解开整条引用链——实测不手动清任何东西 dump 也 0 块。
+三刀只对 ExitProcess(0) 路径有意义（跳过静态析构），但该路径不触发 dump、无观测价值。
+详见 SKILL.md "函数局部 static caf::actor 不需要手动清空" 条目。
+
+## 跨进程（mesh 网状节点互相调用）——环的边界与句柄缓存纪律（2026-08-24）
+
+**结论：mesh 调用本身不产生泄露；泄露只来自"跨进程持久句柄"被缓存。**
+
+**为什么跨进程无环**：强引用环是**进程内**概念（control block 引用计数）。跨进程调用
+走 BASP 连接 + 消息，不共享 control block——A 调 B、B 调 A 是双向消息流，各自进程内
+没有互相持有的引用，天然无环。与 shutdown_mgr↔plugin_mgr 那种进程内环本质不同。
+
+**泄露形态矩阵**：
+
+| 模式 | 会不会泄露 |
+|---|---|
+| 调用中临时 connect / remote_lookup / request | 不会——异步消息，终态后释放 |
+| 缓存 `actor_route`（纯数据：host/port/actor_name） | 不会——不保活 control block |
+| **缓存 `caf::actor` 强引用**（remote actor 的本地代理 control block） | **会**——remote 死/断连，本地代理块被攥着不释放 |
+| 重试状态机无终态（pending promise 永挂） | 会——promise 回调持有 sender 引用 |
+| middleman 连接池 | 不会——CAF 系统级管理，析构关闭 |
+
+**判据不同**：进程内环是**常量泄露**（对照实验测不出）；mesh 句柄泄露**随节点数/断连
+次数线性增长**——杀节点重启风暴后 dump 涨 = 句柄泄露，恒定 = 干净（可验证，是好事）。
+
+**当前架构安全性**（caf-plugin-system 已满足）：RemoteCaller 缓存路由数据（round-robin
+游标 + healthy 标记），connect/lookup 临时用、用完即弃；cross_call_ex 有界重试有终态
+（全败清缓存报错）。按此纪律 mesh 化不会泄露。
+
+**四条纪律**：
+1. 跨调用长期容器**只存 actor_route 数据**，不存 `caf::actor`
+2. 若必须缓存 remote actor 句柄 → 必须 monitor + down_msg 清理
+3. 重试状态机必须有终态（不留永久 pending promise）
+4. 连接复用交给 middleman，别自建持久连接句柄池
+
+**验证方法**：mesh 冒烟 = 3 节点互调 N 轮 → 关机 dump；再跑"杀节点重启 ×N"风暴 →
+dump 随重启次数线性增长 = 句柄泄露，恒定 = 干净。
 
 ## 排查方法沉淀
 
