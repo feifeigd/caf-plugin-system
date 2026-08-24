@@ -531,17 +531,33 @@ void start_console_thread(caf::actor ops) {
         return;
 #endif
     ops_print("console ready: type 'help' for commands");
-    std::thread([ops = std::move(ops)] {
-        // 关键：绝不能用 scoped_actor——线程阻塞在 getline 等键盘输入，
-        // 其持有的 scoped_actor（本身是 CAF actor）永不退出，actor_system
-        // 析构等它导致进程挂起（quit 能退而 Ctrl+C 卡死的根因之一）。
-        // anon_send 不需要调用者上下文，任意线程安全。
+    // 线程只捕获 actor_addr（弱引用）：线程阻塞在 getline，交互模式下会
+    // 活到进程退出——若捕获强引用 caf::actor，ops 的 control block 被线程
+    // 攥着，关机后也不释放（CRT dump 报泄露）。addr 不保活，ops 死后
+    // anon_send 自动丢弃消息。绝不能用 scoped_actor——线程阻塞在 getline
+    // 等键盘输入，其持有的 scoped_actor（本身是 CAF actor）永不退出，
+    // actor_system 析构等它导致进程挂起（quit 能退而 Ctrl+C 卡死的根因
+    // 之一）。anon_send 不需要调用者上下文，任意线程安全。
+    auto ops_addr = caf::actor_cast<caf::actor_addr>(ops);
+    std::thread([ops_addr] {
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty())
                 continue;
-            caf::anon_send(ops, console_cmd_atom_v, line);
+            // addr 不保活 control block；发送前升级为强引用（get_locked，
+            // actor 已死返回空则跳过）。自由函数 anon_send(addr) 在 CAF 1.1
+            // 编译不过（模板要求 operator->），必须手动升级。
+            auto strong = caf::actor_cast<caf::actor>(ops_addr);
+            if (strong)
+                caf::anon_send(strong, console_cmd_atom_v, line);
+            else
+                break;
         }
+        // 走到这里 = stdin EOF/错误，线程自然结束（唯一自愿退出路径）。
+        // 交互模式（Ctrl+C 关机）永远看不到这行——线程是被进程退出强杀的。
+        // 单次 fprintf 原子写（多线程环境不用 std::cout 链式输出）。
+        fprintf(stderr, "[console] thread exiting (stdin EOF)\n");
+        fflush(stderr);
     }).detach();
 }
 
