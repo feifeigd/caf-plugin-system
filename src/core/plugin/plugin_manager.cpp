@@ -443,7 +443,24 @@ caf::behavior PluginManager::make_behavior() {
             }
             for (auto it = plugins_.begin(); it != plugins_.end(); ++it) {
                 if (it->second.actor->address() == dm.source) {
-                    LOG_ERROR("Plugin crashed: " + it->first);
+                    // 正常退出不是崩溃：优雅关机链就是发 shutdown_atom 让
+                    // 插件 self->quit()（reason=normal），down_msg 到达时
+                    // 插件仍在 plugins_（关机路径不进 retired_），此前一律
+                    // 误报 "Plugin crashed"。真崩溃（handler 抛异常）的
+                    // reason 是 error（如 sec::runtime_error），仍走 ERROR。
+                    // exit_reason 是 CAF 错误码枚举，error 可直接 == 比较。
+                    const bool clean_exit =
+                        dm.reason == caf::exit_reason::normal
+                        || dm.reason == caf::exit_reason::user_shutdown;
+                    if (clean_exit) {
+                        LOG_INFO("Plugin exited (reason="
+                                 + caf::to_string(dm.reason)
+                                 + "): " + it->first);
+                    } else {
+                        LOG_ERROR("Plugin crashed (reason="
+                                  + caf::to_string(dm.reason)
+                                  + "): " + it->first);
+                    }
 
                     for (const auto& svc : it->second.manifest.provides) {
                         self->send(registry_, unregister_atom{}, svc);
