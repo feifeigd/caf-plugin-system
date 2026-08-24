@@ -138,3 +138,6 @@ graph_info.json
 *~
 __pycache__/
 *.pyc
+
+# PlantUML 生成图（.puml 是源码，PNG 用 tools/render_puml.py 随时重生成）
+/docs/bridge-protocol/
