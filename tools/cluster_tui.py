@@ -434,7 +434,11 @@ class ClusterTUI(App):
             svc, payload = parts[1], parts[2]
             self.link.call(svc, parse_payload(payload))
         elif cmd == "call" and len(parts) == 2:
-            self.link.call(parts[1], b"")
+            # call system.ping（无 payload）→ 默认命令名 = system. 去掉前缀，
+            # 否则空 payload 到 cluster_admin 插件报 unknown admin cmd
+            svc = parts[1]
+            default = svc[len("system."):] if svc.startswith("system.") else ""
+            self.link.call(svc, default.encode() if default else b"")
         elif cmd == "callhex" and len(parts) >= 3:
             try:
                 payload = bytes.fromhex(parts[2].replace(" ", ""))

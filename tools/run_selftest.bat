@@ -29,6 +29,6 @@ pause
 exit /b 0
 
 :FAIL
-echo COPY FAILED - build first (cmake --build out/build/windows-x64 --config Debug)
+echo COPY FAILED - exe may be RUNNING (quit TUI / close bridge first) or build missing
 pause
 exit /b 1
