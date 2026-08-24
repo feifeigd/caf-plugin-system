@@ -93,14 +93,22 @@ Release 分支保留 `CAF_MAIN()`。exec_main 支持 int 返回值传播
 （deque 桶）正常 return 时由 static 析构器释放**。即"静态区常驻 ≠ 泄露"。历史结论保留：
 - **时机**：必须 exec_main 返回后（actor 全 join）。caf_main 里调用
   → 插件 actor vtable 在 DLL 代码段 → 0xC0000005。
-- **unload 后必须 ExitProcess(0)**：跳过静态析构阶段，否则 CAF 全局 meta
-  注册表析构调用已卸载 DLL 的函数指针 → 崩。
+- **unload 后必须 ExitProcess(0)**（~~"必须"已被 clear 方案推翻，2026-08-24~~）：跳过静态析构阶段，否则 CAF 全局 meta
+  注册表析构调用已卸载 DLL 的函数指针 → 崩。**准确表述**：不 clear meta 时 unload 才必须
+  ExitProcess；`clear_global_meta_objects()` 之后 unload + 正常 return 实测无 0xC0000005
+  （见下方替代方案节），且保留静态析构 + dump 完整触发，是更干净的选择。
 - **ExitProcess 前必须 flush**：重定向到文件时 stdout 全缓冲，ExitProcess
   不跑 CRT 清理 → spdlog 日志全丢（症状：进程"没跑"其实跑了）。
   ```cpp
   std::cout.flush(); fflush(stdout); ExitProcess(0);
   ```
-- 卸载后 DLL detach 完成，自动 dump 输出干净数字（实测 216 块/20.3KB ≈ 基线）。
+- ~~卸载后 DLL detach 完成，自动 dump 输出干净数字（实测 216 块/20.3KB ≈ 基线）~~
+  **这条记录自相矛盾，不可信（2026-08-24 复核）**：`_CRTDBG_LEAK_CHECK_DF` 的自动 dump
+  是 atexit 注册的，ExitProcess 不跑 atexit → dump 不可能触发。当时的"216 块干净数字"
+  大概率来自非纯 ExitProcess 路径（ExitProcess 前手动 dump），记录未写明。**ExitProcess
+  语义边界**：不执行进程级 CRT 清理链（atexit/stdio flush/静态析构），但**会**通知已加载
+  DLL 的 DLL_PROCESS_DETACH（DLL 侧 detach 处理会跑）——本项目动态 CRT（VS2022+UCRT 22621）
+  实测 stdout 缓冲仍丢，以实测为准。
 
 ## running() 不是 0 的判读
 
