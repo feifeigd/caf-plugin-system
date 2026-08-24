@@ -15,6 +15,7 @@
 行协议（\n 分隔；payload 长度前缀，可含任意字节）：
   外部 → bridge:  CALL <id> <svc> <len>\n<payload>\n
   bridge → 外部:  RESULT <id> OK|ERR <len>\n<payload>\n
+  
   bridge → 外部:  REQ <rid> <len>\n<payload>\n
   外部 → bridge:  RESULT <rid> OK|ERR <len>\n<payload>\n
 """
@@ -23,33 +24,13 @@ import sys
 import threading
 import time
 
-
-class LineReader:
-    def __init__(self, s):
-        self.s = s
-        self.buf = b""
-
-    def read_line(self):
-        while True:
-            i = self.buf.find(b"\n")
-            if i >= 0:
-                line = self.buf[: i + 1]
-                self.buf = self.buf[i + 1 :]
-                return line
-            d = self.s.recv(4096)
-            if not d:
-                return None
-            self.buf += d
-
-    def read_exact(self, n):
-        while len(self.buf) < n:
-            d = self.s.recv(4096)
-            if not d:
-                return None
-            self.buf += d
-        out = self.buf[:n]
-        self.buf = self.buf[n:]
-        return out
+from bridge_proto import (  # noqa: E402
+    BadFrame,
+    LineReader,
+    make_call_frame,
+    make_result_frame,
+    read_frame,
+)
 
 
 class BridgeClient:
@@ -69,13 +50,11 @@ class BridgeClient:
     def _send_call(self, cid, svc, payload):
         # 行协议：CALL <id> <svc> <len>\n<payload>\n（svc 必须带！
         # 之前写成 RESULT 的格式漏了 svc → bridge 解析 sp2=npos 断连）
-        line = f"CALL {cid} {svc} {len(payload)}\n"
-        self.s.sendall(line.encode() + payload + b"\n")
+        self.s.sendall(make_call_frame(cid, svc, payload))
 
     def _send_result(self, rid, ok, payload):
         # 行协议：RESULT <id> OK|ERR <len>\n<payload>\n
-        line = f"RESULT {rid} {'OK' if ok else 'ERR'} {len(payload)}\n"
-        self.s.sendall(line.encode() + payload + b"\n")
+        self.s.sendall(make_result_frame(rid, ok, payload))
 
     def call(self, svc, payload, timeout=15):
         with self.lock:
@@ -95,24 +74,14 @@ class BridgeClient:
     def _reader(self):
         try:
             while True:
-                head = self.reader.read_line()
-                if head is None:
+                try:
+                    fr = read_frame(self.reader)
+                except BadFrame:
+                    continue  # 坏帧跳过（协议异常）
+                if fr is None:
                     print("[client] connection closed by bridge")
                     break
-                head = head.decode("utf-8", "replace").rstrip("\r\n")
-                parts = head.split(" ")
-                if len(parts) < 3:
-                    continue
-                kind, ident = parts[0], parts[1]
-                third = parts[2] if len(parts) > 2 else "" # 第3个参数
-                try:
-                    ln = int(parts[-1]) # 长度
-                except ValueError:
-                    continue
-                payload = self.reader.read_exact(ln)
-                if payload is None:
-                    break
-                self.reader.read_exact(1)  # 行终止符 \n， 跳过<payload>后面那个\n
+                kind, ident, third, payload = fr
                 if kind == "REQ": # bridge → 外部:  REQ <rid> <len>\n<payload>\n
                     # 集群 → 外部：external_echo 的 Python 实现在这
                     body = self.handler(payload.decode("utf-8", "replace"))
