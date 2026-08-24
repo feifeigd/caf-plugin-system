@@ -21,12 +21,6 @@ std::deque<DynamicLibrary>& plugin_lib_pool() {
 }
 } // namespace
 
-// 卸载全部插件库（见头文件注释）。调用时机同样必须晚于所有插件 actor
-// 消亡，否则 vtable/函数指针指向已卸载代码段。
-void unload_all_plugin_libs() {
-    plugin_lib_pool().clear();
-}
-
 PluginManager::PluginManager(caf::actor_config& cfg, caf::actor registry, caf::actor checkpoint_mgr)
     : caf::event_based_actor(cfg), registry_(registry), checkpoint_mgr_(checkpoint_mgr) {}
 
@@ -462,6 +456,29 @@ caf::behavior PluginManager::make_behavior() {
                     break;
                 }
             }
+        },
+
+        // 正常关机路径：插件 actor 的 down_msg 与本 actor 的 exit_msg 来自
+        // 不同 sender，无顺序保证——finish_shutdown 的 send_exit 先到时
+        // down_msg 被丢弃，create_plugin() 的实例（8B 纯 vtable 对象）永不
+        // destroy → CRT dump 报 8 字节泄露。exit 时兜底销毁全部实例
+        //（down_msg 路径已 erase 的不会重复销毁）。
+        [=, this](caf::exit_msg& em) {
+            for (auto& kv : plugins_) {
+                auto& lp = kv.second;
+                if (lp.destroy) {
+                    LOG_INFO("Destroying plugin instance on shutdown: "
+                             + kv.first);
+                    lp.destroy(lp.instance);
+                }
+            }
+            plugins_.clear();
+            for (auto& rit : retired_) {
+                if (rit.destroy)
+                    rit.destroy(rit.instance);
+            }
+            retired_.clear();
+            self->quit(em.reason);
         }
     };
 }

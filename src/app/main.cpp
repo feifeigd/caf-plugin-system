@@ -17,8 +17,6 @@
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
 #include "common/message_tags.hpp"
-#include "plugin/plugin_loader.hpp"  // unload_all_meta_libs
-#include "plugin/plugin_manager.hpp" // unload_all_plugin_libs
 
 #ifdef _WIN32
 #include <windows.h> // ExitProcess（DLL 池卸载后跳过静态析构阶段）
