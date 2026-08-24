@@ -226,6 +226,36 @@ down_msg 与 monitor 自己的 exit 竞态。凡是被 monitor 的 actor 有配�
 句柄），monitor 必须 exit_msg 兜底。**验证**：--test-ctrl-c 与冒烟全量（含热更新
 v2）均 0 泄露，EXIT=0，无残留 actor。战果：205 块/19.8KB → 1 块/8B → **0 块/0B**。
 
+## 集群模式泄露测试（2026-08-24 实测：master+worker 双进程 0 泄露）
+
+**目标**：验证双进程集群（middleman/BASP/注册表/心跳/monitor down 感知）生命周期无泄露。判据同单进程：两边 CRT dump 均为 0（无 "Detected memory leaks"）+ EXIT 0。
+
+**核心难点**：`--test-ctrl-c` / `--test-auto-shutdown` 都是写死 delayed 2s 关机——master 必须活着等 worker 注册，2s 窗口必错过（worker 启动要 ~3.3s：exe 加载 + 插件 + checkpoint restore）。
+
+**正确姿势（实测通过）**：
+
+```bash
+# master：cmd 括号子进程延迟 EOF——app 立即启动，60s 后 ping 结束 echo x → EOF → watchdog 优雅关机
+cmd.exe /c "(ping -n 61 127.0.0.1 >nul & echo x) | caf_plugin_app.exe \
+  --caf-plugin-system.node-kind=master --caf-plugin-system.node-name=master \
+  --caf-plugin-system.node-port=47000 --caf-plugin-system.lease-seconds=6"
+
+# worker：独立 run_worker/ 目录（防 checkpoints 双写冲突），test-ctrl-c 2s 自关
+cd run_worker && ./caf_plugin_app.exe --caf-plugin-system.node-kind=worker \
+  --caf-plugin-system.node-name=worker-a --caf-plugin-system.node-port=47001 \
+  --caf-plugin-system.master-port=47000 --caf-plugin-system.parent=master \
+  --caf-plugin-system.lease-seconds=6 --caf-plugin-system.test-ctrl-c=true < /dev/null
+```
+
+**验证证据**：worker `[NodeClient:worker-a] register: OK` + master `[ClusterMaster] registered node 'worker-a'` → worker 退出 → master `node 'worker-a' went down`（跨进程 monitor 实时感知）= 真集群交互。两边 EXIT 0 + dump 0 = 通过。
+
+**踩坑（都实测过）**：
+1. **cmd `&` 是顺序执行**：`ping -n 61 >nul & echo x | app` 会让 **app 延迟 60s 才启动**（管道整体在 ping 之后）→ worker 先到必连不上。**必须括号**：`(ping & echo x) | app`（括号子进程组作为管道左侧，app 立即启动）。
+2. **WSL interop 下 FIFO 的 EOF 传不到 exe**：`< /tmp/fifo` 时 bash 持有 pipe 写端，FIFO 写端全关 ≠ exe 的 stdin EOF → watchdog 永远不触发。**只能用 Windows 侧管道**（cmd 的 `|`）控制 EOF。
+3. **两个进程共享 run/ 会并发写 checkpoints/ 与 updates/**：MSVC ofstream 并发写同一文件会失败/阻塞（shutdown-trace.log 同款坑）→ worker 必须独立目录（`cp -r run run_worker` + 删日志/checkpoints）。
+4. **残留进程并发写同一日志文件 → stdout 行粘连**（`[14:04:36] Graceful...registr[14:05:08] Graceful...` 挤一行）：看着像"卡 32s"实为两个 master 进程（前一个延迟启动版 + 正式版）并发写 master_out.log。**启动新测试前先确认旧 master 进程已退**（`tasklist | findstr caf_plugin_app` 应为空），否则误判。判据：shutdown-trace.log 只有一条完整链 = 正式进程正常；粘连行归属用 trace 时间戳对不上 = 残留进程。
+5. worker `--test-ctrl-c` 用 `< /dev/null` 没问题（test 后门触发关机，watchdog 挂起无妨）；`echo hello |` 会立即 EOF 触发 watchdog 抢跑（注册窗口没了）。
+
 ## 用户信任工作流（重要）
 
 用户对"无泄露"结论持怀疑时会亲自验证。正确应对：给**可复现的命令** +

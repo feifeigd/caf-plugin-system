@@ -102,6 +102,7 @@ vcpkg_installed/
 
 # 手工组装的运行目录（exe + DLL + plugins/ + updates/ + checkpoints/ + 日志）
 /run/
+run_worker/
 
 # 测试生成的检查点文件
 /checkpoints/
