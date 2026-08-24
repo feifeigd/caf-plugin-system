@@ -10,6 +10,7 @@
 
 #include <caf/all.hpp>
 #include <caf/logger.hpp>
+#include <caf/actor_registry.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -300,9 +301,7 @@ framework_config::framework_config() {
         .add(test_quit, "test-quit",
              "trigger ops quit after startup (verify graceful shutdown, process must exit 0)")
         .add(test_ctrl_c, "test-ctrl-c",
-             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)")
-        .add(test_unload_dlls, "test-unload-dlls",
-             "unload all plugin/meta DLL pools before CRT leak dump (leak test)");
+             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,
@@ -334,6 +333,7 @@ bool bootstrap_system_components(caf::actor_system& sys,
         ShutdownConfig{}, out.plugin_mgr, out.registry, out.checkpoint_mgr,
         out.logging_service, get_stop_order);
     shutdown_manager_ref() = out.shutdown_mgr;
+    sys.registry().put("shutdown_mgr", out.shutdown_mgr);
 
     // 保证 Ctrl+C 语义 = 中断信号（QuickEdit 会劫持成复制）
     disable_quick_edit();
@@ -345,9 +345,6 @@ bool bootstrap_system_components(caf::actor_system& sys,
 #endif
 
     caf::scoped_actor self{sys};
-
-    // 让 PluginManager 知道谁是关机总管，以便插件请求关机时转发
-    self->send(out.plugin_mgr, shutdown_atom{}, out.shutdown_mgr);
 
     // 核心内置服务注册：插件 manifest 依赖可直接引用 logging_service。
     // ServiceRegistry 会为它建 proxy + 镜像到 CAF sys.registry()，

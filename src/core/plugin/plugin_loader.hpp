@@ -25,9 +25,9 @@ std::optional<PluginInfo> probe_plugin(const std::filesystem::path& path);
 // 含有该导出的 DLL 会常驻进程（元对象函数指针指向 DLL 代码段）。
 void preregister_plugin_meta(const std::filesystem::path& root);
 
-// 卸载全部 meta 探测库（泄露测试专用后门：DLL_PROCESS_DETACH 析构 DLL
-// 静态对象，让 CRT 报告区分"DLL 常驻分配"与"真泄露"。必须在所有 actor
-// 死光后调用，否则元对象函数指针会指向已卸载代码段）。
+// 卸载全部 meta 探测库（FreeLibrary → DLL detach 析构 DLL 静态对象）。
+// 调用时机必须晚于所有 actor 消亡（关机链完成、actor_system 析构后），
+// 否则元对象函数指针会指向已卸载代码段。
 void unload_all_meta_libs();
 
 // 扫描插件目录，预加载所有插件获取 manifest

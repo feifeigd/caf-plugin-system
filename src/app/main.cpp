@@ -5,8 +5,10 @@
 #include <caf/logger.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "framework_bootstrap.hpp"
@@ -15,10 +17,9 @@
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
 #include "common/message_tags.hpp"
-#include "plugin/plugin_loader.hpp"
-#include "plugin/plugin_manager.hpp"
+#include "plugin/plugin_loader.hpp"  // unload_all_meta_libs
+#include "plugin/plugin_manager.hpp" // unload_all_plugin_libs
 
-#include <cstdlib>   // std::atexit
 #ifdef _WIN32
 #include <windows.h> // ExitProcess（DLL 池卸载后跳过静态析构阶段）
 #endif
@@ -57,53 +58,15 @@ struct app_config : framework_config {
 // ------------------------------------------------------------------
 
 int caf_main(caf::actor_system& sys, const app_config& cfg) {
+    #ifdef _DEBUG
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);  // 在控制台打印内存泄漏
+    #endif
+
     // 构建标识：双击测试时一眼确认 exe 新旧（旧实例窗口不会随代码更新）
     std::cout << "[App] caf_plugin_app build " << __DATE__ << " " << __TIME__
               << std::endl;
-
-#ifdef _DEBUG
-    // 泄露检测（Debug 专用，随 --test-ctrl-c / --test-auto-shutdown 后门启用，
-    // 日常运行不打扰）：
-    // _CRTDBG_LEAK_CHECK_DF 让 CRT 在进程退出（正常 return 路径，
-    // actor_system 析构之后）自动输出泄露报告；报告路由到 stderr 便于捕获。
-    // 注意：点 X 路径走 ExitProcess(0) 不经 CRT 终止流程，dump 不触发——\
-    // 优雅路径（Ctrl+C / --test-ctrl-c）才是泄露检测的有效样本。
-    // 判读：泄露字节数与活动量无关（有效对照实测：普通版与冒烟全量版
-    // 均为 206 块/19857B——冒烟测试的额外 actor/请求/热更新零额外泄露）
-    // = 进程生命周期静态分配（CAF meta 注册表/插件 meta/spdlog），非真泄露。
-    // 初始化放 try 外：主体异常时 dump 也必须触发（见下方 try 说明）。
-    if (cfg.test_ctrl_c || cfg.test_auto_shutdown || cfg.test_unload_dlls) {
-        _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-        _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
-        _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
-    }
-#endif
-
-    // ---- 泄露测试后门：卸载全部 DLL 池再 dump（--test-unload-dlls）----
-    // atexit 在 main 返回后执行——此时 actor_system 已析构（join 全部 actor）、
-    // 关机链已完成，没有任何代码还指向插件 DLL。清池（FreeLibrary → DLL
-    // detach 析构 DLL 静态对象）后不手动 dump——ExitProcess 会走完剩余
-    // detach，_CRTDBG_LEAK_CHECK_DF 的自动 dump 在 detach 完成后输出
-    // 干净数字（实测：卸载后 207 块/19873B ≈ 基线 206 块/19857B）。
-    // ExitProcess(0) 同时跳过静态析构阶段——CAF 全局 meta 注册表析构会
-    // 调用已卸载 DLL 的元对象函数指针（0xC0000005），必须不碰它。
-    if (cfg.test_unload_dlls) {
-        std::atexit([] {
-            std::cout << "[LeakCheck] unloading all DLL pools..." << std::endl;
-            unload_all_meta_libs();
-            unload_all_plugin_libs();
-            ExitProcess(0);
-        });
-    }
-
-    // ---- 主体包 try：任何未捕获异常 → FATAL → return 1 ----
-    // 意图：异常绝不能绕过析构链/泄露检测。actor_system 是 exec_main 的栈
-    // 对象——只要 caf_main 正常返回（含 catch 后返回），exec_main 就正常
-    // 收尾：actor_system 析构 join 全部存活 actor（有残留则挂死=泄露信号），
-    // main 正常返回后 CRT dump 触发（_CRTDBG_LEAK_CHECK_DF）。未捕获异常
-    // 会冒泡到 main → terminate/abort，析构与 dump 全部跳过（检测失效）。
-    // 退出码语义：正常 0；异常 1（exec_main 支持 int 返回值传播）。
-    try {
     // ---- 系统级组件引导（任何进程都执行）----
     // registry/checkpoint_mgr/plugin_mgr/shutdown_mgr 是系统组件，必然存在；
     // 节点模式同样依赖它们（exported_actors 收集、shutdown_mgr 作 monitor）。
@@ -174,7 +137,7 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
             sys,
             cfg.node_cfg.node_name.empty() ? "standalone"
                                            : cfg.node_cfg.node_name,
-            fw.plugin_mgr, nb.master, fw.shutdown_mgr);
+            fw.plugin_mgr, nb.master);
         sys.registry().put("ops", ops);
         // ops 注册给 shutdown_mgr 统一终止：Ctrl+C 等直接 shutdown_atom
         // 的路径不经 ops，若 ops 不退出，actor_system 析构会等它永久挂起
@@ -245,7 +208,7 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // ---- 运维验证后门：模拟 Ctrl+C（--test-ctrl-c，任何模式）----
     // 直接发 shutdown_atom 给 shutdown_mgr（不经 ops），等价 Ctrl+C 的
     // console_handler 路径；验证 ops 注册给 shutdown_mgr 后也能自然退出。
-    if (cfg.test_ctrl_c || cfg.test_unload_dlls) {
+    if (cfg.test_ctrl_c) {
         std::cout << "[OpsTest] simulating Ctrl+C (direct shutdown_atom, delayed 2s)"
                   << std::endl;
         caf::scoped_actor self{sys};
@@ -261,26 +224,23 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // main 只等它退出——进程必须自己自然退出，不许外部强杀。
     wait_for_shutdown(sys, fw);
 
-    // ---- 关机泄露诊断（随 --test-ctrl-c / --test-auto-shutdown 启用）----
+    // current_logger() = caf::actor{};
+
+    // ---- 关机泄露诊断 ----
     // actor_system 析构会 join 所有存活 actor——若有 actor 不退出，进程会
-    // 挂死在析构（EXIT 非 0 或超时）。running() 是关机链走完后仍存活的
-    // actor 数：跨多次关机必须恒定（实测 7↔8，是 send_exit 异步排空的
-    // 时序抖动而非累积；不增长 = 无 actor 泄露）。
-    if (cfg.test_ctrl_c || cfg.test_auto_shutdown) {
-        auto remaining = sys.registry().running();
+    // 挂死在析构（EXIT 非 0 或超时）。running() 是关机链走完后仍存活的 actor 数
+    // 给 send_exit 异步排空留时间：等 200ms 后组件逐个退完，数字趋近 0
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto remaining = sys.registry().running();
+    if (remaining > 0) {
         std::cout << "[LeakCheck] actors remaining after shutdown: " << remaining
                   << std::endl;
     }
+
+    std::cout.flush();
+    fflush(stdout);
+
     return 0;
-    } catch (const std::exception& e) {
-        // FATAL 走 stderr：与 CRT dump 同流，异常路径下泄露报告紧随其后
-        std::cerr << "[FATAL] unhandled exception: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "[FATAL] unknown exception" << std::endl;
-    }
-    // 异常路径：非 0 退出码 + 正常 return → actor_system 析构 join 全部
-    // actor + CRT dump 照常触发（未捕获异常会 terminate 跳过这一切）。
-    return 1;
 }
 
 CAF_MAIN()

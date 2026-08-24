@@ -9,6 +9,7 @@
 #include "services/logging_service.hpp"
 
 #include <caf/actor_cast.hpp>
+#include <caf/actor_registry.hpp> // registry() 完整定义（pimpl，all.hpp 不含）
 #include <caf/all.hpp>
 #include <caf/io/middleman.hpp>
 
@@ -150,12 +151,11 @@ class OpsActor : public caf::event_based_actor {
 public:
     OpsActor(caf::actor_config& cfg, std::string node_name,
              caf::actor plugin_mgr, caf::actor master_registry,
-             caf::actor shutdown_mgr, std::string updates_dir)
+             std::string updates_dir)
         : event_based_actor(cfg),
           node_name_(std::move(node_name)),
           plugin_mgr_(std::move(plugin_mgr)),
           master_registry_(std::move(master_registry)),
-          shutdown_mgr_(std::move(shutdown_mgr)),
           updates_dir_(std::move(updates_dir)) {}
 
     caf::behavior make_behavior() override {
@@ -212,8 +212,14 @@ private:
             // 杀组件（plugin_mgr/registry/checkpoint）——main 只等它退出。
             // ops 自己立即退出：main return 后 actor_system 析构会等常驻
             // actor，ops 不退则进程永不退出（quit 卡死根因之一）。
-            if (shutdown_mgr_)
-                caf::anon_send(shutdown_mgr_, shutdown_atom{});
+            // 不能存 shutdown_mgr 成员：ops 注册进 shutdown_mgr 的
+            // cluster_ctls_（register_cluster_atom），回存强引用形成环
+            // （两个 control block 互相保活 → 进程退出不释放 → dump 报
+            // "泄露"）。每次 quit 从 registry 瞬时查找，发送即弃。
+            auto shutdown_mgr = caf::actor_cast<caf::actor>(
+                system().registry().get("shutdown_mgr"));
+            if (shutdown_mgr)
+                caf::anon_send(shutdown_mgr, shutdown_atom{});
             this->quit();
         } else {
             ops_print("unknown command: " + cmd);
@@ -493,7 +499,6 @@ private:
     std::string node_name_;
     caf::actor plugin_mgr_;
     caf::actor master_registry_;
-    caf::actor shutdown_mgr_;
     std::string updates_dir_;
 };
 
@@ -501,10 +506,9 @@ private:
 
 caf::actor spawn_ops_actor(caf::actor_system& sys, std::string node_name,
                            caf::actor plugin_mgr, caf::actor master_registry,
-                           caf::actor shutdown_mgr, std::string updates_dir) {
+                           std::string updates_dir) {
     return sys.spawn<OpsActor>(std::move(node_name), std::move(plugin_mgr),
                                std::move(master_registry),
-                               std::move(shutdown_mgr),
                                std::move(updates_dir));
 }
 

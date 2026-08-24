@@ -35,12 +35,13 @@ namespace caf_plugin_system { namespace cluster {
 /// @param plugin_mgr       PluginManager actor（纯节点进程传空 actor）
 /// @param master_registry  master 注册表 actor（仅 master 进程非空；
 ///                         reload-node / nodes 命令需要它）
-/// @param shutdown_mgr     quit 命令的关机目标（必须传 shutdown_mgr：
-///                         关机统一由它处理——停插件 + 集群 + 组件）
 /// @param updates_dir      字节流推送的落盘根目录（默认 ./updates）
+/// 注意：不传 shutdown_mgr——ops 注册进 shutdown_mgr 的 cluster_ctls_
+/// （register_cluster_atom），若再存 shutdown_mgr 强引用成员会形成环
+/// （control block 互相保活，进程退出不释放）。quit 命令需要时从
+/// registry 瞬时查找（见 ops_actor.cpp quit handler）。
 caf::actor spawn_ops_actor(caf::actor_system& sys, std::string node_name,
                            caf::actor plugin_mgr, caf::actor master_registry,
-                           caf::actor shutdown_mgr,
                            std::string updates_dir = "./updates");
 
 /// 启动 stdin 控制台线程：读取命令行 → anon_send console_cmd_atom。

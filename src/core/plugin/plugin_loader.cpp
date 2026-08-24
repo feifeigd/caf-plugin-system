@@ -17,9 +17,9 @@ std::deque<DynamicLibrary>& meta_lib_pool() {
 }
 } // namespace
 
-// 泄露测试专用：卸载全部 meta 探测库（FreeLibrary 触发 DLL_PROCESS_DETACH，
-// 析构 DLL 内静态对象）。调用时机必须晚于所有 actor 消亡（关机链完成、
-// actor_system 析构后），否则 meta 函数指针会指向已卸载代码段。
+// 卸载全部 meta 探测库（FreeLibrary 触发 DLL_PROCESS_DETACH，析构 DLL 内
+// 静态对象）。调用时机必须晚于所有 actor 消亡（关机链完成、actor_system
+// 析构后），否则 meta 函数指针会指向已卸载代码段。
 void unload_all_meta_libs() {
     meta_lib_pool().clear();
 }

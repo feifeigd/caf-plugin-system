@@ -18,8 +18,11 @@ caf::actor spawn_logging_service(caf::actor_system& sys) {
         return current_logger();
 
     // spdlog sinks：console（stdout 颜色）+ 文件（logs/app.log，每次启动重写）。
-    // spdlog 以共享 DLL 链接，sinks 跨 DLL 可共享（插件若直接 spdlog::get
-    // 也能拿到同名 logger——见 services/logging_service.hpp 的契约）。
+    // sinks 归本日志服务 actor 独占，跨模块（exe / 各插件 DLL）共享走 actor
+    // 路径——各模块 current_logger() 都指向它、发 log_atom（契约见
+    // services/logging_service.hpp："写日志只有一个地方"）。logger 用
+    // make_shared 直建、存 logger_cache，不注册进 spdlog 全局 registry：
+    // 插件 spdlog::get(name) 会拿空，绕过 actor 直写 sink 违反契约。
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     auto file_sink    = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
         "logs/app.log", true);

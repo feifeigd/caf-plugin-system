@@ -1,6 +1,9 @@
 #include "plugin_manager.hpp"
 #include "checkpoint_manager.hpp"
 #include "services/logging_service.hpp"
+
+#include <caf/actor_registry.hpp>
+
 #include <deque>
 #include <vector>
 #include <iostream>
@@ -18,8 +21,8 @@ std::deque<DynamicLibrary>& plugin_lib_pool() {
 }
 } // namespace
 
-// 泄露测试专用：卸载全部插件库（见头文件注释）。调用时机同样必须晚于
-// 所有插件 actor 消亡，否则 vtable/函数指针指向已卸载代码段。
+// 卸载全部插件库（见头文件注释）。调用时机同样必须晚于所有插件 actor
+// 消亡，否则 vtable/函数指针指向已卸载代码段。
 void unload_all_plugin_libs() {
     plugin_lib_pool().clear();
 }
@@ -416,15 +419,17 @@ caf::behavior PluginManager::make_behavior() {
             return (it != plugins_.end()) ? it->second.actor : caf::actor{};
         },
 
-        [=, this](shutdown_atom, caf::actor mgr) {
-            shutdown_mgr_ = mgr;
-            LOG_INFO("Shutdown manager registered");
-        },
-
+        // 插件请求关机（business 插件的 "shutdown" 命令触发）。不能把
+        // shutdown_mgr 存成成员：GracefulShutdown 构造时持有 plugin_mgr_
+        // 强引用，这里回存 shutdown_mgr_ 会形成强引用环（两个 actor 的
+        // control block 互相保活，进程退出也不释放，CRT dump 报"泄露"）。
+        // 用 registry 瞬时查找，发送即弃，不保留任何引用。
         [=, this](request_shutdown_atom) {
-            if (shutdown_mgr_) {
+            auto shutdown_mgr = caf::actor_cast<caf::actor>(
+                self->system().registry().get("shutdown_mgr"));
+            if (shutdown_mgr) {
                 LOG_INFO("Forwarding shutdown request to GracefulShutdown");
-                self->send(shutdown_mgr_, shutdown_atom{});
+                self->send(shutdown_mgr, shutdown_atom{});
             } else {
                 LOG_ERROR("Shutdown manager not set");
             }

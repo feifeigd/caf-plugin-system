@@ -67,9 +67,6 @@ struct framework_config : caf::actor_system_config {
     /// 运维验证后门：启动后直接发 shutdown_atom 给 shutdown_mgr
     /// （模拟 Ctrl+C 路径——不经 ops，验证 ops 注册后也能自然退出）
     bool test_ctrl_c = false;
-    /// 泄露测试后门：关机链完成后卸载全部插件/meta DLL 池再 dump
-    /// （区分"DLL 常驻分配"与真泄露；atexit 里清池+手动 dump+ExitProcess）
-    bool test_unload_dlls = false;
 
     framework_config();
 };

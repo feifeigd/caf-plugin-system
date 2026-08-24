@@ -24,8 +24,9 @@ struct LoadedPlugin {
     DestroyPluginFunc destroy = nullptr;
 };
 
-// 卸载全部插件库（泄露测试专用后门：与 unload_all_meta_libs 同目的。
-// 必须在所有插件 actor 死光（关机链完成）后调用）。
+// 卸载全部插件库（与 unload_all_meta_libs 同目的：泄露测试时在 actor_system
+// 析构后调用，让 DLL 静态对象随 detach 释放）。调用时机必须晚于所有插件
+// actor 消亡，否则 vtable/函数指针指向已卸载代码段。
 void unload_all_plugin_libs();
 
 class PluginManager : public caf::event_based_actor {
@@ -37,7 +38,6 @@ public:
 private:
     caf::actor registry_;
     caf::actor checkpoint_mgr_;
-    caf::actor shutdown_mgr_;
     DependencyGraph dep_graph_;
     std::map<std::string, LoadedPlugin> plugins_;
     // 热更新退役的旧实例：等旧 actor 排空退出（down_msg）后再销毁。
