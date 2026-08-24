@@ -94,6 +94,23 @@ python.exe tools\bridge_client.py 127.0.0.1 48060
     测试用 Windows 侧进程（python.exe 由 cmd 启动）连 127.0.0.1。
 11. **cmd 括号管道偶发延迟启动**：`(ping & echo x) | app` 在部分轮次
     app 延迟 ~160s（ping 结束后才启动）——用 180s+ 窗口兜底，别用 90s。
+12. **增量构建漏编坑**：cmake --build 增量构建只重编时间戳变化的文件——
+    若 touch 的不是 bridge_actor.cpp，exe 还是旧代码（实测：sin_port 修复
+    不在 exe 里 → 日志 INFO 打 48060 但 netstat 查无此端口 → 实际 bind 随机
+    端口 39461 被 Windows python 连上抓现行）。**验证 exe 用行为特征**
+    （监听端口、日志行号——日志 `bridge_actor.cpp:398` vs 工作区 517 行
+    立刻暴露版本差异），别信 strings。改 bridge 代码后必须 touch 它本身。
+13. **test-bridge-call 关机竞态**：run_bridge_call_test 的 60×4s 重试循环
+    最长 4 分钟——无外部客户端在线时 REQ 永远 timeout，循环跑满撞上
+    EOF 关机 → send_exit 发晚了 → RemoteCaller 残活 → actor_system 析构
+    join 挂起（LeakCheck actors remaining: 1，进程 STOPPED 后卡死）。
+    修复：caller 注册给 shutdown_mgr（register_cluster_atom），关机链
+    统一 send_exit → request 立即失败 → 循环快速退出。run8 没踩是时序
+    侥幸（master 先退时 bridge 还活着）。
+14. **强杀后 TIME_WAIT 端口 bind 失败**：测试中 Stop-Process 强杀 →
+    端口 TIME_WAIT → 立刻重跑脚本 → bind/listen failed (WSAEADDRINUSE)。
+    修复：bind 前 `setsockopt(SO_REUSEADDR)`（实测：强杀→立即重启
+    bind 正常）。优雅退出（graceful）不会留 TIME_WAIT，但测试强杀难免。
 
 ## 线程模型（v1 单连接语义）
 
@@ -102,3 +119,22 @@ python.exe tools\bridge_client.py 127.0.0.1 48060
   （捕获 actor_addr 弱引用，发送前升级——线程强杀不保活 actor）
 - 写线程：pop 连接 wq → send_all（actor 经 active->push 入队）
 - bridge actor exit：send_exit(impl) → active->shutdown_and_join() → quit
+
+## TUI 控制台（tools/cluster_tui.py，Textual）
+
+- 蓝紫科技风交互控制台：连接面板 + 服务统计 + 彩色帧日志 + 底部命令栏
+- 任意协议：`call <svc> <payload>` 发任意 CALL（payload 原样透传）
+- 集群→外部 REQ 自动 echo（`auto-reply off` 可关）
+- 交互模式：`python.exe tools\cluster_tui.py [host] [port]`
+- 无头自测：`python.exe tools\cluster_tui.py --selftest [host] [port]`
+  （connect → CALL OK 路径 → CALL ERR 路径 → REQ 自动回复断言，exit 0/1）
+- 依赖：`pip install textual`（Windows Python314 已装 8.2.8）
+- 注意：bridge v1 单连接语义——TUI + 其他外部节点不能同时在线；
+  多客户端需 bridge v2（per-conn wq + 连接表，ActiveConn 的 conns 已留）
+
+## CAF 连接数（实测结论）
+
+- CAF 无内置连接上限（grep vcpkg 头文件无 max_connections 常量）
+- 每连接 = 一个 scribe actor（broker 体系），N 连接 = N actor，受内存/scheduler 约束
+- 瓶颈在 OS：Windows 句柄默认 16K 可调；Linux ulimit -n（默认 1024）
+- bridge v1 单连接是**设计约束**（ActiveConn 单 wq），不是 CAF 限制
