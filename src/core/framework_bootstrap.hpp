@@ -67,6 +67,13 @@ struct framework_config : caf::actor_system_config {
     /// 运维验证后门：启动后直接发 shutdown_atom 给 shutdown_mgr
     /// （模拟 Ctrl+C 路径——不经 ops，验证 ops 注册后也能自然退出）
     bool test_ctrl_c = false;
+    /// bridge 模式：外部语言节点（Python/Go）sidecar 的本地 TCP 监听端口
+    ///（0 = 禁用）。bridge 以正常集群节点身份注册，external_echo 服务
+    /// 的 handler 在外部进程（行协议，见 src/core/bridge_actor.hpp）。
+    std::uint16_t bridge_port = 0;
+    /// 集群验证后门：master 延迟后跨节点调用指定节点的 external_echo
+    ///（--test-bridge-call=<节点名>，验证集群→外部进程链路）。
+    std::string test_bridge_call;
 
     framework_config();
 };

@@ -16,6 +16,7 @@
 #include "app_tests.hpp"
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
+#include "bridge_actor.hpp"
 #include "common/message_tags.hpp"
 
 #ifdef _WIN32
@@ -93,6 +94,19 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // 注：日志无注入环节——logging_service 是系统组件，bootstrap_system_components
     // 最先 spawn 时即成为唯一日志入口（log_info/log_error，见 logging_service.hpp）。
 
+    // ---- 外部语言节点 sidecar（--caf-plugin-system.bridge-port>0）----
+    // 必须在节点引导【之前】spawn：bootstrap_node 的 exported_actors 收集
+    // 只查一次，bridge 的 external_echo 若注册晚了，manifest 上报不含它，
+    // master 路由查不到（no_such_key）。注册给 shutdown_mgr 统一终止。
+    if (cfg.bridge_port > 0) {
+        auto bridge = spawn_bridge_actor(
+            sys, fw.registry, cfg.bridge_port,
+            cfg.node_cfg.node_name.empty() ? "standalone"
+                                           : cfg.node_cfg.node_name);
+        caf::scoped_actor self{sys};
+        self->send(fw.shutdown_mgr, register_cluster_atom_v, bridge);
+    }
+
     // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
     // 单节点（纯插件）与集群节点（含插件）都经此路径，正交组合。
     cluster::BootstrapResult nb;
@@ -154,6 +168,12 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     if (!cfg.test_cross_call_ex.empty() && nb.master) {
         run_cross_call_ex_test(sys, nb.master, cfg.node_cfg.node_name,
                                cfg.test_cross_call_ex);
+    }
+    // ---- bridge 验证后门：跨节点调外部节点 external_echo ----
+    // （--test-bridge-call=<节点名>，验证 集群→bridge→外部进程 链路）
+    if (!cfg.test_bridge_call.empty() && nb.master) {
+        run_bridge_call_test(sys, nb.master, cfg.node_cfg.node_name,
+                             cfg.test_bridge_call);
     }
 
     // ---- 运维验证后门：远程热更（--test-remote-reload=<node>,<plugin>,<path>）----

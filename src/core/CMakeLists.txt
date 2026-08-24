@@ -21,6 +21,8 @@ add_library(caf_plugin_core STATIC
     cluster/bootstrap.cpp
     cluster/remote_caller.cpp
     cluster/ops_actor.cpp
+    # ---- bridge（外部语言节点 sidecar）----
+    bridge_actor.cpp
 )
 
 target_include_directories(caf_plugin_core PUBLIC

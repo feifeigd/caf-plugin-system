@@ -194,6 +194,7 @@ return caf::behavior{business.or_else(plugin_lifecycle(self, hooks))};
 - `references/logging-system.md` — **日志体系重构（2026-08-23）**：logging_service 系统组件 + 单头宏日志（每模块单例 current_logger、LOG_* 宏带行号、LOG_FROM 关机 FIFO、核心内置服务依赖解析）、插件迁移步骤、全部编译坑（fmt v12 C7595 / 宏不可限定 / spdlog pattern_formatter include / sed 行号漂移）。
 - `references/crt-leak-detection.md` — **CRT 泄露检测深潜（2026-08-24）**：MSVC 退出时序（静态析构→atexit dump）、全量 dump / checkpoint diff / MAP_ALLOC 三层方法、_CRTDBG_MAP_ALLOC 双坑（CONFIG 表达式 + /FIcrtdbg.h）、自定义 main 替代 CAF_MAIN、unload DLL 池时机 + ExitProcess + flush、running() 归零验证、用户信任工作流、**集群模式泄露测试（2026-08-24：master 延迟 EOF 管道 `(ping & echo x) | app` + run_worker 隔离 + cmd & 顺序执行/WSL FIFO EOF 不通两个坑）**。
 - `references/actor-reference-cycles.md` — **强引用环破案（2026-08-24）**：shutdown_mgr↔plugin_mgr/ops/master 环图与赋值路径、CAF"终止≠control block 释放"语义、plugin_mgr 侧修复（删死 handler + request_shutdown_atom 改瞬时查找）、隔离验证（205→1 块）、剩余三刀 TODO。
+- `references/bridge-sidecar.md` — **外部语言节点 sidecar（2026-08-24）**：Python/Go 经本地 TCP 行协议接入集群（方案 B）、行协议格式、双向链路验证命令（run8 全绿）、11 个实测坑（ActiveConn 写队列转发、sin_port 遗漏、线程 join 防 dump 泄露、exported_actors 竞态、ACL、WSL→Windows 连接）。
 
 ### 运维功能（OpsActor）— master 远程热更 + 每节点本地控制台（2026-08 实施）
 

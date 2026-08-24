@@ -301,7 +301,11 @@ framework_config::framework_config() {
         .add(test_quit, "test-quit",
              "trigger ops quit after startup (verify graceful shutdown, process must exit 0)")
         .add(test_ctrl_c, "test-ctrl-c",
-             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)");
+             "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)")
+        .add(bridge_port, "bridge-port",
+             "bridge sidecar TCP port for external-language nodes (0 = disabled)")
+        .add(test_bridge_call, "test-bridge-call",
+             "master: cross-node call external_echo on this node after startup (bridge test)");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,

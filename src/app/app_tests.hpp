@@ -31,4 +31,11 @@ void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
                             const std::string& local_node_name,
                             const std::string& actor_name);
 
+/// bridge 验证（--test-bridge-call=<节点名>，master 进程执行）：
+/// 跨节点调用指定节点的 external_echo（服务 handler 在外部进程，
+/// bridge 转发）——验证 集群→bridge→外部进程 完整链路。
+void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
+                          const std::string& local_node_name,
+                          const std::string& node_name);
+
 } // namespace caf_plugin_system

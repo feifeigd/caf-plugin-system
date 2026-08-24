@@ -157,6 +157,9 @@ void run_cross_call_test(caf::actor_system& sys, caf::actor master,
         std::this_thread::sleep_for(std::chrono::seconds(2));
         do_call();
     }
+    // 清理 RemoteCaller：不 send_exit 它，actor_system 析构会 join 这个
+    // 常驻 actor → 进程挂起（关机链 STOPPED 后不退出，实测踩过）。
+    self->send_exit(caller, caf::exit_reason::user_shutdown);
 }
 
 // ------------------------------------------------------------------
@@ -189,6 +192,52 @@ void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
                      std::cout << "[CrossCallEx] fail: "
                                << caf::to_string(err) << std::endl;
                  });
+    // 清理 RemoteCaller（同 run_cross_call_test：不杀则析构挂起）
+    self->send_exit(caller, caf::exit_reason::user_shutdown);
+}
+
+// ------------------------------------------------------------------
+// bridge 验证（--test-bridge-call=<节点名>，master 进程执行）。
+// 跨节点调用指定节点的 external_echo——handler 在外部进程（Python/Go），
+// bridge 转发 REQ/RESULT。验证 集群→bridge→外部进程 完整链路。
+// 循环重试 60×1s：bridge 节点可能比 master 晚启动/晚注册。
+// ------------------------------------------------------------------
+
+void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
+                          const std::string& local_node_name,
+                          const std::string& node_name) {
+    auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
+    plugin_envelope env;
+    env.sub_proto = k_env_hello;
+    const char* text = "bridge-ping";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                       reinterpret_cast<const std::byte*>(text)
+                           + std::strlen(text));
+    caf::scoped_actor self{sys};
+    std::cout << "[BridgeTest] cross-node call external_echo@'" << node_name
+              << "' (retry 60x1s)" << std::endl;
+    bool ok = false;
+    for (int i = 0; i < 60 && !ok; ++i) {
+        self->request(caller, std::chrono::seconds(3), cross_call_atom_v,
+                      std::string("external_echo"), node_name, env)
+            .receive([&](std::string& s) {
+                         std::cout << "[BridgeTest] external_echo@'"
+                                   << node_name << "' -> " << s << std::endl;
+                         ok = true;
+                     },
+                     [&](caf::error& err) {
+                         std::cout << "[BridgeTest] attempt " << (i + 1)
+                                   << ": " << caf::to_string(err) << std::endl;
+                     });
+        if (!ok)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (!ok) {
+        std::cout << "[BridgeTest] timeout: external_echo@'" << node_name
+                  << "' never reachable" << std::endl;
+    }
+    // 清理 RemoteCaller（同 run_cross_call_test：不杀则析构挂起）
+    self->send_exit(caller, caf::exit_reason::user_shutdown);
 }
 
 } // namespace caf_plugin_system
