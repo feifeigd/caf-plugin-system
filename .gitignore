@@ -103,6 +103,7 @@ vcpkg_installed/
 # 手工组装的运行目录（exe + DLL + plugins/ + updates/ + checkpoints/ + 日志）
 /run/
 run_worker/
+run_bridge/
 # 集群/桥接测试的多轮运行目录（run2、run3b 等）
 run[0-9]*/
 run[0-9]*b/
@@ -135,3 +136,5 @@ graph_info.json
 *.swp
 *.swo
 *~
+__pycache__/
+*.pyc
