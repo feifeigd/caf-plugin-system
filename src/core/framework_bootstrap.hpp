@@ -74,6 +74,11 @@ struct framework_config : caf::actor_system_config {
     /// 集群验证后门：master 延迟后跨节点调用指定节点的 external_echo
     ///（--test-bridge-call=<节点名>，验证集群→外部进程链路）。
     std::string test_bridge_call;
+    /// 数据库插件配置（同一配置文件、字段区分）：
+    /// Redis 连接表（--redis-uris / caf-application.conf 的 redis-uris 字段），
+    /// 格式 "name1=uri1,name2=uri2"（逗号分隔、等号配对），
+    /// uri = redis://host:port/db。插件 spawn 时经 sys.config() 读取。
+    std::string redis_uris = "default=redis://127.0.0.1:6379";
 
     framework_config();
 };
