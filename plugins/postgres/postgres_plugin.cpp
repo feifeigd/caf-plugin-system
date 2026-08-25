@@ -453,7 +453,7 @@ public:
                         uint64_t tx = make_tx_handle(static_cast<size_t>(name_idx), idx);
                         auto job = std::make_shared<Job>();
                         job->op = Op::Begin;
-                        job->done = [=](db::db_result& r) {
+                        job->done = [=](db::db_result& r) mutable {
                             if (!r.ok)
                                 slots[idx]->busy = false;
                             else
@@ -470,25 +470,35 @@ public:
                 rp.deliver(std::move(r));
             };
 
-            // 自检：默认连接上 SELECT 1 + 建表写读 + 事务一轮
+            // 自检：默认连接上 SELECT 1 + 建表写读（串行链，顺序确定）
             auto selfcheck = [=] {
-                auto sc = [self](const std::string& sql, const std::vector<std::string>& params) {
-                    self->request(self, std::chrono::seconds(5), sql_query_atom_v,
+                auto sc = [self](const std::string& sql, const std::vector<std::string>& params,
+                                 std::function<void()> next) {
+                    // 注意：request 首参必须显式 actor 句柄（裸指针推导失败）
+                    self->request(caf::actor{self}, std::chrono::seconds(5), sql_query_atom_v,
                                   sql, params)
                         .then(
-                            [self, sql](const db::db_result& r) {
+                            [self, sql, next](const db::db_result& r) {
                                 LOG_INFO_SELF(self, "selfcheck {} -> ok={} err={} rows={}",
                                               sql, r.ok, r.error, r.rows.size());
+                                if (next)
+                                    next();
                             },
-                            [self, sql](caf::error& e) {
+                            [self, sql, next](caf::error& e) {
                                 LOG_ERROR_SELF(self, "selfcheck {} failed: {}", sql,
                                                caf::to_string(e));
+                                if (next)
+                                    next();
                             });
                 };
-                sc("SELECT 1", {});
-                sc("CREATE TABLE IF NOT EXISTS hermes_selfcheck (id SERIAL PRIMARY KEY, v VARCHAR(64))", {});
-                sc("INSERT INTO hermes_selfcheck (v) VALUES ($1)", {"db-ping"});
-                sc("SELECT id, v FROM hermes_selfcheck ORDER BY id DESC LIMIT 1", {});
+                // 串行链：CREATE → INSERT → SELECT（建表写读一轮）
+                sc("SELECT 1", {}, [=] {
+                    sc("CREATE TABLE IF NOT EXISTS hermes_selfcheck (id SERIAL PRIMARY KEY, v VARCHAR(64))", {}, [=] {
+                        sc("INSERT INTO hermes_selfcheck (v) VALUES ($1)", {"db-ping"}, [=] {
+                            sc("SELECT id, v FROM hermes_selfcheck ORDER BY id DESC LIMIT 1", {}, nullptr);
+                        });
+                    });
+                });
             };
 
             caf::message_handler business{
@@ -501,7 +511,7 @@ public:
                     job->op = Op::Query;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(conn, std::move(job));
                 },
                 [=](sql_query_atom, const std::string& sql,
@@ -513,7 +523,7 @@ public:
                     job->op = Op::Query;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(*default_conn, std::move(job));
                 },
                 [=](sql_exec_atom, const std::string& conn, const std::string& sql,
@@ -525,7 +535,7 @@ public:
                     job->op = Op::Exec;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(conn, std::move(job));
                 },
                 [=](sql_exec_atom, const std::string& sql,
@@ -537,7 +547,7 @@ public:
                     job->op = Op::Exec;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(*default_conn, std::move(job));
                 },
                 [=](tx_begin_atom, const std::string& conn) {
@@ -556,7 +566,7 @@ public:
                     auto rp = self->make_response_promise<db::db_result>();
                     auto job = std::make_shared<Job>();
                     job->op = Op::Commit;
-                    job->done = [=](db::db_result& r) {
+                    job->done = [=](db::db_result& r) mutable {
                         release_slot(tx);
                         rp.deliver(std::move(r));
                     };
@@ -568,7 +578,7 @@ public:
                     auto rp = self->make_response_promise<db::db_result>();
                     auto job = std::make_shared<Job>();
                     job->op = Op::Rollback;
-                    job->done = [=](db::db_result& r) {
+                    job->done = [=](db::db_result& r) mutable {
                         release_slot(tx);
                         rp.deliver(std::move(r));
                     };

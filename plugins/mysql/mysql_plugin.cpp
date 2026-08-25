@@ -223,13 +223,14 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
     }
     if (!params.empty()) {
         std::vector<MYSQL_BIND> binds(params.size());
-        std::vector<unsigned long> lens(params.size());
         for (size_t i = 0; i < params.size(); ++i) {
             std::memset(&binds[i], 0, sizeof(binds[i]));
             binds[i].buffer_type = MYSQL_TYPE_STRING;
             binds[i].buffer = const_cast<char*>(params[i].data());
+            // length=NULL + buffer_length：驱动按 buffer_length 处理
+            //（用 length 指针实测 libmariadb 3.4.7 在 stmt execute 时报
+            //  CR_OUT_OF_MEMORY——发送长度异常，弃用指针方案）
             binds[i].buffer_length = static_cast<unsigned long>(params[i].size());
-            binds[i].length = &lens[i];
         }
         if (mysql_stmt_bind_param(st, binds.data()) != 0) {
             r.error = mysql_stmt_error(st);
@@ -501,7 +502,7 @@ public:
                         auto job = std::make_shared<Job>();
                         job->op = Op::Begin;
                         // 失败时释放槽再交付；成功时 insert_id 携带 tx_handle
-                        job->done = [=](db::db_result& r) {
+                        job->done = [=](db::db_result& r) mutable {
                             if (!r.ok)
                                 slots[idx]->busy = false;
                             else
@@ -518,25 +519,35 @@ public:
                 rp.deliver(std::move(r));
             };
 
-            // 自检：默认连接上 SELECT 1 + 建表写读 + 事务一轮
+            // 自检：默认连接上 SELECT 1 + 建表写读（串行链，顺序确定）
             auto selfcheck = [=] {
-                auto sc = [self](const std::string& sql, const std::vector<std::string>& params) {
-                    self->request(self, std::chrono::seconds(5), sql_query_atom_v,
+                auto sc = [self](const std::string& sql, const std::vector<std::string>& params,
+                                 std::function<void()> next) {
+                    // 注意：request 首参必须显式 actor 句柄（裸指针推导失败）
+                    self->request(caf::actor{self}, std::chrono::seconds(5), sql_query_atom_v,
                                   sql, params)
                         .then(
-                            [self, sql](const db::db_result& r) {
+                            [self, sql, next](const db::db_result& r) {
                                 LOG_INFO_SELF(self, "selfcheck {} -> ok={} err={} rows={}",
                                               sql, r.ok, r.error, r.rows.size());
+                                if (next)
+                                    next();
                             },
-                            [self, sql](caf::error& e) {
+                            [self, sql, next](caf::error& e) {
                                 LOG_ERROR_SELF(self, "selfcheck {} failed: {}", sql,
                                                caf::to_string(e));
+                                if (next)
+                                    next();
                             });
                 };
-                sc("SELECT 1", {});
-                sc("CREATE TABLE IF NOT EXISTS hermes_selfcheck (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64))", {});
-                sc("INSERT INTO hermes_selfcheck (v) VALUES (?)", {"db-ping"});
-                sc("SELECT id, v FROM hermes_selfcheck ORDER BY id DESC LIMIT 1", {});
+                // 串行链：CREATE → INSERT → SELECT（建表写读一轮）
+                sc("SELECT 1", {}, [=] {
+                    sc("CREATE TABLE IF NOT EXISTS hermes_selfcheck (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64))", {}, [=] {
+                        sc("INSERT INTO hermes_selfcheck (v) VALUES (?)", {"db-ping"}, [=] {
+                            sc("SELECT id, v FROM hermes_selfcheck ORDER BY id DESC LIMIT 1", {}, nullptr);
+                        });
+                    });
+                });
             };
 
             caf::message_handler business{
@@ -549,7 +560,7 @@ public:
                     job->op = Op::Query;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(conn, std::move(job));
                 },
                 [=](sql_query_atom, const std::string& sql,
@@ -561,7 +572,7 @@ public:
                     job->op = Op::Query;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(*default_conn, std::move(job));
                 },
                 [=](sql_exec_atom, const std::string& conn, const std::string& sql,
@@ -573,7 +584,7 @@ public:
                     job->op = Op::Exec;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(conn, std::move(job));
                 },
                 [=](sql_exec_atom, const std::string& sql,
@@ -585,7 +596,7 @@ public:
                     job->op = Op::Exec;
                     job->sql = sql;
                     job->params = params;
-                    job->done = [rp](db::db_result& r) { rp.deliver(std::move(r)); };
+                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
                     enqueue_rr(*default_conn, std::move(job));
                 },
                 [=](tx_begin_atom, const std::string& conn) {
@@ -604,7 +615,7 @@ public:
                     auto rp = self->make_response_promise<db::db_result>();
                     auto job = std::make_shared<Job>();
                     job->op = Op::Commit;
-                    job->done = [=](db::db_result& r) {
+                    job->done = [=](db::db_result& r) mutable {
                         release_slot(tx);  // 无论成败事务已结束
                         rp.deliver(std::move(r));
                     };
@@ -616,7 +627,7 @@ public:
                     auto rp = self->make_response_promise<db::db_result>();
                     auto job = std::make_shared<Job>();
                     job->op = Op::Rollback;
-                    job->done = [=](db::db_result& r) {
+                    job->done = [=](db::db_result& r) mutable {
                         release_slot(tx);
                         rp.deliver(std::move(r));
                     };
@@ -651,6 +662,8 @@ public:
                     std::cout << "[MySqlPlugin] shutdown hook: " << joined
                               << " workers joined" << std::endl;
                     LOG_INFO_SELF(self, "MySqlPlugin shutdown, {} workers joined", joined);
+                    // libmariadb 全局清理：释放 mysql_init 的内部缓存（否则 5 块泄露）
+                    mysql_library_end();
                 },
             }))};
         });
