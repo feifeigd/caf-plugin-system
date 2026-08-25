@@ -6,7 +6,9 @@
     "caf",
     "spdlog",
     "fmt",
-    "hiredis"
+    "hiredis",
+    "libmariadb",
+    "libpq"
   ],
   "overrides": [
     {

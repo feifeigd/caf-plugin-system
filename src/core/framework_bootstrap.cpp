@@ -315,6 +315,12 @@ framework_config::framework_config() {
              "trust remote cluster nodes bypassing service ACL (default false)")
         .add(redis_uris, "redis-uris",
              "redis plugin connections: name1=uri1,name2=uri2 (uri=redis://host:port/db)")
+        .add(mysql_uris, "mysql-uris",
+             "mysql plugin connections: name1=uri1,name2=uri2 (uri=mysql://user:pass@host:port/dbname)")
+        .add(pg_uris, "pg-uris",
+             "postgres plugin connections: name1=uri1,name2=uri2 (uri=postgres://user:pass@host:port/dbname)")
+        .add(db_pool_size, "db-pool-size",
+             "sql plugin connection pool size per named connection (default 2)")
         .add(test_cross_call, "test-cross-call",
              "cross-node call this service after node registration (cluster test)")
         .add(test_cross_call_ex, "test-cross-call-ex",
