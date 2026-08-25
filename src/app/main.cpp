@@ -61,6 +61,10 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);  // 在控制台打印内存泄漏
+    // 断言也走 stderr + 调试器断点：默认的模态对话框会在无头/自动化
+    // 运行时卡死进程（is_block_type_valid 这类堆断言现场会停在对话框）。
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
     #endif
 
     // 构建标识：双击测试时一眼确认 exe 新旧（旧实例窗口不会随代码更新）

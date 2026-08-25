@@ -29,6 +29,7 @@
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
+#include "templates/job_queue.hpp"
 
 // hiredis 依赖 winsock2 的 timeval；必须先于 caf/all.hpp（其可能拉入
 // windows.h）包含，否则 struct timeval 不完整 → 编译错
@@ -120,56 +121,14 @@ struct Job {
     std::string cmd;
     std::vector<std::string> args;
     caf::typed_response_promise<db::db_result> rp;
-};
 
-/// 线程安全任务队列。stop() 后 pop() 返回 nullptr → worker 退出；
-/// fail_all() 把残留 job 全部回错误（连接失败场景）。
-struct JobQueue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::shared_ptr<Job>> jobs;
-    bool running = true;
-
-    void push(std::shared_ptr<Job> j) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            jobs.push_back(std::move(j));
-        }
-        cv.notify_one();
-    }
-
-    // 返回 nullptr = 应退出（stop 已调用且队列清空）
-    std::shared_ptr<Job> pop() {
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [this] { return !jobs.empty() || !running; });
-        if (!jobs.empty()) {
-            auto j = std::move(jobs.front());
-            jobs.pop_front();
-            return j;
-        }
-        return nullptr;
-    }
-
-    void fail_all(const std::string& err) {
-        std::deque<std::shared_ptr<Job>> rest;
-        {
-            std::lock_guard<std::mutex> lk(m);
-            rest.swap(jobs);
-            running = false;
-        }
-        for (auto& j : rest)
-            j->rp.deliver(caf::make_error(caf::sec::runtime_error, err));
-        cv.notify_all();
-    }
-
-    void stop() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            running = false;
-        }
-        cv.notify_all();
+    /// 失败交付方式（JobQueue::fail_all 统一调用）。
+    void fail(const std::string& err) {
+        rp.deliver(caf::make_error(caf::sec::runtime_error, err));
     }
 };
+
+using JobQueue = caf_plugin_system::JobQueue<Job>;
 
 /// 嵌套数组递归展平（逗号分隔，v1 简化表示）。
 void flatten_reply(const redisReply* r, std::string& out) {

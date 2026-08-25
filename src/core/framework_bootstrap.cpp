@@ -318,7 +318,9 @@ framework_config::framework_config() {
         .add(mysql_uris, "mysql-uris",
              "mysql plugin connections: name1=uri1,name2=uri2 (uri=mysql://user:pass@host:port/dbname)")
         .add(pg_uris, "pg-uris",
-             "postgres plugin connections: name1=uri1,name2=uri2 (uri=postgres://user:pass@host:port/dbname)")
+             "postgres plugin connections: name1=uri1,name2=uri2 (uri=postgres://user:***@host:port/dbname)")
+        .add(mongo_uris, "mongo-uris",
+             "mongo plugin connections: name1=uri1,name2=uri2 (uri=mongodb://[user:pass@]host[:port][/dbname])")
         .add(db_pool_size, "db-pool-size",
              "sql plugin connection pool size per named connection (default 2)")
         .add(test_cross_call, "test-cross-call",

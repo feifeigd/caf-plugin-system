@@ -84,6 +84,8 @@ struct framework_config : caf::actor_system_config {
     std::string mysql_uris = "default=mysql://root@127.0.0.1:3306";
     /// PostgreSQL 连接表（libpq），uri = postgres://user:pass@host:port/dbname
     std::string pg_uris = "default=postgres://postgres@127.0.0.1:5432";
+    /// MongoDB 连接表（mongo-cxx-driver），uri = mongodb://[user:pass@]host[:port][/dbname]
+    std::string mongo_uris = "default=mongodb://127.0.0.1:27017";
     /// SQL 插件连接池大小（每个命名连接的 worker/连接数，全局统一）
     int db_pool_size = 2;
 
