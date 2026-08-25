@@ -292,6 +292,11 @@ framework_config::framework_config() {
     // framework_config 由 exec_main 在 parse 前、actor_system 构造前创建，
     // 这里是最干净的注册窗口（CAF_MAIN 的模块参数机制只服务自带模块）。
     app_meta::init();
+    // DLL 分类目录（exe_dir/lib/）必须先于 preregister_plugin_meta 注册：
+    // 预注册阶段的 LoadLibrary 同样要能解析 run/lib 下的第三方依赖，
+    // 否则非 delayload 依赖的插件在预注册阶段会加载失败（静默跳过）。
+    // 幂等——bootstrap_system_components 里还有一次兜底调用。
+    setup_dll_search_path();
     // 插件私有消息类型的元对象：扫描插件目录并调用可选导出
     // register_meta_objects()。注册了元对象的插件 DLL 自此常驻。
     preregister_plugin_meta(plugins_dir);

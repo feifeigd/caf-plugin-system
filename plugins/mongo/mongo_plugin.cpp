@@ -249,11 +249,15 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
             }
             case Op::UpdateOne:
             case Op::UpdateMany: {
-                auto filter = get_doc(v, "filter").view();
-                auto update = get_doc(v, "update").view();
+                // ⚠️ 必须把 document::value 留在作用域内：直接 .view() 绑定到
+                // auto 会让临时 value 在语句末尾析构 → 悬垂 view → 驱动从已释放
+                // 内存（Debug 0xDD）构造 bson_t → 后续 bson_free 堆断言崩溃
+                // （is_block_type_valid）。move 进 view_or_value 由驱动持有。
+                auto filter = get_doc(v, "filter");
+                auto update = get_doc(v, "update");
                 auto res = (op == Op::UpdateOne)
-                               ? coll.update_one(filter, update)
-                               : coll.update_many(filter, update);
+                               ? coll.update_one(std::move(filter), std::move(update))
+                               : coll.update_many(std::move(filter), std::move(update));
                 if (res) {
                     r.affected = static_cast<int64_t>(res->modified_count());
                     r.ok = true;
@@ -262,10 +266,13 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
             }
             case Op::DeleteOne:
             case Op::DeleteMany: {
-                auto filter = get_doc(v, "filter").view();
+                // 同 Update：悬垂 view 会让 bulk delete 模型读到 0xDD 垃圾，
+                // bson_destroy/bson_free 在无效块头上断言崩溃（delete_many 卡死
+                // 与 is_block_type_valid 崩溃同根）。
+                auto filter = get_doc(v, "filter");
                 auto res = (op == Op::DeleteOne)
-                               ? coll.delete_one(filter)
-                               : coll.delete_many(filter);
+                               ? coll.delete_one(std::move(filter))
+                               : coll.delete_many(std::move(filter));
                 if (res) {
                     r.affected = static_cast<int64_t>(res->deleted_count());
                     r.ok = true;
