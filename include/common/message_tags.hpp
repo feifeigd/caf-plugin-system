@@ -30,6 +30,7 @@
 #include "common/system_state.hpp"
 #include "common/plugin_envelope.hpp"
 #include "common/cluster_types.hpp"
+#include "common/db_contract.hpp"
 
 /// 定义一个空标签结构体并注册显式 type_id（旧 atom 的替代品）。
 #define CAF_MESSAGE_TAG(tag_name, tag_id)                                      \
