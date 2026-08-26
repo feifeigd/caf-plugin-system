@@ -1,0 +1,178 @@
+' ============================================================================
+' Bridge 行协议 PlantUML 图（外部语言节点 sidecar）
+' 源码依据：src/core/bridge_actor.cpp（2026-08-26 复核：caf::io::broker 版）
+' 渲染：VS Code PlantUML 扩展 / plantuml.com / `plantuml bridge-protocol.puml`
+' ============================================================================
+
+' ----------------------------------------------------------------------------
+' 图 1：组件总览 + 线格式
+' ----------------------------------------------------------------------------
+@startuml bridge-overview
+title Bridge 组件总览（外部语言节点 sidecar，broker 版）
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam defaultTextAlignment center
+
+component "外部进程\n[Python / Go 参考客户端]" as PY #LightBlue
+component "TCP 连接\n127.0.0.1:bridge-port" as TCP #LightGray
+
+package "caf_plugin_app 进程" #LightYellow {
+  component "BridgeBroker\ncaf::io::broker 单 actor\nadd_tcp_doorman 监听 + new_data_msg\n事件解析（try_parse_frame）+ write/flush" as BROKER
+  component "BridgeActor\nCALL 入口：resolve 服务\n+ 信封调用 + RESULT 回执" as BRIDGE
+  component "ImplActor\nexternal_echo 服务\nREQ 发起 + RESULT 应答投递" as IMPL
+  component "ServiceRegistry\n服务台账 + 服务 proxy" as REG
+  component "插件服务 actor\nBusinessPlugin 等" as PLUGIN
+  component "RemoteCaller / 集群节点\n跨节点调用方" as RC
+  component "GracefulShutdown\n关机统一终止（register_cluster_atom）" as GS
+}
+
+PY -down-> TCP : 建立连接
+TCP -down-> BROKER : accept（doorman）
+BROKER -right-> BRIDGE : anon_send(ext_call_atom)\n（CALL 帧解析）
+BROKER -right-> IMPL : anon_send(ext_result_atom)\n（RESULT 帧解析）
+BRIDGE -down-> BROKER : anon_send(write_atom, RESULT 行)
+IMPL -down-> BROKER : anon_send(write_atom, REQ 行)
+BROKER -left-> TCP : write + flush\n（multiplexer 事件发送）
+BRIDGE -right-> REG : request(resolve_atom)
+REG -down-> PLUGIN : proxy 委托 plugin_envelope
+RC -down-> IMPL : 跨节点 envelope
+GS -down-> BRIDGE : send_exit（关机）
+GS -down-> IMPL : send_exit（关机）
+
+note bottom of TCP
+  == 线格式（长度前缀 → payload 可含任意字节，上限 64MB）==
+  CALL   <id> <svc> <len>\n<payload>\n    外部 → exe：调用服务
+  RESULT <id> OK|ERR <len>\n<payload>\n   CALL 的回执 / REQ 的应答
+  REQ    <rid> <len>\n<payload>\n         exe → 外部：请求处理
+end note
+
+note bottom of BROKER
+  broker 单 actor 统一处理所有连接事件：
+  new_data_msg → per-conn rx 缓冲追加 → try_parse_frame
+  循环消费完整帧（数据不足等更多；协议错 → bad 集合忽略）
+  CALL   → BridgeActor（ext_call_atom）
+  RESULT → ImplActor（ext_result_atom）
+  写路径：write_atom → write(缓冲) + flush(发送)
+  （CAF 1.1 写模型：scheduler 线程必须显式 flush）
+end note
+@enduml
+
+' ----------------------------------------------------------------------------
+' 图 2：CALL 时序 —— 外部进程主动调用本地插件服务
+' ----------------------------------------------------------------------------
+@startuml bridge-call
+title 链路 1：CALL —— Python 调用 exe 侧插件服务
+
+participant "Python 客户端" as PY
+participant "BridgeBroker" as BR
+participant "BridgeActor" as BA
+participant "ServiceRegistry" as REG
+participant "服务 Proxy" as PX
+participant "插件 Actor" as PL
+
+PY -> BR : TCP: CALL <id> <svc> <len>\n<payload>\n
+note right of BR
+  id = Python 侧自增序号；
+  svc = 服务名（如 business_service）
+  new_data_msg 事件 → rx 缓冲 → try_parse_frame
+end note
+BR -> BA : anon_send(ext_call_atom, id, svc, payload)
+activate BA
+BA -> REG : request(resolve_atom, svc)（2s 超时）
+REG --> BA : actor（服务 proxy）
+alt proxy 为空（服务不存在）
+  BA -> BR : anon_send(write_atom, RESULT <id> ERR <len>\n"service not found: " + svc)
+else 正常
+  BA -> PX : request(plugin_envelope{sub_proto=1, payload})（5s 超时）
+  note right of BA
+    payload 原样透传进信封；
+    sub_proto=1 供插件路由
+  end note
+  PX -> PL : delegate（保持原始 sender 语义）
+  PL --> PX : 响应字符串
+  PX --> BA : 响应
+  BA -> BR : anon_send(write_atom, RESULT <id> OK <len>\n<payload>\n)
+end
+BR -> BR : write(hdl, span) + flush(hdl)
+BR -> PY : TCP: RESULT <id> OK|ERR <len>\n<payload>\n
+deactivate BA
+@enduml
+
+' ----------------------------------------------------------------------------
+' 图 3：REQ 时序 —— exe 侧（插件/集群）调用外部进程
+' ----------------------------------------------------------------------------
+@startuml bridge-req
+title 链路 2：REQ —— 插件/集群调用 Python（external_echo）
+
+participant "调用方\n(本地插件 / 远端 RemoteCaller)" as CALLER
+participant "ImplActor\nexternal_echo" as IMPL
+participant "BridgeBroker" as BR
+participant "Python 客户端" as PY
+
+CALLER -> IMPL : request(plugin_envelope{sub_proto=1, payload})
+activate IMPL
+IMPL -> IMPL : rid = ++seq\npending[rid] = response_promise
+IMPL -> BR : anon_send(write_atom, REQ <rid> <len>\n<payload>\n)
+note right of BR
+  rid 是 exe 侧自增序号（BridgeImplState.seq）；
+  write + flush 立即发送
+end note
+BR -> PY : TCP: REQ <rid> <len>\n<payload>\n
+PY -> BR : TCP: RESULT <rid> OK|ERR <len>\n<payload>\n
+BR -> IMPL : anon_send(ext_result_atom, rid, ok, payload)
+alt ok == true
+  IMPL -> IMPL : pending[rid].deliver(payload)
+else ok == false
+  IMPL -> IMPL : pending[rid].deliver(sec::runtime_error, payload)
+end
+IMPL --> CALLER : 响应回程\n（本地：直接回执；跨节点：BASP 回程）
+deactivate IMPL
+
+note right of IMPL
+  纯 send 调用（非 request）零回执：
+  handler 保持 void，用 is_request() 判断
+  是否 make_response_promise 响应
+end note
+@enduml
+
+' ----------------------------------------------------------------------------
+' 图 4：连接生命周期与关机（broker 版，无手写线程）
+' ----------------------------------------------------------------------------
+@startuml bridge-lifecycle
+title 连接生命周期 + 优雅关机（broker 析构链）
+
+participant "Python 客户端" as PY
+participant "BridgeBroker" as BR
+participant "BridgeActor" as BA
+participant "ImplActor" as IMPL
+participant "GracefulShutdown" as GS
+participant "multiplexer" as MX
+
+BR -> BR : add_tcp_doorman(port, reuse_addr=true)\n（CAF 内部建监听 socket，注册到 multiplexer）
+PY -> BR : connect
+BR -> BR : new_connection_msg\nconfigure_read(at_least(1)) + current = handle
+BR <-> MX : 读就绪事件（数据到达）
+BR -> BR : new_data_msg → 解析 → 转发（图 1 路由）
+BR -> BR : write_atom → write + flush（写出）
+
+GS -> BA : send_exit(user_shutdown)（关机链 stop_cluster）
+activate BA
+BA -> BA : exit_msg handler
+BA -> IMPL : send_exit(user_shutdown)（impl 退出）
+BA -> BR : send_exit(user_shutdown)
+deactivate BA
+BR -> BR : exit_msg → self->quit()
+activate MX
+BR -> MX : ~abstract_broker → close_all()\n（doorman_map/scribe 引用释放）
+MX -> MX : 从 poll 表注销 fd（closesocket）
+MX -> PY : 连接关闭（对端 recv EOF）
+deactivate MX
+note right of MX
+  2026-08-26 broker 版：零手写线程/零 join 时序。
+  doorman/scribe 生命周期由 middleman/multiplexer
+  引用计数托管，actor 退出自动清理，无 detached 线程
+  泄漏面（旧版 shutdown_and_join 线程 join 已删除）。
+end note
+@enduml
