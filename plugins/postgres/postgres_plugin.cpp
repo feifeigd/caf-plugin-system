@@ -32,6 +32,7 @@
 #include <caf/all.hpp>
 
 #include <atomic>
+#include <fstream>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -301,7 +302,7 @@ public:
         caf::settings uris = cfg.uris;
         int pool_size = cfg.pool_size < 1 ? 1 : cfg.pool_size;
 
-        return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
+        return sys.spawn([logger, uris, pool_size, this](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<PgSpec>>(parse_uris(uris));
             auto pools = std::make_shared<std::map<std::string, std::vector<std::shared_ptr<ConnSlot>>>>();
             auto rr = std::make_shared<std::atomic<size_t>>(0);
@@ -545,8 +546,18 @@ public:
             };
 
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
-                .on_init = [=](caf::actor, const std::string&) {
+                .on_init = [=, this](caf::actor, const std::string&) {
                     LOG_INFO_SELF(self, "PostgresPlugin initialized, conns={}", uris.size());
+                    // 可选资源读取（asset_dir 注入机制）：读插件目录下
+                    // resource.json（部署时与 DLL 同目录，见 docs/plugin-assets.md）。
+                    // 文件不存在则跳过——资源对插件始终是可选的。
+                    auto rp = asset_path("resource.json");
+                    std::ifstream f(rp);
+                    if (f) {
+                        std::string line;
+                        std::getline(f, line);
+                        LOG_INFO_SELF(self, "PostgresPlugin asset {} -> {}", rp, line);
+                    }
                     launch_workers();
                     selfcheck();
                 },

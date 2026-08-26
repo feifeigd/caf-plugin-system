@@ -22,6 +22,9 @@ struct LoadedPlugin {
     caf::actor actor;
     plugin_manifest manifest;
     DestroyPluginFunc destroy = nullptr;
+    // 插件资源目录（绝对路径）。首次加载时按 DLL 父目录固化；
+    // 热更新时新实例继承本值（资源不随 DLL 换位置，零复制）。
+    std::string asset_dir;
 };
 
 class PluginManager : public caf::event_based_actor {

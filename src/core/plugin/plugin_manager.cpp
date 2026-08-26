@@ -5,6 +5,7 @@
 #include <caf/actor_registry.hpp>
 
 #include <deque>
+#include <filesystem>
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -67,6 +68,12 @@ caf::behavior PluginManager::make_behavior() {
             }
 
             PluginEntry* plugin = create();
+            // 注入资源目录：DLL 父目录的绝对路径（正常布局 plugins/<name>/）。
+            // 绝对化防 cwd 漂移；热更新时新实例继承本值（见 reload 段）。
+            plugin->set_asset_dir(
+                std::filesystem::absolute(std::filesystem::path(path))
+                    .parent_path()
+                    .string());
             auto manifest = plugin->manifest();
             LOG_INFO("Plugin manifest: " + manifest.name
                      + " deps=" + std::to_string(manifest.dependencies.size())
@@ -153,7 +160,8 @@ caf::behavior PluginManager::make_behavior() {
 
             plugin_lib_pool().push_back(std::move(*lib_opt));
             plugins_.emplace(name, LoadedPlugin{
-                &plugin_lib_pool().back(), plugin, actor, manifest, destroy
+                &plugin_lib_pool().back(), plugin, actor, manifest, destroy,
+                plugin->asset_dir()
             });
             LOG_INFO("Plugin loaded successfully: " + name);
             return true;
@@ -200,6 +208,9 @@ caf::behavior PluginManager::make_behavior() {
             }
 
             PluginEntry* new_plugin = create();
+            // 继承旧实例的资源目录：热更新只换代码，资源不换（零复制）。
+            // 插件名热更不可改（下方 manifest 检查）→ 目录语义稳定。
+            new_plugin->set_asset_dir(it->second.asset_dir);
             auto manifest = new_plugin->manifest();
             if (manifest.name != name) {    // 热更新，不能改变插件名字
                 destroy(new_plugin);
@@ -344,7 +355,8 @@ caf::behavior PluginManager::make_behavior() {
 
             plugin_lib_pool().push_back(std::move(*lib_opt));
             it->second = LoadedPlugin{
-                &plugin_lib_pool().back(), new_plugin, new_actor, manifest, destroy
+                &plugin_lib_pool().back(), new_plugin, new_actor, manifest, destroy,
+                new_plugin->asset_dir()
             };
 
             LOG_INFO("Plugin hot-reloaded: " + name + " -> " + path);

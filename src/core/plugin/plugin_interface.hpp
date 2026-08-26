@@ -1,6 +1,7 @@
 #pragma once
 
 #include <caf/all.hpp>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,26 @@ public:
         caf::actor_system& sys,
         const std::vector<caf::actor>& injected_deps,   // manifest.dependencies 的 actor 实例，injected_deps 顺序与 manifest.dependencies 一致
         const std::string& config) = 0;
+
+    // ------------------------------------------------------------------
+    // 资源目录（框架注入，插件只读）
+    // ------------------------------------------------------------------
+    // 框架在 load/reload 时自动注入"插件目录"（绝对路径，默认 DLL 所在
+    // 目录的父级布局 plugins/<name>/，见 plugin_manager.cpp）。
+    // 热更新时新实例【继承】旧实例的资源目录——DLL 换位置（如 stage/），
+    // 资源仍读原插件目录，零复制。插件名热更时不可改（manifest 检查），
+    // 目录天然稳定。
+    // 读资源的插件只需：auto p = asset_path("config.json");
+    // 不读资源的插件零改动（默认实现）。
+    void set_asset_dir(std::string dir) { asset_dir_ = std::move(dir); }
+    const std::string& asset_dir() const { return asset_dir_; }
+    // 拼资源绝对路径（Windows 分隔符由 std::filesystem 处理）
+    std::string asset_path(const std::string& rel) const {
+        return (std::filesystem::path(asset_dir_) / rel).string();
+    }
+
+private:
+    std::string asset_dir_;
 };
 
 // ------------------------------------------------------------------
