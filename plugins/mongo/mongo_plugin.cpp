@@ -42,6 +42,7 @@
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
+#include "common/plugin_config.hpp"
 #include "templates/job_queue.hpp"
 
 // mongocxx 依赖 winsock2，必须最先包含（同 hiredis/libpq 坑）
@@ -83,50 +84,38 @@ namespace bbs = bsoncxx::builder::basic;
 
 namespace {
 
-constexpr const char* kDefaultUris = "default=mongodb://127.0.0.1:27017";
+// 声明式配置（PLUGIN_CONFIG 宏，见 common/plugin_config.hpp）：
+// 字段 + 默认值，读取路径 caf-plugin-system.mongo.<字段名>（conf 嵌套块）。
+#define MONGO_FIELDS(X)                                                       \
+    X(caf::settings, uris, {})                                                \
+    X(int, pool_size, 2)
+PLUGIN_CONFIG(MONGO_FIELDS)
+#undef MONGO_FIELDS
 
-/// 单个命名连接的解析结果（mongodb://[user:pass@]host[:port][/dbname]）。
+/// 单个命名连接的解析结果（mongodb://[user:***@]host[:port][/dbname]）。
 struct MongoSpec {
     std::string name;
     std::string uri = "mongodb://127.0.0.1:27017";
     std::string dbname;
 };
 
-/// 解析 "name1=uri1,name2=uri2"。无 name 条目归入 "default"。
-std::vector<MongoSpec> parse_uris(const std::string& spec) {
+/// 从配置 dictionary 构造命名连接表（键 = 连接名，值 = uri 字符串）。
+std::vector<MongoSpec> parse_uris(const caf::settings& uris) {
     std::vector<MongoSpec> out;
-    size_t pos = 0;
-    while (pos <= spec.size()) {
-        auto comma = spec.find(',', pos);
-        std::string item = spec.substr(pos, comma == std::string::npos
-                                            ? std::string::npos : comma - pos);
-        if (!item.empty()) {
-            MongoSpec cs;
-            auto eq = item.find('=');
-            std::string uri;
-            if (eq != std::string::npos) {
-                cs.name = item.substr(0, eq);
-                uri = item.substr(eq + 1);
-            } else {
-                cs.name = "default";
-                uri = item;
-            }
-            if (uri.empty())
-                uri = "mongodb://127.0.0.1:27017";
-            cs.uri = uri;
-            // 提取 dbname：最后一个 '/' 后、'?' 前的段（uri 查询参数不属库名）
-            auto q = uri.find('?');
-            std::string path = uri.substr(0, q == std::string::npos ? uri.size() : q);
-            auto slash = path.rfind('/');
-            if (slash != std::string::npos && slash + 1 < path.size())
-                cs.dbname = path.substr(slash + 1);
-            if (cs.name.empty())
-                cs.name = "default";
-            out.push_back(std::move(cs));
-        }
-        if (comma == std::string::npos)
-            break;
-        pos = comma + 1;
+    for (const auto& [name, value] : uris) {
+        auto uri = caf::get_if<std::string>(&value);
+        if (!uri)
+            continue;
+        MongoSpec cs;
+        cs.name = name;
+        cs.uri = uri->empty() ? "mongodb://127.0.0.1:27017" : *uri;
+        // 提取 dbname：最后一个 '/' 后、'?' 前的段（uri 查询参数不属库名）
+        auto q = cs.uri.find('?');
+        std::string path = cs.uri.substr(0, q == std::string::npos ? cs.uri.size() : q);
+        auto slash = path.rfind('/');
+        if (slash != std::string::npos && slash + 1 < path.size())
+            cs.dbname = path.substr(slash + 1);
+        out.push_back(std::move(cs));
     }
     if (out.empty()) {
         MongoSpec cs;
@@ -431,11 +420,10 @@ public:
         // created"——current() 在无显式实例时隐式构造（首次调用线程安全）
         mongocxx::instance::current();
 
-        std::string uris = caf::get_or(sys.config(), "caf-plugin-system.mongo-uris",
-                                       std::string(kDefaultUris));
-        int pool_size = caf::get_or<int>(sys.config(), "caf-plugin-system.db-pool-size", 2);
-        if (pool_size < 1)
-            pool_size = 1;
+        // 声明式配置读取（PLUGIN_CONFIG）：字段、默认值、解析全部自动
+        auto cfg = load_plugin_config(sys.config());
+        caf::settings uris = cfg.uris;
+        int pool_size = cfg.pool_size < 1 ? 1 : cfg.pool_size;
 
         return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<MongoSpec>>(parse_uris(uris));
