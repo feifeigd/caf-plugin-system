@@ -13,7 +13,8 @@
 
 #include "framework_bootstrap.hpp"
 #include "services/logging_service.hpp"
-#include "app_tests.hpp"
+#include "app_config.hpp"
+#include "app_backdoors.hpp"
 #include "cluster/bootstrap.hpp"
 #include "cluster/ops_actor.hpp"
 #include "bridge_actor.hpp"
@@ -31,24 +32,8 @@
 using namespace caf_plugin_system;
 
 // ------------------------------------------------------------------
-// 进程配置 = 插件框架（caf_plugin_core） + 集群节点（caf_plugin_cluster）
-// 两个模块正交，可按需组合：
-//   - 纯插件进程：默认加载 caf-application.conf（CAF 默认文件名，无需参数）
-//   - 纯节点进程：--caf-plugin-system.node-kind=master|region|worker
-//   - 节点 + 插件：两者都配（region 上跑服务插件）
-// ------------------------------------------------------------------
-
-struct app_config : framework_config {
-    cluster::node_settings node_cfg;
-    app_config() : framework_config() {
-        // middleman 元对象注册 + 加载（必须在 actor_system 构造前）
-        cluster::init_node_io(*this);
-        cluster::add_node_options(*this, node_cfg);
-    }
-};
-
-// ------------------------------------------------------------------
-// 验证后门（--test-auto-shutdown / --test-cross-call*）实现见 app_tests.cpp
+// 验证后门（--test-auto-shutdown / --test-cross-call* / --test-*）
+// 统一入口见 app_backdoors.cpp（run_test_backdoors）。
 // ------------------------------------------------------------------
 
 // ------------------------------------------------------------------
@@ -81,18 +66,6 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // （优雅关机/进程退出时 master 立即感知，无需等 lease 过期）。
     if (!cfg.entry_plugins.empty()) {
         if (!bootstrap_plugins(sys, cfg, fw)) return 0;
-        if (cfg.test_auto_shutdown) {
-            run_smoke_tests(sys, fw);
-            // 冒烟测试跑完自动关机（选项名即语义）：走 shutdown_mgr 统一
-            // 关机链（插件保存 → 集群 → 组件 → logging_service 最后退出）。
-            // 注意：重构把关机统一到 shutdown_mgr 后，此触发必须显式发
-            // shutdown_atom——曾漏接导致冒烟测试跑完进程挂死在等输入。
-            std::cout << "[OpsTest] auto shutdown after smoke tests (delayed 2s)"
-                      << std::endl;
-            caf::scoped_actor self{sys};
-            self->delayed_send(fw.shutdown_mgr, std::chrono::seconds(2),
-                               shutdown_atom{});
-        }
     }
 
     // 注：日志无注入环节——logging_service 是系统组件，bootstrap_system_components
@@ -163,80 +136,11 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
         cluster::start_console_thread(ops);
     }
 
-    // ---- 集群验证后门：跨节点调用（resolve → connect → lookup → call）----
-    if (!cfg.test_cross_call.empty() && nb.master) {
-        run_cross_call_test(sys, nb.master, cfg.node_cfg.node_name,
-                            cfg.test_cross_call);
-    }
-    // ---- 集群验证后门：跨节点调用 + 有界重试（重启窗口期不丢）----
-    if (!cfg.test_cross_call_ex.empty() && nb.master) {
-        run_cross_call_ex_test(sys, nb.master, cfg.node_cfg.node_name,
-                               cfg.test_cross_call_ex);
-    }
-    // ---- bridge 验证后门：跨节点调外部节点 external_echo ----
-    // （--test-bridge-call=<节点名>，验证 集群→bridge→外部进程 链路）
-    if (!cfg.test_bridge_call.empty() && nb.master) {
-        run_bridge_call_test(sys, nb.master, cfg.node_cfg.node_name,
-                             cfg.test_bridge_call, fw.shutdown_mgr);
-    }
-
-    // ---- 运维验证后门：远程热更（--test-remote-reload=<node>,<plugin>,<path>）----
-    // 复用控制台命令路径：把 reload-node 命令字符串发给本机 OpsActor，
-    // 走与交互控制台完全相同的解析/寻址/热更链路。
-    if (!cfg.test_remote_reload.empty() && nb.master) {
-        auto ops = caf::actor_cast<caf::actor>(sys.registry().get("ops"));
-        if (ops) {
-            // 完整命令前缀（reload / reload-node / reload-nodes / reload-all）
-            // 原样发送；否则按单节点 reload-node <node>,<plugin>,<path> 拼装。
-            std::string cmd;
-            const bool full_cmd =
-                cfg.test_remote_reload.rfind("reload ", 0) == 0
-                || cfg.test_remote_reload.rfind("reload-node ", 0) == 0
-                || cfg.test_remote_reload.rfind("reload-nodes ", 0) == 0
-                || cfg.test_remote_reload.rfind("reload-all ", 0) == 0;
-            if (full_cmd)
-                cmd = cfg.test_remote_reload;
-            else
-                cmd = "reload-node " + cfg.test_remote_reload;
-            std::replace(cmd.begin(), cmd.end(), ',', ' ');
-            std::cout << "[OpsTest] " << cmd << " (delayed 12s for worker registration)"
-                      << std::endl;
-            // delayed_send：给 worker 完成注册留时间（node_resolve 才能命中）
-            caf::scoped_actor self{sys};
-            self->delayed_send(ops, std::chrono::seconds(12),
-                               console_cmd_atom_v, cmd);
-        } else {
-            std::cout << "[OpsTest] ops actor not found in registry" << std::endl;
-        }
-    }
-
-    // ---- 运维验证后门：自动 quit（--test-quit，任何模式）----
-    // 复用控制台 quit 命令路径，验证优雅关机链自然退出（进程必须自己
-    // 退出且 EXIT 0，不能靠外部强杀——优雅关机回归测试）。
-    if (cfg.test_quit) {
-        auto ops = caf::actor_cast<caf::actor>(sys.registry().get("ops"));
-        if (ops) {
-            std::cout << "[OpsTest] triggering quit (delayed 2s)"
-                      << std::endl;
-            caf::scoped_actor self{sys};
-            self->delayed_send(ops, std::chrono::seconds(2),
-                               console_cmd_atom_v, std::string("quit"));
-        } else {
-            std::cout << "[OpsTest] ops actor not found in registry"
-                      << std::endl;
-        }
-    }
-
-    // ---- 运维验证后门：模拟 Ctrl+C（--test-ctrl-c，任何模式）----
-    // 直接发 shutdown_atom 给 shutdown_mgr（不经 ops），等价 Ctrl+C 的
-    // console_handler 路径；验证 ops 注册给 shutdown_mgr 后也能自然退出。
-    if (cfg.test_ctrl_c) {
-        std::cout << "[OpsTest] simulating Ctrl+C (direct shutdown_atom, delayed 2s)"
-                  << std::endl;
-        caf::scoped_actor self{sys};
-        self->delayed_send(fw.shutdown_mgr, std::chrono::seconds(2),
-                           shutdown_atom{});
-    }
+    // ---- 集群/运维验证后门统一入口（--test-*）----
+    // 实现见 app_backdoors.cpp：auto_shutdown / cross_call /
+    // cross_call_ex / bridge_call / remote_reload / quit / ctrl_c。
+    // 各后门按 cfg 字段分发，无需本进程配置时静默跳过。
+    run_test_backdoors(sys, cfg, nb, fw);
 
     // ---- 等待关机：统一由 shutdown_mgr 负责 ----
     // shutdown_mgr 关机链：停插件（drain→save→shutdown）→ 杀集群
