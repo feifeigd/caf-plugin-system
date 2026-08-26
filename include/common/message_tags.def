@@ -43,94 +43,96 @@ X_TAG(unload_atom, 211)
 X_TAG(list_atom, 212)
 X_TAG(resolve_plugin_atom, 213)
 X_TAG(ping_atom, 214)
-X_TAG(pong_atom, 215)
-X_TAG(init_atom, 216)
+X_TAG(init_atom, 215)
 
 // -- ServiceRegistry（service_registry.hpp）-------------------------
-X_TAG(register_atom, 217)
-X_TAG(resolve_atom, 218)
-X_TAG(list_services_atom, 219)
-X_TAG(hot_reload_atom, 220)
-X_TAG(unregister_atom, 221)
+X_TAG(register_atom, 216)
+X_TAG(resolve_atom, 217)
+X_TAG(list_services_atom, 218)
+X_TAG(hot_reload_atom, 219)
+X_TAG(unregister_atom, 220)
 
 // -- 服务契约（include/services/）-----------------------------------
-X_TAG(get_config_atom, 222)
-X_TAG(set_config_atom, 223)
-X_TAG(log_atom, 224)
-X_TAG(report_metric_atom, 225)
-X_TAG(get_metrics_atom, 226)
+X_TAG(get_config_atom, 221)
+X_TAG(set_config_atom, 222)
+X_TAG(log_atom, 223)
+X_TAG(report_metric_atom, 224)
+X_TAG(get_metrics_atom, 225)
 
 // -- 消息中使用的 STL 容器类型（CAF 内置列表未覆盖）------------------
-X_REG(vec_string, (std::vector<std::string>), 227, "std::vector<std::string>")
-X_REG(map_string_int, (std::map<std::string, int>), 228, "std::map<std::string, int>")
+// 注意：X_REG 键名不被代码引用，但类型本身必须注册（消息类型完整性
+// 检查 is_complete<type_id<T>> 依赖它）。判断死活用【类型表达式】grep，
+// 不是键名——vec_string/map_string_int 曾被误判死删除，编译炸了
+// （ops_actor deliver vector<string> / platform get_metrics map<string,int>）。
+X_REG(vec_string, (std::vector<std::string>), 226, "std::vector<std::string>")
+X_REG(map_string_int, (std::map<std::string, int>), 227, "std::map<std::string, int>")
 
 // -- 插件私有子协议的公共信封（利弊见 common/plugin_envelope.hpp 头注释）--
-X_REG(plugin_envelope, (plugin_envelope), 229, "plugin_envelope")
+X_REG(plugin_envelope, (plugin_envelope), 228, "plugin_envelope")
 
 // -- 服务代理 ACL（见 docs/plugin-guide.md §6）------------------------
 // （std::vector<caf::actor_addr> 是 CAF 内置注册类型，无需自行注册）
-X_TAG(set_service_acl_atom, 230)
-X_TAG(set_acl_atom, 231)
+X_TAG(set_service_acl_atom, 229)
+X_TAG(set_acl_atom, 230)
 
 // -- 旁路热更新（见 docs/plugin-guide.md §8）--------------------------
-X_TAG(reload_atom, 232)
-X_TAG(quiesce_atom, 233)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
-X_TAG(resume_atom, 234)    // 代理恢复：切换到新实现并冲刷缓冲
+X_TAG(reload_atom, 231)
+X_TAG(quiesce_atom, 232)   // 代理静默：暂停转发、缓冲新调用（先排空后快照）
+X_TAG(resume_atom, 233)    // 代理恢复：切换到新实现并冲刷缓冲
 
 // -- 集群节点协议（master 扁平注册 + 子树，见 common/cluster_types.hpp）--
 // 机制移植自 warehouse-backend/distributed-nodes，类型注册沿用本文件
 // 显式 ID 方案（跨 DLL 一致，DLL 动态加载场景安全）。
-X_TAG(node_register_atom, 235)    // 节点注册（manifest + monitor）
-X_TAG(node_heartbeat_atom, 236)   // 心跳续租
-X_TAG(node_unregister_atom, 237)  // 节点注销
-X_TAG(node_topology_atom, 238)    // 全量拓扑快照
-X_TAG(node_children_atom, 239)    // 指定父节点的子树
-X_TAG(node_resolve_atom, 240)     // 解析节点上导出的 actor 路由
-X_TAG(node_shutdown_atom, 241)    // 关机级联请求
-X_REG(node_kind, (caf_plugin_system::node_kind), 242, "node_kind")
-X_REG(node_manifest, (caf_plugin_system::node_manifest), 243, "node_manifest")
-X_REG(node_registration, (caf_plugin_system::node_registration), 244, "node_registration")
-X_REG(register_reply, (caf_plugin_system::register_reply), 245, "register_reply")
-X_REG(topology_snapshot, (caf_plugin_system::topology_snapshot), 246, "topology_snapshot")
-X_REG(child_snapshot, (caf_plugin_system::child_snapshot), 247, "child_snapshot")
-X_REG(actor_route, (caf_plugin_system::actor_route), 248, "actor_route")
-X_REG(shutdown_request, (caf_plugin_system::shutdown_request), 249, "shutdown_request")
-X_REG(shutdown_source, (caf_plugin_system::shutdown_source), 250, "shutdown_source")
-X_TAG(heartbeat_tick_atom, 251)   // 节点客户端内部心跳定时器
-X_TAG(retry_tick_atom, 252)       // 节点客户端重连定时器
-X_TAG(maintenance_tick_atom, 253) // master 注册表维护周期（lease 过期清理）
-X_TAG(exported_actors_atom, 254)  // 查询本进程已导出到 CAF registry 的服务名列表
-X_TAG(cross_call_atom, 255)       // 跨节点调用：请求 RemoteCaller 调用远端服务
-X_TAG(internal_resolve_atom, 256) // RemoteCaller 内部：resolve+调用流程（携带响应承诺）
-X_TAG(service_resolve_atom, 257)  // 按服务名解析：master 返回导出该服务的全部节点路由
-X_REG(service_route, (caf_plugin_system::service_route), 258, "service_route")
-X_TAG(cross_call_ex_atom, 259)    // 跨节点调用（有界重试）：attempts 次尝试，间隔可中断等待
-X_TAG(remote_retry_tick_atom, 260) // RemoteCaller 内部：per-key 重试定时器（event-based 状态机）
+X_TAG(node_register_atom, 234)    // 节点注册（manifest + monitor）
+X_TAG(node_heartbeat_atom, 235)   // 心跳续租
+X_TAG(node_unregister_atom, 236)  // 节点注销
+X_TAG(node_topology_atom, 237)    // 全量拓扑快照
+X_TAG(node_children_atom, 238)    // 指定父节点的子树
+X_TAG(node_resolve_atom, 239)     // 解析节点上导出的 actor 路由
+X_REG(node_kind, (caf_plugin_system::node_kind), 240, "node_kind")
+X_REG(node_manifest, (caf_plugin_system::node_manifest), 241, "node_manifest")
+X_REG(node_registration, (caf_plugin_system::node_registration), 242, "node_registration")
+X_REG(register_reply, (caf_plugin_system::register_reply), 243, "register_reply")
+X_REG(topology_snapshot, (caf_plugin_system::topology_snapshot), 244, "topology_snapshot")
+X_REG(child_snapshot, (caf_plugin_system::child_snapshot), 245, "child_snapshot")
+X_REG(actor_route, (caf_plugin_system::actor_route), 246, "actor_route")
+X_REG(shutdown_request, (caf_plugin_system::shutdown_request), 247, "shutdown_request")
+X_REG(shutdown_source, (caf_plugin_system::shutdown_source), 248, "shutdown_source")
+X_TAG(heartbeat_tick_atom, 249)   // 节点客户端内部心跳定时器
+X_TAG(retry_tick_atom, 250)       // 节点客户端重连定时器
+X_TAG(maintenance_tick_atom, 251) // master 注册表维护周期（lease 过期清理）
+X_TAG(exported_actors_atom, 252)  // 查询本进程已导出到 CAF registry 的服务名列表
+X_TAG(cross_call_atom, 253)       // 跨节点调用：请求 RemoteCaller 调用远端服务
+X_TAG(service_resolve_atom, 254)  // 按服务名解析：master 返回导出该服务的全部节点路由
+X_REG(service_route, (caf_plugin_system::service_route), 255, "service_route")
+X_TAG(cross_call_ex_atom, 256)    // 跨节点调用（有界重试）：attempts 次尝试，间隔可中断等待
+X_TAG(remote_retry_tick_atom, 257) // RemoteCaller 内部：per-key 重试定时器（event-based 状态机）
 
 // -- 运维（OpsActor，见 src/core/cluster/ops_actor.*）---------------------
 // 内核固定协议（与集群协议同级，非插件 envelope）：远程热更 + 本地控制台。
 // 双模式：dll_bytes 推送（master 读本地 DLL 发节点，节点落盘 updates/ 新路径）
 //         或 dll_path 已就位（DLL 已通过其他渠道到达节点本地）。
-X_TAG(remote_reload_atom, 261)    // master→节点 OpsActor：远程热更（载荷 reload_request）
-X_REG(reload_request, (caf_plugin_system::reload_request), 262, "reload_request")
-X_REG(reload_result, (caf_plugin_system::reload_result), 263, "reload_result")
-X_TAG(console_cmd_atom, 264)      // 本地控制台：stdin 线程 → OpsActor（命令字符串）
-X_TAG(list_plugins_atom, 265)     // 查询本机插件列表 → vector<string>
-X_TAG(register_cluster_atom, 266) // 节点引导后：把 master/client 句柄注册给 shutdown_mgr（关机统一终止）
+X_TAG(remote_reload_atom, 258)    // master→节点 OpsActor：远程热更（载荷 reload_request）
+X_REG(reload_request, (caf_plugin_system::reload_request), 259, "reload_request")
+X_REG(reload_result, (caf_plugin_system::reload_result), 260, "reload_result")
+X_TAG(console_cmd_atom, 261)      // 本地控制台：stdin 线程 → OpsActor（命令字符串）
+X_TAG(list_plugins_atom, 262)     // 查询本机插件列表 → vector<string>
+X_TAG(register_cluster_atom, 263) // 节点引导后：把 master/client 句柄注册给 shutdown_mgr（关机统一终止）
 // -- bridge（外部语言节点 sidecar，见 src/core/bridge_actor.*）-------------
 // 进程内消息（外部进程经 TCP 行协议接入，不占跨进程协议）：CALL 行 →
 // bridge actor 本地调服务；外部对 REQ 的 RESULT 行 → external_echo 实现 actor。
-X_TAG(ext_call_atom, 267)    // bridge actor：外部请求调本地服务（id, svc, payload）
-X_TAG(ext_result_atom, 268)  // external_echo：外部对 REQ 的响应（rid, ok, payload）
+X_TAG(ext_call_atom, 264)    // bridge actor：外部请求调本地服务（id, svc, payload）
+X_TAG(ext_result_atom, 265)  // external_echo：外部对 REQ 的响应（rid, ok, payload）
+X_TAG(write_atom, 266)       // bridge broker：写外部进程一行（REQ/RESULT 行；broker 转发到当前连接）
 // -- 数据库插件契约（db_contract.hpp：Redis/MySQL/PostgreSQL/MongoDB 共用）----
 // cell 全字符串化的统一结果集 db_result（JDBC 风格，天然可跨节点序列化）。
 // 四个插件提供不同服务名（redis_service/mysql_service/pg_service/mongo_service），
 // 消息类型统一；事务句柄 = uint64（CAF 内置类型，无需注册）。
-X_REG(db_result, (caf_plugin_system::db::db_result), 269, "db_result")
-X_TAG(redis_cmd_atom, 270)    // Redis 命令：(conn, cmd, args) → db_result；三参 (cmd, args) 走默认连接（MULTI/EXEC 即命令，天然支持事务）
-X_TAG(sql_query_atom, 271)    // SQL 查询：(sql, params) → db_result（MySQL/PG）
-X_TAG(sql_exec_atom, 272)     // SQL 写：(sql, params) → db_result（affected/insert_id）
-X_TAG(tx_begin_atom, 273)     // 开启事务：→ uint64 tx_handle
-X_TAG(tx_commit_atom, 274)    // 提交事务：(tx_handle) → db_result
-X_TAG(tx_rollback_atom, 275)  // 回滚事务：(tx_handle) → db_result
-X_TAG(mongo_op_atom, 276)     // Mongo 操作：(collection, op, json) → db_result
+X_REG(db_result, (caf_plugin_system::db::db_result), 267, "db_result")
+X_TAG(redis_cmd_atom, 268)    // Redis 命令：(conn, cmd, args) → db_result；三参 (cmd, args) 走默认连接（MULTI/EXEC 即命令，天然支持事务）
+X_TAG(sql_query_atom, 269)    // SQL 查询：(sql, params) → db_result（MySQL/PG）
+X_TAG(sql_exec_atom, 270)     // SQL 写：(sql, params) → db_result（affected/insert_id）
+X_TAG(tx_begin_atom, 271)     // 开启事务：→ uint64 tx_handle
+X_TAG(tx_commit_atom, 272)    // 提交事务：(tx_handle) → db_result
+X_TAG(tx_rollback_atom, 273)  // 回滚事务：(tx_handle) → db_result
+X_TAG(mongo_op_atom, 274)     // Mongo 操作：(collection, op, json) → db_result
