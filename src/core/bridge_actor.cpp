@@ -7,27 +7,16 @@
 
 #include <caf/all.hpp>
 #include <caf/actor_registry.hpp>
+#include <caf/io/all.hpp>
 
-#include <atomic>
 #include <algorithm>
-#include <condition_variable>
+#include <cstdint>
 #include <cstring>
-#include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <set>
 #include <string>
-#include <thread>
-
-#ifdef _WIN32
-#include <winsock2.h> // 必须在 windows.h 之前
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
+#include <vector>
 
 namespace caf_plugin_system {
 
@@ -38,9 +27,6 @@ namespace {
 // ------------------------------------------------------------------
 constexpr std::uint16_t k_bridge_sub_proto = 1; // external_echo 信封子协议号
 
-// ------------------------------------------------------------------
-// 跨平台 socket 别名
-// ------------------------------------------------------------------
 struct BridgeImplState {
     int seq = 0;                            // REQ 序号（rid）
     // 用 typed_response_promise（public 可拷贝）——caf::response_promise
@@ -49,186 +35,6 @@ struct BridgeImplState {
 };
 
 struct BridgeState {}; // bridge 主 actor 无状态（全在 lambda 捕获里）
-
-#ifdef _WIN32
-using socket_t = SOCKET;
-constexpr socket_t k_invalid_socket = INVALID_SOCKET;
-#else
-using socket_t = int;
-constexpr socket_t k_invalid_socket = -1;
-#endif
-
-void close_socket(socket_t fd) {
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    ::close(fd);
-#endif
-}
-
-// ------------------------------------------------------------------
-// 线程安全的写队列：写线程消费，actor（bridge / external_echo）生产
-// ------------------------------------------------------------------
-struct WriteQueue {
-    std::mutex m;
-    std::condition_variable cv;
-    std::deque<std::string> lines;
-    bool closed = false;
-
-    void push(std::string line) {
-        std::lock_guard<std::mutex> lock(m);
-        lines.push_back(std::move(line));
-        cv.notify_one();
-    }
-
-    // 阻塞取一行；closed 且空时返回 false（写线程退出）
-    bool pop(std::string& out) {
-        std::unique_lock<std::mutex> lock(m);
-        cv.wait(lock, [this] { return closed || !lines.empty(); });
-        if (lines.empty())
-            return false;
-        out = std::move(lines.front());
-        lines.pop_front();
-        return true;
-    }
-
-    void close() {
-        std::lock_guard<std::mutex> lock(m);
-        closed = true;
-        cv.notify_all();
-    }
-};
-
-// ------------------------------------------------------------------
-// 当前活动连接：actor 写 socket 的唯一入口 + 全部资源句柄。
-// 坑 1：若 actor 直接捕获"主 wq"，而写线程消费的是每连接新建的 wq，
-//       则 respond/REQ 全进无人消费的队列 → 外部进程永远等不到响应
-//       （实测：Python 15s 超时、master 跨节点 request_timeout）。
-//       因此 actor 必须经 active->push() 转发到【当前连接】的 wq。
-// 坑 2：detached 线程在进程退出时被强杀不 unwind → 栈上 shared_ptr
-//       不析构 → CRT dump 报泄露（实测 "REQ 53 ..." 残留在 WriteQueue）。
-//       因此线程全部登记到 active，bridge actor exit 时 shutdown_and_join：
-//       close 所有 fd + wq->close() → 线程阻塞点返回 → join → 0 泄露。
-// ------------------------------------------------------------------
-struct ActiveConn {
-    std::mutex m;
-    std::shared_ptr<WriteQueue> wq;
-    socket_t listener = k_invalid_socket;
-    std::vector<socket_t> conns;
-    std::vector<std::thread> threads;
-    bool shutting_down = false;
-
-    void set_listener(socket_t s) {
-        std::lock_guard<std::mutex> g(m);
-        listener = s;
-    }
-    void set_wq(std::shared_ptr<WriteQueue> w) {
-        std::lock_guard<std::mutex> g(m);
-        wq = std::move(w);
-    }
-    void add_conn(socket_t fd) {
-        std::lock_guard<std::mutex> g(m);
-        conns.push_back(fd);
-    }
-    void add_thread(std::thread t) {
-        std::lock_guard<std::mutex> g(m);
-        threads.push_back(std::move(t));
-    }
-    void push(const std::string& line) {
-        std::lock_guard<std::mutex> g(m);
-        if (wq)
-            wq->push(line);
-    }
-    bool is_shutting_down() {
-        std::lock_guard<std::mutex> g(m);
-        return shutting_down;
-    }
-    void shutdown_and_join() {
-        std::vector<std::thread> ts;
-        {
-            std::lock_guard<std::mutex> g(m);
-            if (!shutting_down) {
-                shutting_down = true;
-                if (listener != k_invalid_socket)
-                    close_socket(listener);
-                for (auto fd : conns)
-                    close_socket(fd);
-                if (wq)
-                    wq->close();
-            }
-            ts = std::move(threads);
-        }
-        for (auto& t : ts)
-            if (t.joinable())
-                t.join();
-    }
-};
-
-// ------------------------------------------------------------------
-// 带缓冲的行读取器（阻塞 recv）
-// ------------------------------------------------------------------
-struct LineReader {
-    socket_t fd;
-    std::string buf;
-    std::shared_ptr<ActiveConn> active; // 优雅关闭标志查询（recv 失败门控）
-
-    // 读一行（含 \n）；EOF/错误返回 false
-    bool read_line(std::string& out) {
-        while (true) {
-            auto nl = buf.find('\n');
-            if (nl != std::string::npos) {
-                out = buf.substr(0, nl + 1);
-                buf.erase(0, nl + 1);
-                return true;
-            }
-            char tmp[4096];
-            int n = recv(fd, tmp, static_cast<int>(sizeof tmp), 0);
-            if (n <= 0) {
-                // 优雅关闭时 shutdown_and_join() 主动 close 全部 fd，
-                // recv 失败（WSAECONNABORTED）是预期行为，不刷噪音；
-                // 非关闭期的失败才打（客户端异常断开，调试有用）。
-                if (!active || !active->is_shutting_down()) {
-#ifdef _WIN32
-                    fprintf(stderr, "[Bridge] recv failed, err=%d n=%d\n",
-                            WSAGetLastError(), n);
-#else
-                    fprintf(stderr, "[Bridge] recv failed, errno=%d n=%d\n",
-                            errno, n);
-#endif
-                    fflush(stderr);
-                }
-                return false;
-            }
-            buf.append(tmp, static_cast<size_t>(n));
-        }
-    }
-
-    // 精确读 len 字节（可能跨缓冲）
-    bool read_exact(char* dst, size_t len) {
-        while (buf.size() < len) {
-            char tmp[4096];
-            int n = recv(fd, tmp, static_cast<int>(sizeof tmp), 0);
-            if (n <= 0)
-                return false;
-            buf.append(tmp, static_cast<size_t>(n));
-        }
-        std::memcpy(dst, buf.data(), len);
-        buf.erase(0, len);
-        return true;
-    }
-};
-
-bool send_all(socket_t fd, const std::string& s) {
-    size_t sent = 0;
-    while (sent < s.size()) {
-        int n = send(fd, s.data() + sent,
-                     static_cast<int>(s.size() - sent), 0);
-        if (n <= 0)
-            return false;
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
 
 // "REQ <rid> <len>" / "RESULT <id> OK|ERR <len>" 的头部行
 std::string header_line(const std::string& kind, int id,
@@ -254,161 +60,142 @@ std::vector<std::byte> string_to_bytes(const std::string& s) {
 }
 
 // ------------------------------------------------------------------
-// 连接读线程：外部行 → 按类型投递给 bridge actor（CALL）或
-// external_echo 实现 actor（RESULT）。捕获 actor_addr（弱引用），
-// 发送前升级——线程被进程退出强杀时不 unwind，强引用会保活 actor。
+// 行协议帧解析（broker 事件驱动版）
+//
+// 帧格式：<KIND> <id> [<status>] <len>\n <payload> \n
+//   KIND = CALL（id, svc, payload）/ RESULT（rid, OK|ERR, payload）
+// 驱动方式：new_data_msg 的 buf 追加到连接缓冲，循环 try_parse_frame
+// 消费完整帧；缓冲不足返回 false（等更多数据）。
 // ------------------------------------------------------------------
-void conn_read_loop(socket_t fd, caf::actor_addr bridge_addr,
-                    caf::actor_addr impl_addr,
-                    std::shared_ptr<ActiveConn> active) {
-    LineReader reader{fd, {}, active};
-    std::string head;
-    while (reader.read_line(head)) {
-        // 头部：<KIND> <id> [<status>] <len>\n
-        // 用最后一个空格切出 len，前面按空格分 token
-        auto last_space = head.rfind(' ');
-        if (last_space == std::string::npos)
-            break;
-        std::string len_str = head.substr(last_space + 1);
-        while (!len_str.empty()
-               && (len_str.back() == '\n' || len_str.back() == '\r'))
-            len_str.pop_back();
-        std::string prefix = head.substr(0, last_space);
-        // prefix: "CALL <id> <svc>" 或 "RESULT <id> OK|ERR"
-        auto sp1 = prefix.find(' ');
-        if (sp1 == std::string::npos)
-            break;
-        std::string kind = prefix.substr(0, sp1);
-        std::string rest = prefix.substr(sp1 + 1);
-        auto sp2 = rest.find(' ');
-        if (sp2 == std::string::npos)
-            break;
-        std::string id_str = rest.substr(0, sp2);
-        std::string third = rest.substr(sp2 + 1);
+struct ParsedFrame {
+    // Invalid 放第 0 位：声明后未赋值时默认即 Invalid（防御性安全）
+    enum class Kind { Invalid, Call, Result };
+    Kind kind = Kind::Invalid;
+    int id = 0;
+    std::string svc;  // CALL 的服务名
+    bool ok = false;  // RESULT 的 OK/ERR
+    std::string payload;
+};
 
-        size_t len = 0;
-        try {
-            len = static_cast<size_t>(std::stoull(len_str));
-        } catch (...) {
-            break;
-        }
-        if (len > 64u * 1024u * 1024u) // 64MB 上限防恶意长度
-            break;
-        std::string payload;
-        payload.resize(len);
-        if (len > 0 && !reader.read_exact(payload.data(), len))
-            break;
-        // 跳过 payload 后的行终止符
-        char tail = 0;
-        if (!reader.read_exact(&tail, 1) || tail != '\n')
-            break;
-
-        int id = 0;
-        try {
-            id = std::stoi(id_str);
-        } catch (...) {
-            break;
-        }
-
-        // Python 主动调用 exe
-        if (kind == "CALL") {
-            // third = 服务名
-            auto strong = caf::actor_cast<caf::actor>(bridge_addr);
-            if (strong)
-                caf::anon_send(strong, ext_call_atom_v, id, third,
-                               std::move(payload));
-        } else if (kind == "RESULT") {  // exe 调用 Python，异步回调
-            // third = OK | ERR
-            bool ok = (third == "OK");
-            auto strong = caf::actor_cast<caf::actor>(impl_addr);
-            if (strong)
-                caf::anon_send(strong, ext_result_atom_v, id, ok,
-                               std::move(payload));
-        }
-        // 其他行忽略
+// 尝试从缓冲头部解析一帧。返回 false = 数据不足；true = 消费一帧
+//（kind == Invalid 表示协议错误，调用方决定断开该连接）。
+bool try_parse_frame(std::string& buf, ParsedFrame& out) {
+    // 头部行（到 \n）
+    auto nl = buf.find('\n');
+    if (nl == std::string::npos)
+        return false;
+    std::string head = buf.substr(0, nl);
+    // 用最后一个空格切出 len，前面按空格分 token
+    auto last_space = head.rfind(' ');
+    if (last_space == std::string::npos) {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
     }
-    close_socket(fd);
+    std::string len_str = head.substr(last_space + 1);
+    while (!len_str.empty() && (len_str.back() == '\n' || len_str.back() == '\r'))
+        len_str.pop_back();
+    std::string prefix = head.substr(0, last_space);
+    auto sp1 = prefix.find(' ');
+    if (sp1 == std::string::npos) {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    std::string kind = prefix.substr(0, sp1);
+    std::string rest = prefix.substr(sp1 + 1);
+    auto sp2 = rest.find(' ');
+    if (sp2 == std::string::npos) {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    std::string id_str = rest.substr(0, sp2);
+    std::string third = rest.substr(sp2 + 1);
+    size_t len = 0;
+    try {
+        len = static_cast<size_t>(std::stoull(len_str));
+    } catch (...) {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    if (len > 64u * 1024u * 1024u) { // 64MB 上限防恶意长度
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    // 等 payload + 尾部行终止符
+    if (buf.size() < nl + 1 + len + 1)
+        return false;
+    std::string payload = buf.substr(nl + 1, len);
+    if (buf[nl + 1 + len] != '\n') {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    buf.erase(0, nl + 1 + len + 1);
+    int id = 0;
+    try {
+        id = std::stoi(id_str);
+    } catch (...) {
+        out.kind = ParsedFrame::Kind::Invalid;
+        return true;
+    }
+    out.id = id;
+    out.payload = std::move(payload);
+    if (kind == "CALL") {
+        out.kind = ParsedFrame::Kind::Call;
+        out.svc = third;
+    } else if (kind == "RESULT") {
+        out.kind = ParsedFrame::Kind::Result;
+        out.ok = (third == "OK");
+    } else {
+        out.kind = ParsedFrame::Kind::Invalid;
+    }
+    return true;
 }
 
-// ------------------------------------------------------------------
-// 连接写线程：消费 WriteQueue，串行写 socket
-// ------------------------------------------------------------------
-void conn_write_loop(socket_t fd, std::shared_ptr<WriteQueue> wq) {
-    std::string line;
-    while (wq->pop(line)) {
-        if (!send_all(fd, line))
-            break;
-    }
-    close_socket(fd);
-}
+} // namespace（匿名结束：辅助类型；spawn_bridge_actor 必须外部链接）
 
 // ------------------------------------------------------------------
-// listener 线程：accept → 每连接一对读写线程；连接 wq 注册给 active
+// spawn_bridge_actor —— broker 版（2026-08-26 重写）
+//
+// 替换点：手写 socket（WSAStartup/bind/listen/accept/recv/send）+ 每
+// 连接读写线程 + WriteQueue/ActiveConn 全部移除，改为 caf::io::broker
+// 事件驱动：
+//   - add_tcp_doorman(port) 监听（CAF 内部建 socket，Winsock 由
+//     middleman 初始化，无需 WSAStartup）
+//   - new_connection_msg → configure_read(at_least(1)) 收数据
+//   - new_data_msg → 行协议解析（try_parse_frame）→ 转发 CALL/RESULT
+//   - write_atom → write(handle, span) 写外部（v1 单连接语义写当前连接）
+// 收益：零手写线程/零 socket 管理/零 join 时序问题；actor 退出时
+// middleman 自动关闭 doorman/scribe，无 detached 线程泄露面。
 // ------------------------------------------------------------------
-void listener_loop(socket_t listener, caf::actor_addr bridge_addr,
-                   caf::actor_addr impl_addr,
-                   std::shared_ptr<ActiveConn> active) {
-    fprintf(stderr, "[Bridge] listener thread started, accepting...\n");
-    fflush(stderr);
-    while (true) {
-        socket_t fd = accept(listener, nullptr, nullptr);
-        if (fd == k_invalid_socket) {
-            // 优雅关闭：shutdown_and_join() close listener 打断阻塞的
-            // accept（WSAEINTR），预期行为，不打噪音；非关闭期的
-            // accept 失败才打（端口耗尽等，调试有用）。
-            if (!active->is_shutting_down()) {
-#ifdef _WIN32
-                fprintf(stderr, "[Bridge] accept failed, err=%d\n",
-                        WSAGetLastError());
-#else
-                fprintf(stderr, "[Bridge] accept failed, errno=%d\n", errno);
-#endif
-                fflush(stderr);
-            }
-            break;
-        }
-        auto wq = std::make_shared<WriteQueue>();
-        active->set_wq(wq); // 本连接成为"当前连接"（v1 单连接语义）
-        active->add_conn(fd);
-        active->add_thread(std::thread(conn_write_loop, fd, wq));
-        active->add_thread(
-            std::thread(conn_read_loop, fd, bridge_addr, impl_addr, active));
-    }
-    close_socket(listener);
-}
-
-} // namespace
-
 caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
                               std::uint16_t port,
                               const std::string& node_name) {
-#ifdef _WIN32
-    static std::atomic<bool> wsock_init{false};
-    if (!wsock_init.exchange(true)) {
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-    }
-#endif
-
-    // ---- 活动连接：impl actor（REQ）与 bridge actor（RESULT）经它写
-    //      socket（转发到当前连接的 wq，见 ActiveConn 注释）----
-    auto active = std::make_shared<ActiveConn>();
+    // broker 句柄间接层：impl/bridge 先 spawn，broker 后 spawn，运行时填充
+    auto broker_ref = std::make_shared<caf::actor>();
 
     // ---- external_echo 实现 actor：集群调用（envelope）→ REQ 出站，
     //      外部 RESULT 到达后 deliver 给调用方 ----
     auto impl = sys.spawn(
-        [active](caf::stateful_actor<BridgeImplState>* self) {
+        [broker_ref](caf::stateful_actor<BridgeImplState>* self) {
             return caf::behavior{
-                // 发给 Python
-                [self, active](plugin_envelope& env) -> caf::result<std::string> {
+                // 发给外部进程
+                [self, broker_ref](plugin_envelope& env) -> caf::result<std::string> {
                     auto rid = ++self->state().seq;
                     std::string payload = bytes_to_string(env.payload);
                     auto rp = self->make_response_promise<std::string>();
                     self->state().pending.emplace(rid, rp);
-                    active->push(header_line("REQ", rid, "", payload.size())
-                                 + payload + "\n");
+                    if (*broker_ref) {
+                        caf::anon_send(*broker_ref, write_atom_v,
+                                       header_line("REQ", rid, "", payload.size())
+                                           + payload + "\n");
+                    } else {
+                        // 理论上不可达（broker 先于任何请求 spawn）；
+                        // 兜底防 rp 悬空
+                        rp.deliver(caf::make_error(caf::sec::runtime_error,
+                                                   "bridge broker not ready"));
+                    }
                     return rp;
                 },
+                // Python 回复
                 [self](ext_result_atom, int rid, bool ok,
                        const std::string& payload) {
                     auto it = self->state().pending.find(rid);
@@ -424,6 +211,166 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
                             caf::sec::runtime_error, payload));
                     }
                     self->state().pending.erase(it);
+                },
+                [self](caf::exit_msg&) { self->quit(); }};
+        });
+
+    // ---- bridge 主 actor：外部 CALL → resolve 本地服务 → 信封调用 ----
+    // exit 时连 impl 一起杀：registry 关机只 send_exit proxy 不杀 impl，
+    // 若 impl 无人 send_exit → actor_system 析构 join 它 → 进程挂起。
+    auto bridge = sys.spawn(
+        [registry, broker_ref, impl](caf::stateful_actor<BridgeState>* self) {
+            return caf::behavior{
+                // 外部进程发来的
+                [self, registry, broker_ref](ext_call_atom, int id,
+                                             const std::string& svc,
+                                             const std::string& payload) {
+                    auto respond = [broker_ref, id](bool ok,
+                                                    std::string body) {
+                        if (*broker_ref)
+                            caf::anon_send(*broker_ref, write_atom_v,
+                                           header_line("RESULT", id,
+                                                       ok ? "OK" : "ERR",
+                                                       body.size())
+                                               + body + "\n");
+                    };
+                    self->request(registry, std::chrono::seconds(2),
+                                  resolve_atom_v, svc)
+                        .then(
+                            [self, svc, payload,
+                             respond](caf::actor& proxy) {
+                                if (!proxy) {
+                                    respond(false,
+                                            "service not found: " + svc);
+                                    return;
+                                }
+                                plugin_envelope env;
+                                env.sub_proto = k_bridge_sub_proto;
+                                env.payload = string_to_bytes(payload);
+                                self->request(proxy, std::chrono::seconds(5),
+                                              std::move(env))
+                                    .then(
+                                        [respond](std::string& r) {
+                                            respond(true, std::move(r));
+                                        },
+                                        [respond](caf::error& e) {
+                                            respond(false,
+                                                    caf::to_string(e));
+                                        });
+                            },
+                            [respond](caf::error& e) {
+                                respond(false, caf::to_string(e));
+                            });
+                },
+                [self, impl, broker_ref](caf::exit_msg&) {
+                    self->send_exit(impl, caf::exit_reason::user_shutdown);
+                    // broker 退出时 middleman 自动关闭 doorman/连接
+                    if (*broker_ref)
+                        self->send_exit(*broker_ref,
+                                        caf::exit_reason::user_shutdown);
+                    self->quit();
+                }};
+        });
+
+    // ---- bridge broker：监听 + 读事件 + 行协议解析 + 写转发 ----
+    auto bridge_addr = caf::actor_cast<caf::actor_addr>(bridge);
+    auto impl_addr = caf::actor_cast<caf::actor_addr>(impl);
+    // broker 不能 sys.spawn()（prohibit_top_level_spawn_marker）；
+    // 官方入口是 middleman::spawn_broker（CAF 1.1，middleman.hpp:204）
+    *broker_ref = sys.middleman().spawn_broker(
+        [bridge_addr, impl_addr, port, node_name](caf::io::broker* self) {
+            // reuse_addr=true：强杀/崩溃后 TIME_WAIT 残留端口，bind 立即
+            // 复用（原手写 socket 版实测：Stop-Process 强杀 → 立刻重跑
+            // → WSAEADDRINUSE，SO_REUSEADDR 治本）。
+            auto doorman = self->add_tcp_doorman(port, nullptr, true);  // 监听端口
+            if (!doorman) {
+                LOG_ERROR("[Bridge] add_tcp_doorman on port "
+                          + std::to_string(port) + " failed, bridge disabled");
+                self->quit();
+                return caf::behavior{};
+            }
+            LOG_INFO("[Bridge] " + node_name + " listening on port "
+                     + std::to_string(port) + " (external_echo registered)");
+
+            // 每连接读缓冲；bad = 协议错误连接（忽略后续数据，等对端关）
+            auto rx = std::make_shared<std::map<caf::io::connection_handle,
+                                                std::string>>();
+            auto bad = std::make_shared<std::set<caf::io::connection_handle>>();
+            // 当前连接（v1 单连接语义：外部只有一个进程，写它）
+            auto current = std::make_shared<caf::io::connection_handle>();
+
+            return caf::behavior{
+                [self, rx, bad, current](caf::io::new_connection_msg& msg) {
+                    self->configure_read(msg.handle,
+                                         caf::io::receive_policy::at_least(1));
+                    *current = msg.handle;
+                    (*rx)[msg.handle].clear();
+                    bad->erase(msg.handle);
+                    LOG_INFO("[Bridge] new connection: "
+                             + std::to_string(msg.handle.id()));
+                },
+                [self, rx, bad, current, bridge_addr,
+                 impl_addr](caf::io::new_data_msg& msg) {
+                    if (bad->count(msg.handle))
+                        return;
+                    auto& buf = (*rx)[msg.handle];
+                    buf.append(reinterpret_cast<const char*>(msg.buf.data()),
+                               msg.buf.size());
+                    LOG_INFO("[Bridge] rx " + std::to_string(msg.buf.size())
+                             + "B from " + std::to_string(msg.handle.id()));
+                    ParsedFrame frame;
+                    while (try_parse_frame(buf, frame)) {
+                        if (frame.kind == ParsedFrame::Kind::Invalid) {
+                            // 协议错误：标记该连接，忽略后续数据
+                            bad->insert(msg.handle);
+                            rx->erase(msg.handle);
+                            break;
+                        }
+                        if (frame.kind == ParsedFrame::Kind::Call) {
+                            auto strong = caf::actor_cast<caf::actor>(bridge_addr);
+                            LOG_INFO("[Bridge] CALL " + std::to_string(frame.id)
+                                     + " svc=" + frame.svc + " len="
+                                     + std::to_string(frame.payload.size()));
+                            if (strong)
+                                caf::anon_send(strong, ext_call_atom_v, frame.id,
+                                               frame.svc, frame.payload);
+                        } else if (frame.kind == ParsedFrame::Kind::Result) {
+                            auto strong = caf::actor_cast<caf::actor>(impl_addr);
+                            if (strong)
+                                caf::anon_send(strong, ext_result_atom_v, frame.id,
+                                               frame.ok, frame.payload);
+                        }
+                    }
+                },
+                [self, rx, bad, current](caf::io::connection_closed_msg& msg) {
+                    rx->erase(msg.handle);
+                    bad->erase(msg.handle);
+                    if (!current->invalid() && *current == msg.handle)
+                        *current = caf::io::connection_handle{};
+                },
+                [self, current](write_atom, const std::string& line) {
+                    // v1 单连接语义：写当前连接
+                    if (!current->invalid()) {
+                        LOG_INFO("[Bridge] tx " + std::to_string(line.size())
+                                 + "B to " + std::to_string(current->id()));
+                        // CAF 1.1 写模型：write 进缓冲 + flush 发送。
+                        // new_data_msg 处理路径 multiplexer 会自动 flush，
+                        // 但 scheduler 线程（write_atom 消息）必须显式
+                        // flush，否则缓冲滞留（实测 2026-08-26：写后 1s
+                        // 无响应，客户端再发 1B 唤醒才收到缓冲数据）。
+                        self->write(*current,
+                                    caf::make_span(
+                                        reinterpret_cast<const std::byte*>(
+                                            line.data()),
+                                        line.size()));
+                        self->flush(*current);
+                    } else {
+                        LOG_WARN("[Bridge] tx dropped: no current connection");
+                    }
+                },
+                [self](caf::io::data_transferred_msg&) {
+                    // ack_writes(true) 的写完成通知；无操作（写缓冲由
+                    // multiplexer 管理，无需逐字节确认）
                 },
                 [self](caf::exit_msg&) { self->quit(); }};
         });
@@ -452,99 +399,6 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
         LOG_ERROR("[Bridge] external_echo registration not confirmed");
     }
 
-    auto impl_addr = caf::actor_cast<caf::actor_addr>(impl);
-
-    // ---- bridge 主 actor：外部 CALL → resolve 本地服务 → 信封调用 ----
-    // exit 时连 impl 一起杀：registry 关机只 send_exit proxy 不杀 impl，
-    // 若 impl 无人 send_exit → actor_system 析构 join 它 → 进程挂起。
-    auto bridge = sys.spawn(
-        [registry, active, impl](caf::stateful_actor<BridgeState>* self) {
-            return caf::behavior{
-                // Python 发来的
-                [self, registry, active](ext_call_atom, int id,
-                                         const std::string& svc,
-                                         const std::string& payload) {
-                    auto respond = [active, id](bool ok,
-                                                std::string body) {
-                        active->push(header_line("RESULT", id,
-                                                 ok ? "OK" : "ERR",
-                                                 body.size())
-                                     + body + "\n");
-                    };
-                    self->request(registry, std::chrono::seconds(2),
-                                  resolve_atom_v, svc)
-                        .then(
-                            [self, active, svc, payload,
-                             respond](caf::actor& proxy) {
-                                if (!proxy) {
-                                    respond(false,
-                                            "service not found: " + svc);
-                                    return;
-                                }
-                                plugin_envelope env;
-                                env.sub_proto = k_bridge_sub_proto;
-                                env.payload = string_to_bytes(payload);
-                                self->request(proxy, std::chrono::seconds(5),
-                                              std::move(env))
-                                    .then(
-                                        [respond](std::string& r) {
-                                            respond(true, std::move(r));
-                                        },
-                                        [respond](caf::error& e) {
-                                            respond(false,
-                                                    caf::to_string(e));
-                                        });
-                            },
-                            [respond](caf::error& e) {
-                                respond(false, caf::to_string(e));
-                            });
-                },
-                [self, impl, active](caf::exit_msg&) {
-                    self->send_exit(impl, caf::exit_reason::user_shutdown);
-                    // 优雅关闭 socket 线程并 join：detached 线程在进程
-                    // 退出时被强杀不 unwind → 栈上 shared_ptr 泄漏
-                    // （CRT dump 报 "REQ ..." 残留）。join 前 close 全部
-                    // fd + wq->close()，阻塞点（accept/recv/pop）立即返回。
-                    active->shutdown_and_join();
-                    self->quit();
-                }};
-        });
-
-    // ---- listener：bind/listen/accept ----
-    socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == k_invalid_socket) {
-        LOG_ERROR("[Bridge] socket() failed, bridge disabled");
-        return bridge; // actor 仍在，只是无连接
-    }
-    // SO_REUSEADDR：强杀/崩溃后 TIME_WAIT 残留端口，bind 立即复用。
-    // 否则测试中 Stop-Process 强杀 → 立刻重跑脚本 → WSAEADDRINUSE
-    // （实测：bind/listen on 127.0.0.1:48060 failed）。
-    {
-        int reuse = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-    }
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    // 绑 0.0.0.0：WSL 里的外部语言客户端经宿主 IP 连接（WSL2 的
-    // 127.0.0.1 是 WSL 自己的 loopback，连不到 Windows 监听）。
-    // 生产部署应改回 INADDR_LOOPBACK 并配合防火墙。
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port); // 必须设！遗漏 = bind 随机端口（踩过）
-    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0
-        || listen(listener, 8) != 0) {
-        LOG_ERROR("[Bridge] bind/listen on 127.0.0.1:" + std::to_string(port)
-                  + " failed");
-        close_socket(listener);
-        return bridge;
-    }
-    LOG_INFO("[Bridge] " + node_name + " listening on 127.0.0.1:"
-             + std::to_string(port) + " (external_echo registered)");
-    active->set_listener(listener);
-
-    auto bridge_addr = caf::actor_cast<caf::actor_addr>(bridge);
-    active->add_thread(
-        std::thread(listener_loop, listener, bridge_addr, impl_addr, active));
     return bridge;
 }
 

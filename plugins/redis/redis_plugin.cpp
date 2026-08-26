@@ -29,6 +29,7 @@
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
+#include "common/plugin_config.hpp"
 #include "templates/job_queue.hpp"
 
 // hiredis 依赖 winsock2 的 timeval；必须先于 caf/all.hpp（其可能拉入
@@ -56,7 +57,13 @@ namespace db = caf_plugin_system::db;
 
 namespace {
 
-constexpr const char* kDefaultUris = "default=redis://127.0.0.1:6379";
+// 声明式配置（PLUGIN_CONFIG 宏，见 common/plugin_config.hpp）：
+// 字段 + 默认值，读取路径 caf-plugin-system.redis.<字段名>（conf 嵌套块）。
+// X = 只读 conf；XC = conf + CLI 双通道（Phase 4 接线后生效）。
+#define REDIS_FIELDS(X, XC)                                                   \
+    X(caf::settings, uris, {})
+PLUGIN_CONFIG(REDIS_FIELDS)
+#undef REDIS_FIELDS
 
 /// 单个命名连接的解析结果。
 struct ConnSpec {
@@ -66,46 +73,33 @@ struct ConnSpec {
     int db = 0;
 };
 
-/// 解析 "name1=uri1,name2=uri2" → 连接表。无 name 条目归入 "default"；
+/// 从配置 dictionary 构造命名连接表（键 = 连接名，值 = uri 字符串）；
 /// uri 尾部 /N 为 db 下标。解析失败条目跳过（记日志由调用方做）。
-std::vector<ConnSpec> parse_uris(const std::string& spec) {
+std::vector<ConnSpec> parse_uris(const caf::settings& uris) {
     std::vector<ConnSpec> out;
-    size_t pos = 0;
-    while (pos <= spec.size()) {
-        auto comma = spec.find(',', pos);
-        std::string item = spec.substr(pos, comma == std::string::npos
-                                            ? std::string::npos : comma - pos);
-        if (!item.empty()) {
-            ConnSpec cs;
-            auto eq = item.find('=');
-            std::string uri;
-            if (eq != std::string::npos) {
-                cs.name = item.substr(0, eq);
-                uri = item.substr(eq + 1);
-            } else {
-                cs.name = "default";
-                uri = item;
-            }
-            if (uri.rfind("redis://", 0) == 0)
-                uri = uri.substr(8);
-            auto slash = uri.find('/');
-            std::string hostport = (slash == std::string::npos) ? uri : uri.substr(0, slash);
-            auto colon = hostport.find(':');
-            if (colon != std::string::npos) {
-                cs.host = hostport.substr(0, colon);
-                cs.port = std::atoi(hostport.substr(colon + 1).c_str());
-            } else if (!hostport.empty()) {
-                cs.host = hostport;
-            }
-            if (slash != std::string::npos)
-                cs.db = std::atoi(uri.substr(slash + 1).c_str());
-            if (cs.name.empty())
-                cs.name = "default";
-            out.push_back(std::move(cs));
+    for (const auto& [name, value] : uris) {
+        auto uri_v = caf::get_if<std::string>(&value);
+        if (!uri_v)
+            continue;
+        ConnSpec cs;
+        cs.name = name;
+        std::string uri = *uri_v;
+        if (uri.rfind("redis://", 0) == 0)
+            uri = uri.substr(8);
+        auto slash = uri.find('/');
+        std::string hostport = (slash == std::string::npos) ? uri : uri.substr(0, slash);
+        auto colon = hostport.find(':');
+        if (colon != std::string::npos) {
+            cs.host = hostport.substr(0, colon);
+            cs.port = std::atoi(hostport.substr(colon + 1).c_str());
+        } else if (!hostport.empty()) {
+            cs.host = hostport;
         }
-        if (comma == std::string::npos)
-            break;
-        pos = comma + 1;
+        if (slash != std::string::npos)
+            cs.db = std::atoi(uri.substr(slash + 1).c_str());
+        if (cs.name.empty())
+            cs.name = "default";
+        out.push_back(std::move(cs));
     }
     if (out.empty()) {
         ConnSpec cs;
@@ -274,16 +268,12 @@ public:
         caf_plugin_system::set_logger(logger);
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
-        // 读 CAF 配置（framework_config 注册的 caf-plugin-system.redis-uris；
-        // 用基类 get_or 自由函数——sys.config() 是 actor_system_config&，
-        // 不依赖跨 DLL RTTI）
-        std::string uris = caf::get_or(sys.config(),
-                                       "caf-plugin-system.redis-uris",
-                                       std::string(kDefaultUris));
+        // 声明式配置读取（PLUGIN_CONFIG）：字段、默认值、解析全部自动
+        auto cfg = load_plugin_config(sys.config());
+        caf::settings uris = cfg.uris;
 
         return sys.spawn([logger, uris](caf::event_based_actor* self) -> caf::behavior {
-            auto uris_spec = std::make_shared<std::string>(uris);
-            auto specs = std::make_shared<std::vector<ConnSpec>>(parse_uris(*uris_spec));
+            auto specs = std::make_shared<std::vector<ConnSpec>>(parse_uris(uris));
             auto queues = std::make_shared<std::map<std::string, std::shared_ptr<JobQueue>>>();
             auto threads = std::make_shared<std::map<std::string, std::shared_ptr<std::thread>>>();
             auto started = std::make_shared<std::atomic<bool>>(false);
@@ -370,8 +360,7 @@ public:
 
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 .on_init = [=](caf::actor, const std::string&) {
-                    LOG_INFO_SELF(self, "RedisPlugin initialized, uris={}",
-                                  *uris_spec);
+                    LOG_INFO_SELF(self, "RedisPlugin initialized, conns={}", uris.size());
                     launch_workers();
                     selfcheck();
                 },

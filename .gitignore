@@ -141,3 +141,7 @@ __pycache__/
 
 # PlantUML 生成图（.puml 是源码，PNG 用 tools/render_puml.py 随时重生成）
 /docs/bridge-protocol/
+/docs/*.png
+
+# 本地 AI 辅助配置（不入库）
+/.claude/

@@ -20,6 +20,7 @@
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
+#include "common/plugin_config.hpp"
 #include "templates/job_queue.hpp"
 
 // libpq 头（Windows 上同样依赖 winsock2 先行，统一模式）
@@ -47,7 +48,14 @@ namespace db = caf_plugin_system::db;
 
 namespace {
 
-constexpr const char* kDefaultUris = "default=postgres://postgres@127.0.0.1:5432";
+// 声明式配置（PLUGIN_CONFIG 宏，见 common/plugin_config.hpp）：
+// 字段 + 默认值，读取路径 caf-plugin-system.postgres.<字段名>（conf 嵌套块）。
+// X = 只读 conf；XC = conf + CLI 双通道（Phase 4 接线后生效）。
+#define PG_FIELDS(X, XC)                                                      \
+    X(caf::settings, uris, {})                                                \
+    X(int, pool_size, 2)
+PLUGIN_CONFIG(PG_FIELDS)
+#undef PG_FIELDS
 
 /// 单个命名连接的解析结果（postgres://user:pass@host:port/dbname）。
 struct PgSpec {
@@ -59,58 +67,46 @@ struct PgSpec {
     std::string dbname;
 };
 
-std::vector<PgSpec> parse_uris(const std::string& spec) {
+/// 从配置 dictionary 构造命名连接表（键 = 连接名，值 = uri 字符串）。
+std::vector<PgSpec> parse_uris(const caf::settings& uris) {
     std::vector<PgSpec> out;
-    size_t pos = 0;
-    while (pos <= spec.size()) {
-        auto comma = spec.find(',', pos);
-        std::string item = spec.substr(pos, comma == std::string::npos
-                                            ? std::string::npos : comma - pos);
-        if (!item.empty()) {
-            PgSpec cs;
-            auto eq = item.find('=');
-            std::string uri;
-            if (eq != std::string::npos) {
-                cs.name = item.substr(0, eq);
-                uri = item.substr(eq + 1);
-            } else {
-                cs.name = "default";
-                uri = item;
-            }
-            if (uri.rfind("postgres://", 0) == 0)
-                uri = uri.substr(11);
-            else if (uri.rfind("postgresql://", 0) == 0)
-                uri = uri.substr(13);
-            auto at = uri.find('@');
-            if (at != std::string::npos) {
-                std::string up = uri.substr(0, at);
-                uri = uri.substr(at + 1);
-                auto colon = up.find(':');
-                if (colon != std::string::npos) {
-                    cs.user = up.substr(0, colon);
-                    cs.pass = up.substr(colon + 1);
-                } else {
-                    cs.user = up;
-                }
-            }
-            auto slash = uri.find('/');
-            std::string hostport = (slash == std::string::npos) ? uri : uri.substr(0, slash);
-            auto colon = hostport.find(':');
+    for (const auto& [name, value] : uris) {
+        auto uri_v = caf::get_if<std::string>(&value);
+        if (!uri_v)
+            continue;
+        PgSpec cs;
+        cs.name = name;
+        std::string uri = *uri_v;
+        if (uri.rfind("postgres://", 0) == 0)
+            uri = uri.substr(11);
+        else if (uri.rfind("postgresql://", 0) == 0)
+            uri = uri.substr(13);
+        auto at = uri.find('@');
+        if (at != std::string::npos) {
+            std::string up = uri.substr(0, at);
+            uri = uri.substr(at + 1);
+            auto colon = up.find(':');
             if (colon != std::string::npos) {
-                cs.host = hostport.substr(0, colon);
-                cs.port = std::atoi(hostport.substr(colon + 1).c_str());
-            } else if (!hostport.empty()) {
-                cs.host = hostport;
+                cs.user = up.substr(0, colon);
+                cs.pass = up.substr(colon + 1);
+            } else {
+                cs.user = up;
             }
-            if (slash != std::string::npos)
-                cs.dbname = uri.substr(slash + 1);
-            if (cs.name.empty())
-                cs.name = "default";
-            out.push_back(std::move(cs));
         }
-        if (comma == std::string::npos)
-            break;
-        pos = comma + 1;
+        auto slash = uri.find('/');
+        std::string hostport = (slash == std::string::npos) ? uri : uri.substr(0, slash);
+        auto colon = hostport.find(':');
+        if (colon != std::string::npos) {
+            cs.host = hostport.substr(0, colon);
+            cs.port = std::atoi(hostport.substr(colon + 1).c_str());
+        } else if (!hostport.empty()) {
+            cs.host = hostport;
+        }
+        if (slash != std::string::npos)
+            cs.dbname = uri.substr(slash + 1);
+        if (cs.name.empty())
+            cs.name = "default";
+        out.push_back(std::move(cs));
     }
     if (out.empty()) {
         PgSpec cs;
@@ -300,11 +296,10 @@ public:
         caf_plugin_system::set_logger(logger);
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
-        std::string uris = caf::get_or(sys.config(), "caf-plugin-system.pg-uris",
-                                       std::string(kDefaultUris));
-        int pool_size = caf::get_or<int>(sys.config(), "caf-plugin-system.db-pool-size", 2);
-        if (pool_size < 1)
-            pool_size = 1;
+        // 声明式配置读取（PLUGIN_CONFIG）：字段、默认值、解析全部自动
+        auto cfg = load_plugin_config(sys.config());
+        caf::settings uris = cfg.uris;
+        int pool_size = cfg.pool_size < 1 ? 1 : cfg.pool_size;
 
         return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<PgSpec>>(parse_uris(uris));
@@ -551,7 +546,7 @@ public:
 
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 .on_init = [=](caf::actor, const std::string&) {
-                    LOG_INFO_SELF(self, "PostgresPlugin initialized, uris={}", uris);
+                    LOG_INFO_SELF(self, "PostgresPlugin initialized, conns={}", uris.size());
                     launch_workers();
                     selfcheck();
                 },
