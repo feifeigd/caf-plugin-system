@@ -18,6 +18,10 @@ namespace caf_plugin_system {
 /// 冒烟测试（--test-auto-shutdown）：ACL 拦截、缓冲冲刷、热更新、新代码生效。
 void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw);
 
+/// 脚本插件验证（--test-lua-script）：resolve echo_service，发 plugin_envelope
+/// 与 std::string，校验 on_call / on_string 回执（验证 lua_host 桥接层）。
+void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw);
+
 /// 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 /// RemoteCaller 缓存句柄 + 失败自动重试；循环调用观察杀/重启目标节点时
 /// "失败 → 自动恢复"（缓存失效 → 重新 resolve）。

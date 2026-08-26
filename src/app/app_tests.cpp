@@ -113,6 +113,87 @@ void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
 }
 
 // ------------------------------------------------------------------
+// 脚本插件验证（--test-lua-script）：resolve echo_service，发 envelope
+// 与 string，校验 on_call / on_string 回执——验证 lua_host 桥接层。
+// ------------------------------------------------------------------
+
+void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
+    caf::scoped_actor self{sys};
+
+    caf::actor echo_proxy;
+    // 脚本服务由宿主 on_init 异步注册，晚于 bootstrap_plugins 返回——
+    // 重试 resolve 直到 echo_service 就绪（镜像 run_cross_call_test 的重试）
+    for (int i = 0; i < 20 && !echo_proxy; ++i) {
+        self->request(fw.registry, caf::infinite, resolve_atom{}, "echo_service")
+            .receive([&](const caf::actor& a) { echo_proxy = a; },
+                     [](caf::error&) {});
+        if (!echo_proxy)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (!echo_proxy) {
+        std::cout << "[LuaTest] echo_service not registered "
+                     "(LuaHostPlugin not loaded?)" << std::endl;
+        return;
+    }
+
+    // 信封调用：sub_proto=1 → 脚本 on_call(sub_proto, payload)
+    plugin_envelope env;
+    env.sub_proto = 1;
+    const char* text = "ping";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                      reinterpret_cast<const std::byte*>(text)
+                          + std::strlen(text));
+    self->request(echo_proxy, std::chrono::seconds(5), env)
+        .receive([](const std::string& r) {
+                     std::cout << "[LuaTest] envelope call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[LuaTest] envelope call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    // 字符串命令调用：脚本 on_string(cmd)
+    self->request(echo_proxy, std::chrono::seconds(5), std::string("hello"))
+        .receive([](const std::string& r) {
+                     std::cout << "[LuaTest] string call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[LuaTest] string call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    // 热更验证：发管理信封（sub_proto=1）给 lua_host_service 触发 echo.lua
+    // 重载，再调 echo_service——若状态交接正确，counter 应从 2 续到 3
+    //（"echo:3:ping"）；若状态丢失则重置回 1（"echo:1:ping"）。echo_proxy 经
+    // resume 切到新实例，同一句柄继续可用（quiesce 期调用会进缓冲后冲刷）。
+    caf::actor host_proxy;
+    self->request(fw.registry, caf::infinite, resolve_atom{}, "lua_host_service")
+        .receive([&](const caf::actor& a) { host_proxy = a; },
+                 [](caf::error&) {});
+    if (host_proxy) {
+        plugin_envelope reload_env;
+        reload_env.sub_proto = 1;
+        const char* svc = "echo_service";
+        reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
+                                 reinterpret_cast<const std::byte*>(svc)
+                                     + std::strlen(svc));
+        std::cout << "[LuaTest] triggering reload of echo_service" << std::endl;
+        self->send(host_proxy, reload_env);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+        self->request(echo_proxy, std::chrono::seconds(5), env)
+            .receive([](const std::string& r) {
+                         std::cout << "[LuaTest] post-reload envelope call -> "
+                                   << r << std::endl;
+                     },
+                     [](const caf::error& e) {
+                         std::cout << "[LuaTest] post-reload call error: "
+                                   << caf::to_string(e) << std::endl;
+                     });
+    }
+}
+
+// ------------------------------------------------------------------
 // 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 // RemoteCaller actor 缓存句柄 + 失败自动重试（模式 B）；循环调用
 // 观察杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。

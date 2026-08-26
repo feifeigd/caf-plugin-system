@@ -338,6 +338,8 @@ framework_config::framework_config() {
              "trigger ops quit after startup (verify graceful shutdown, process must exit 0)")
         .add(test_ctrl_c, "test-ctrl-c",
              "send shutdown_atom directly after startup (simulate Ctrl+C path, verify exit 0)")
+        .add(test_lua_script, "test-lua-script",
+             "verify Lua script plugin: resolve echo_service and call envelope+string")
         .add(bridge_port, "bridge-port",
              "bridge sidecar TCP port for external-language nodes (0 = disabled)")
         .add(test_bridge_call, "test-bridge-call",
