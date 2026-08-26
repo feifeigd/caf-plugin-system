@@ -86,7 +86,8 @@ namespace {
 
 // 声明式配置（PLUGIN_CONFIG 宏，见 common/plugin_config.hpp）：
 // 字段 + 默认值，读取路径 caf-plugin-system.mongo.<字段名>（conf 嵌套块）。
-#define MONGO_FIELDS(X)                                                       \
+// X = 只读 conf；XC = conf + CLI 双通道（Phase 4 接线后生效）。
+#define MONGO_FIELDS(X, XC)                                                   \
     X(caf::settings, uris, {})                                                \
     X(int, pool_size, 2)
 PLUGIN_CONFIG(MONGO_FIELDS)
@@ -498,7 +499,7 @@ public:
                 };
                 sc("hermes_selfcheck", "insert_one",
                    "{\"doc\": {\"k\": \"db-ping\", \"ts\": 1}}", [=] {
-                    sc("hermes_selfcheck", "delete_one",
+                    sc("hermes_selfcheck", "delete_many",
                        "{\"filter\": {\"k\": \"db-ping\"}}", [=] {
                         sc("hermes_selfcheck", "find",
                            "{\"filter\": {\"k\": \"db-ping\"}, \"limit\": 1}", nullptr);
@@ -543,7 +544,7 @@ public:
 
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 .on_init = [=](caf::actor, const std::string&) {
-                    LOG_INFO_SELF(self, "MongoPlugin initialized, uris={}", uris);
+                    LOG_INFO_SELF(self, "MongoPlugin initialized, conns={}", uris.size());
                     launch_workers();
                     selfcheck();
                 },
