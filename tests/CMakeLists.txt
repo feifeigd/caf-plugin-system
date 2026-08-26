@@ -33,3 +33,8 @@ target_include_directories(typed_smoke PRIVATE
 target_link_libraries(typed_smoke PRIVATE caf_plugin_core typed_smoke_plugin)
 
 add_test(NAME typed_smoke COMMAND typed_smoke)
+
+# ------------------------------------------------------------------
+# 最小 libpq 泄露测试（独立 exe，不链接 caf，纯 PQconnectdb+PQfinish）
+# ------------------------------------------------------------------
+add_subdirectory(pg_leak_test)

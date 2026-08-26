@@ -12,7 +12,7 @@ for %%f in (caf_plugin_app.exe caf_core.dll caf_io.dll fmtd.dll spdlogd.dll caf-
     copy /y run\%%f run_bridge\ >nul
     if errorlevel 1 goto FAIL
 )
-if not exist run_bridge\plugins xcopy /e /i /y run\plugins run_bridge\plugins >nul
+xcopy /e /i /y run\plugins run_bridge\plugins >nul
 
 echo ============================================
 echo  [1/4] Start master (47096, test-bridge-call)

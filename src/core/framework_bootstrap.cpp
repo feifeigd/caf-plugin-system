@@ -137,6 +137,27 @@ void disable_quick_edit() {
 #endif
 }
 
+/// DLL 分类目录支持：第三方依赖 DLL 可放 exe_dir/lib/ 子目录（分类存放），
+/// 经 AddDllDirectory 注册进搜索路径。注意边界：
+///   - exe 启动时【直接链接】的 DLL（CAF/fmt/spdlog 等）由进程加载器解析，
+///     只搜 exe 目录/系统/PATH——必须留在 exe 同级，本机制管不到；
+///   - 运行时 LoadLibrary 的 DLL（插件及其依赖，如 hiredisd.dll）在加载
+///     时刻才解析依赖，AddDllDirectory 注册的目录全部生效。
+/// SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) 让普通
+/// LoadLibrary 也走 USER_DIRS（AddDllDirectory 注册的目录），且保留
+/// exe 目录优先（旧布局兼容）。
+void setup_dll_search_path() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0)
+        return;
+    std::filesystem::path exe_dir = std::filesystem::path(buf).parent_path();
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    AddDllDirectory(exe_dir.c_str());              // 兼容旧布局（DLL 在 exe 同级）
+    AddDllDirectory((exe_dir / L"lib").c_str());   // 分类目录
+#endif
+}
+
 #ifdef _WIN32
 // 信号落盘证据：点 X 时控制台正在销毁，fprintf(stderr) 可能写不进（句柄
 // 关闭中），且用户看不到——写文件是唯一可靠证据。与 graceful_shutdown.cpp
@@ -271,6 +292,11 @@ framework_config::framework_config() {
     // framework_config 由 exec_main 在 parse 前、actor_system 构造前创建，
     // 这里是最干净的注册窗口（CAF_MAIN 的模块参数机制只服务自带模块）。
     app_meta::init();
+    // DLL 分类目录（exe_dir/lib/）必须先于 preregister_plugin_meta 注册：
+    // 预注册阶段的 LoadLibrary 同样要能解析 run/lib 下的第三方依赖，
+    // 否则非 delayload 依赖的插件在预注册阶段会加载失败（静默跳过）。
+    // 幂等——bootstrap_system_components 里还有一次兜底调用。
+    setup_dll_search_path();
     // 插件私有消息类型的元对象：扫描插件目录并调用可选导出
     // register_meta_objects()。注册了元对象的插件 DLL 自此常驻。
     preregister_plugin_meta(plugins_dir);
@@ -292,6 +318,16 @@ framework_config::framework_config() {
              "auto trigger graceful shutdown after startup (smoke test)")
         .add(allow_cross_node, "allow-cross-node",
              "trust remote cluster nodes bypassing service ACL (default false)")
+        .add(redis_uris, "redis-uris",
+             "redis plugin connections: name1=uri1,name2=uri2 (uri=redis://host:port/db)")
+        .add(mysql_uris, "mysql-uris",
+             "mysql plugin connections: name1=uri1,name2=uri2 (uri=mysql://user:pass@host:port/dbname)")
+        .add(pg_uris, "pg-uris",
+             "postgres plugin connections: name1=uri1,name2=uri2 (uri=postgres://user:***@host:port/dbname)")
+        .add(mongo_uris, "mongo-uris",
+             "mongo plugin connections: name1=uri1,name2=uri2 (uri=mongodb://[user:pass@]host[:port][/dbname])")
+        .add(db_pool_size, "db-pool-size",
+             "sql plugin connection pool size per named connection (default 2)")
         .add(test_cross_call, "test-cross-call",
              "cross-node call this service after node registration (cluster test)")
         .add(test_cross_call_ex, "test-cross-call-ex",
@@ -311,6 +347,9 @@ framework_config::framework_config() {
 bool bootstrap_system_components(caf::actor_system& sys,
                                  const framework_config& cfg,
                                  BootstrapResult& out) {
+    // DLL 分类目录（exe_dir/lib/）注册：必须在任何 LoadLibrary 之前
+    //（插件扫描在 bootstrap_plugins 里，此处早于它）
+    setup_dll_search_path();
     // ---- 日志服务最先 spawn（进程第一个 actor）----
     // 系统组件（registry/shutdown_mgr 等）从创建起就要打日志；插件也依赖
     // "logging_service" 核心内置服务。spdlog 在此创建 sinks 并常驻到关机链

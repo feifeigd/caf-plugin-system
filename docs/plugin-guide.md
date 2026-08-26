@@ -303,6 +303,11 @@ struct MyPlugin : PluginEntry {
 
 ## 10. CAF 1.1 行为变化备忘（踩过的坑）
 
+> 网络模块选型（io::middleman vs net::middleman，连接数上限，是否自研
+> asio）：见 [net-middleman-notes.md](net-middleman-notes.md)——集群强依赖
+> io::middleman 的 BASP（connect/remote_lookup/open），net::middleman
+> 只是事件循环后端，无分布式寻址，不能取代。
+
 - **意外消息会杀 actor**：默认 `print_and_drop` 产生 error 结果并触发 quit。
   actor 必须为每种可能收到的消息写 handler，长期驻留的宿主 actor
   （如 PluginManager）应设兜底 default_handler；

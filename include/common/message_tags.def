@@ -122,3 +122,15 @@ X_TAG(register_cluster_atom, 266) // 节点引导后：把 master/client 句柄�
 // bridge actor 本地调服务；外部对 REQ 的 RESULT 行 → external_echo 实现 actor。
 X_TAG(ext_call_atom, 267)    // bridge actor：外部请求调本地服务（id, svc, payload）
 X_TAG(ext_result_atom, 268)  // external_echo：外部对 REQ 的响应（rid, ok, payload）
+// -- 数据库插件契约（db_contract.hpp：Redis/MySQL/PostgreSQL/MongoDB 共用）----
+// cell 全字符串化的统一结果集 db_result（JDBC 风格，天然可跨节点序列化）。
+// 四个插件提供不同服务名（redis_service/mysql_service/pg_service/mongo_service），
+// 消息类型统一；事务句柄 = uint64（CAF 内置类型，无需注册）。
+X_REG(db_result, (caf_plugin_system::db::db_result), 269, "db_result")
+X_TAG(redis_cmd_atom, 270)    // Redis 命令：(conn, cmd, args) → db_result；三参 (cmd, args) 走默认连接（MULTI/EXEC 即命令，天然支持事务）
+X_TAG(sql_query_atom, 271)    // SQL 查询：(sql, params) → db_result（MySQL/PG）
+X_TAG(sql_exec_atom, 272)     // SQL 写：(sql, params) → db_result（affected/insert_id）
+X_TAG(tx_begin_atom, 273)     // 开启事务：→ uint64 tx_handle
+X_TAG(tx_commit_atom, 274)    // 提交事务：(tx_handle) → db_result
+X_TAG(tx_rollback_atom, 275)  // 回滚事务：(tx_handle) → db_result
+X_TAG(mongo_op_atom, 276)     // Mongo 操作：(collection, op, json) → db_result
