@@ -21,6 +21,7 @@
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
 #include "common/plugin_config.hpp"
+#include "common/plugin_envelope.hpp"
 #include "templates/job_queue.hpp"
 
 // libpq 头（Windows 上同样依赖 winsock2 先行，统一模式）
@@ -542,6 +543,24 @@ public:
                         rp.deliver(std::move(r));
                     };
                     enqueue_tx(tx, std::move(job));
+                },
+                // 跨节点信封入口（RemoteCaller 直接把 plugin_envelope 发给
+                // 目标服务，见 remote_caller.cpp do_call）。子协议号插件自管：
+                //   1 = hello：回显 pg:hello:<payload>（跨节点链路自检）
+                [=](plugin_envelope env) -> caf::result<std::string> {
+                    switch (env.sub_proto) {
+                    case 1: {
+                        std::string in(
+                            reinterpret_cast<const char*>(env.payload.data()),
+                            env.payload.size());
+                        return std::string("pg:hello:") + in;
+                    }
+                    default:
+                        return caf::make_error(
+                            caf::sec::invalid_argument,
+                            "pg_service: unknown sub_proto: "
+                                + std::to_string(env.sub_proto));
+                    }
                 },
             };
 
