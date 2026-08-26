@@ -5,7 +5,7 @@
 ' ============================================================================
 
 ' ----------------------------------------------------------------------------
-' 图 1：组件总览 + 线格式
+' 图 1：组件总览 + 行格式
 ' ----------------------------------------------------------------------------
 @startuml bridge-overview
 title Bridge 组件总览（外部语言节点 sidecar，broker 版）
@@ -42,7 +42,7 @@ GS -down-> BRIDGE : send_exit（关机）
 GS -down-> IMPL : send_exit（关机）
 
 note bottom of TCP
-  == 线格式（长度前缀 → payload 可含任意字节，上限 64MB）==
+  == 行格式（长度前缀 → payload 可含任意字节，上限 64MB）==
   CALL   <id> <svc> <len>\n<payload>\n    外部 → exe：调用服务
   RESULT <id> OK|ERR <len>\n<payload>\n   CALL 的回执 / REQ 的应答
   REQ    <rid> <len>\n<payload>\n         exe → 外部：请求处理
