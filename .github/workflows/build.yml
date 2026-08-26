@@ -11,7 +11,10 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # NOTE: ubuntu-latest is now 24.04 (glibc 2.39), which breaks
+    # mongo-c-driver 1.30.6 CMake symbol probes (res_ndestroy/sched_getcpu
+    # were removed). Pin 22.04 until the mongo-c-driver override is bumped.
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout repository
