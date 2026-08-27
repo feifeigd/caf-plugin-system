@@ -70,6 +70,8 @@ struct framework_config : caf::actor_system_config {
     /// 脚本插件验证后门：启动后 resolve echo_service 并调 envelope + string
     ///（--test-lua-script；需 entry-plugins 含 LuaHostPlugin + scripts/echo.lua）
     bool test_lua_script = false;
+    /// 脚本插件验证后门（--test-py-script；需 entry-plugins 含 PythonHostPlugin）
+    bool test_py_script = false;
     /// bridge 模式：外部语言节点（Python/Go）sidecar 的本地 TCP 监听端口
     ///（0 = 禁用）。bridge 以正常集群节点身份注册，external_echo 服务
     /// 的 handler 在外部进程（行协议，见 src/core/bridge_actor.hpp）。

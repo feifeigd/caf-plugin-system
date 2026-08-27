@@ -194,6 +194,81 @@ void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
 }
 
 // ------------------------------------------------------------------
+// 脚本插件验证（--test-py-script）：镜像 run_lua_script_test，验证
+// py_host 桥接层（on_call/on_string）+ 热更状态交接。
+// ------------------------------------------------------------------
+
+void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
+    caf::scoped_actor self{sys};
+
+    caf::actor echo_proxy;
+    for (int i = 0; i < 20 && !echo_proxy; ++i) {
+        self->request(fw.registry, caf::infinite, resolve_atom{}, "echo_service")
+            .receive([&](const caf::actor& a) { echo_proxy = a; },
+                     [](caf::error&) {});
+        if (!echo_proxy)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (!echo_proxy) {
+        std::cout << "[PyTest] echo_service not registered "
+                     "(PythonHostPlugin not loaded?)" << std::endl;
+        return;
+    }
+
+    plugin_envelope env;
+    env.sub_proto = 1;
+    const char* text = "ping";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                      reinterpret_cast<const std::byte*>(text)
+                          + std::strlen(text));
+    self->request(echo_proxy, std::chrono::seconds(5), env)
+        .receive([](const std::string& r) {
+                     std::cout << "[PyTest] envelope call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[PyTest] envelope call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    self->request(echo_proxy, std::chrono::seconds(5), std::string("hello"))
+        .receive([](const std::string& r) {
+                     std::cout << "[PyTest] string call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[PyTest] string call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    // 热更：发管理信封（sub_proto=1）给 py_host_service 触发 echo.py 重载，
+    // 再调 echo_service——状态交接正确则 counter 从 2 续到 3（"echo:3:ping"）。
+    caf::actor host_proxy;
+    self->request(fw.registry, caf::infinite, resolve_atom{}, "py_host_service")
+        .receive([&](const caf::actor& a) { host_proxy = a; },
+                 [](caf::error&) {});
+    if (host_proxy) {
+        plugin_envelope reload_env;
+        reload_env.sub_proto = 1;
+        const char* svc = "echo_service";
+        reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
+                                 reinterpret_cast<const std::byte*>(svc)
+                                     + std::strlen(svc));
+        std::cout << "[PyTest] triggering reload of echo_service" << std::endl;
+        self->send(host_proxy, reload_env);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+        self->request(echo_proxy, std::chrono::seconds(5), env)
+            .receive([](const std::string& r) {
+                         std::cout << "[PyTest] post-reload envelope call -> "
+                                   << r << std::endl;
+                     },
+                     [](const caf::error& e) {
+                         std::cout << "[PyTest] post-reload call error: "
+                                   << caf::to_string(e) << std::endl;
+                     });
+    }
+}
+
+// ------------------------------------------------------------------
 // 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 // RemoteCaller actor 缓存句柄 + 失败自动重试（模式 B）；循环调用
 // 观察杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。

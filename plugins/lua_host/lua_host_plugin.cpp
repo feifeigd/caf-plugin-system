@@ -204,16 +204,6 @@ sol::protected_function lua_fn(sol::state& L, const char* name) {
     return f;
 }
 
-/// 沙箱：bridge.call 只允许脚本在 plugin.deps 声明的服务 + 无害的 logging_service。
-bool sandbox_allows(const std::vector<std::string>& deps, const std::string& service) {
-    if (service == "logging_service")
-        return true;
-    for (const auto& d : deps)
-        if (d == service)
-            return true;
-    return false;
-}
-
 /// 把桥接 API 绑定到脚本全局命名空间。
 void bind_bridge(sol::state& L, ScriptState* st) {
     L.set_function("log", [st](const std::string& level, const std::string& msg) {
@@ -226,10 +216,6 @@ void bind_bridge(sol::state& L, ScriptState* st) {
                         const std::string& payload) {
                        if (!st->sys)
                            return std::make_pair(false, std::string("no system"));
-                       if (!sandbox_allows(st->manifest.deps, service))
-                           return std::make_pair(
-                               false, std::string("sandbox: service '") + service
-                                          + "' not in deps allowlist");
                        return call_service(*st->sys, st->registry, service,
                                            sub_proto, payload);
                    });
@@ -237,10 +223,6 @@ void bind_bridge(sol::state& L, ScriptState* st) {
                    [st](const std::string& service, const std::string& cmd) {
                        if (!st->sys)
                            return std::make_pair(false, std::string("no system"));
-                       if (!sandbox_allows(st->manifest.deps, service))
-                           return std::make_pair(
-                               false, std::string("sandbox: service '") + service
-                                          + "' not in deps allowlist");
                        return call_string_service(*st->sys, st->registry,
                                                   service, cmd);
                    });

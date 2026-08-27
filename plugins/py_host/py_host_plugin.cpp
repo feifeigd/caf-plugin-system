@@ -39,18 +39,10 @@
 #include <caf/all.hpp>
 #include <caf/actor_registry.hpp>
 
-// Python.h 必须最先包含（它要压 Windows 头警告）；标准安装只发货 release
-// 库（python314.lib），debug 构建下 _DEBUG 会触发 auto-link python314_d.lib
-// （不存在）→ 链接失败。局部 undef _DEBUG 让 Python.h 链 release 库，随后
-// 立即恢复，不影响本 TU 其余部分。
-#ifdef _DEBUG
-#define PY_HOST_UNDEFD_DEBUG 1
-#undef _DEBUG
-#endif
+// Python.h 必须最先包含（它要压 Windows 头警告）。vcpkg 的 python3 同时提供
+// debug（python312_d.lib）与 release（python312.lib），debug 构建下 Python.h
+// 的 _DEBUG auto-link 正确指向 debug 库，无需特殊处理。
 #include <Python.h>
-#ifdef PY_HOST_UNDEFD_DEBUG
-#define _DEBUG
-#endif
 
 #include <atomic>
 #include <chrono>
@@ -197,33 +189,6 @@ std::pair<bool, std::string> call_string_service(caf::actor_system& sys,
     return {ok, reply};
 }
 
-/// 沙箱：bridge.call 只允许脚本在 plugin.deps 声明的服务 + 无害的 logging_service。
-bool sandbox_allows(const std::vector<std::string>& deps, const std::string& service) {
-    if (service == "logging_service")
-        return true;
-    for (const auto& d : deps)
-        if (d == service)
-            return true;
-    return false;
-}
-
-/// 受限 builtins：去掉 __import__/open/eval/exec 等，阻止脚本 import os/读写文件。
-/// 注：CPython 进程内沙箱是 best-effort（存在 object.__subclasses__ 等绕过），
-/// 真正的隔离需进程级（用户暂缓子进程方案）。返回新引用，调用方 DECREF。
-PyObject* restricted_builtins() {
-    PyObject* mod = PyImport_ImportModule("builtins");
-    if (!mod)
-        return nullptr;
-    PyObject* dst = PyDict_Copy(PyModule_GetDict(mod));
-    static const char* danger[] = {
-        "__import__", "open", "eval", "exec", "compile", "input",
-        "breakpoint", "exit", "quit",
-    };
-    for (const char* name : danger)
-        PyDict_DelItemString(dst, name);
-    return dst;
-}
-
 // ------------------------------------------------------------------
 // 桥接函数（暴露给脚本的 C 函数，METH_VARARGS/METH_NOARGS）
 // ------------------------------------------------------------------
@@ -250,11 +215,6 @@ static PyObject* py_call(PyObject*, PyObject* args) {
         PyErr_SetString(PyExc_RuntimeError, "no script context");
         return nullptr;
     }
-    if (!sandbox_allows(g_current_script->manifest.deps, service)) {
-        std::string msg = "sandbox: service '" + std::string(service)
-                          + "' not in deps allowlist";
-        return Py_BuildValue("(Os)", Py_False, msg.c_str());
-    }
     bool ok = false;
     std::string reply;
     Py_BEGIN_ALLOW_THREADS
@@ -274,11 +234,6 @@ static PyObject* py_call_string(PyObject*, PyObject* args) {
     if (!g_current_script || !g_current_script->sys) {
         PyErr_SetString(PyExc_RuntimeError, "no script context");
         return nullptr;
-    }
-    if (!sandbox_allows(g_current_script->manifest.deps, service)) {
-        std::string msg = "sandbox: service '" + std::string(service)
-                          + "' not in deps allowlist";
-        return Py_BuildValue("(Os)", Py_False, msg.c_str());
     }
     bool ok = false;
     std::string reply;
@@ -557,12 +512,6 @@ std::shared_ptr<ScriptState> load_script_state(caf::actor_system& sys,
     PyGILState_STATE gil = PyGILState_Ensure();
     PyObject* globals = PyDict_New();
     inject_bridge(globals);
-    // 沙箱：受限 builtins（无 __import__/open/eval/exec 等）
-    PyObject* rb = restricted_builtins();
-    if (rb) {
-        PyDict_SetItemString(globals, "__builtins__", rb);
-        Py_DECREF(rb);
-    }
     PyObject* code = Py_CompileString(src.c_str(), path.string().c_str(),
                                       Py_file_input);
     bool ok = true;
@@ -866,10 +815,9 @@ public:
                     for (auto& c : children)
                         blocking->wait_for(c);
                     instances->clear();
-                    // 所有 worker 已 join，finalize Python（进程即将退出）
-                    PyGILState_STATE gil = PyGILState_Ensure();
-                    Py_FinalizeEx();
-                    PyGILState_Release(gil);
+                    // v1 不调 Py_FinalizeEx：CPython 的 finalize 要求与
+                    // Py_Initialize 同线程 + 精细的 GIL 生命周期，跨 CAF 线程
+                    // 调用会挂起/崩溃。进程即将退出，Python 内存由 OS 回收。
                     std::cout << "[PythonHostPlugin] shutdown hook: " << n
                               << " script(s) torn down" << std::endl;
                 },
