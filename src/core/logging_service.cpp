@@ -1,4 +1,5 @@
 #include "services/logging_service.hpp"
+#include "services/time_service.hpp"
 #include "framework_bootstrap.hpp"  // console_closing()
 
 #include <spdlog/sinks/basic_file_sink.h>
@@ -6,11 +7,50 @@
 #include <spdlog/pattern_formatter.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <unordered_map>
 
 namespace caf_plugin_system {
+
+namespace {
+
+/// spdlog 自定义 flag `%O`：输出业务时间（真实时间 + 全局偏移）的
+/// "%Y-%m-%d %H:%M:%S.%e"。统一时间源的一部分——日志时间戳必须与
+/// 业务时间一致（否则 time-offset 测试的证据全是真实时间，对不上）。
+/// 只挂在本服务的 formatter 上，CAF 自身日志（基础设施）不受影响。
+class business_time_flag final : public spdlog::custom_flag_formatter {
+public:
+    void format(const spdlog::details::log_msg&, const std::tm&,
+                spdlog::memory_buf_t& dest) override {
+        const auto now = business_now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now.time_since_epoch()) %
+                        std::chrono::milliseconds{1000};
+        const auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char buf[40];
+        const auto n = std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", &tm);
+        dest.append(buf, buf + n);
+        char ms_buf[16];
+        const auto mn = std::snprintf(ms_buf, sizeof ms_buf, ".%03lld",
+                                      static_cast<long long>(ms.count()));
+        dest.append(ms_buf, ms_buf + mn);
+    }
+
+    std::unique_ptr<custom_flag_formatter> clone() const override {
+        return std::make_unique<business_time_flag>();
+    }
+};
+
+} // namespace
 
 caf::actor spawn_logging_service(caf::actor_system& sys) {
     // 幂等：重复 bootstrap（理论上不会）直接返回既有实例
@@ -27,8 +67,16 @@ caf::actor spawn_logging_service(caf::actor_system& sys) {
     auto file_sink    = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
         "logs/app.log", true);
 
+    // 注意：custom_flags 不能 initializer_list 构造（元素 const → 尝试拷贝
+    // unique_ptr，MSVC 报 xmemory 深处的 C2672 construct_at）——先建空 map 再
+    // emplace 移动进去。
+    auto flags = spdlog::pattern_formatter::custom_flags{};
+    flags.emplace('O', std::make_unique<business_time_flag>());
     auto formatter = std::make_unique<spdlog::pattern_formatter>(
-        std::string("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v"));
+        std::string("[%O] [%^%l%$] [%n] %v"),
+        spdlog::pattern_time_type::local,
+        spdlog::details::os::default_eol,
+        std::move(flags));
     console_sink->set_formatter(formatter->clone());
     file_sink->set_formatter(std::move(formatter));
 

@@ -4,6 +4,7 @@
 #include "checkpoint_manager.hpp"
 #include "graceful_shutdown.hpp"
 #include "services/logging_service.hpp"
+#include "services/time_service.hpp"
 #include "plugin/plugin_loader.hpp"
 #include "common/message_meta.hpp"
 #include "common/message_tags.hpp"
@@ -344,6 +345,10 @@ framework_config::framework_config() {
              "verify Python script plugin: resolve echo_service and call envelope+string")
         .add(test_ts_script, "test-ts-script",
              "verify TypeScript script plugin: resolve echo_service and call envelope+string")
+        .add(time_offset, "time-offset",
+             "global business time offset in seconds (test mode; business_now() = now + offset)")
+        .add(test_time_offset, "test-time-offset",
+             "verify time service: business_now() - now == configured offset after startup")
         .add(bridge_port, "bridge-port",
              "bridge sidecar TCP port for external-language nodes (0 = disabled)")
         .add(test_bridge_call, "test-bridge-call",
@@ -363,6 +368,18 @@ bool bootstrap_system_components(caf::actor_system& sys,
     out.logging_service = spawn_logging_service(sys);
     // 日志单例已在 spawn 内注册（logging_service() 访问器），启动期诊断全进 app.log
     LOG_INFO("[Bootstrap] logging service up");
+
+    // ---- 统一时间源：全局业务时间偏移注入（必须早于任何业务取时）----
+    // time_service 是头文件级单例（include/services/time_service.hpp），
+    // 非 actor：快路径 business_now() inline 读原子变量零开销。偏移来自
+    // 配置（--time-offset / caf-application.conf），多节点集群测试时各
+    // 节点配置同一值即天然一致。非零必告警，防止忘改回 0 误上生产。
+    set_time_offset(std::chrono::seconds{cfg.time_offset});
+    if (cfg.time_offset != 0) {
+        std::cout << "[WARN] TIME OFFSET = +" << cfg.time_offset
+                  << "s (TEST MODE)" << std::endl;
+        LOG_WARN("[Bootstrap] TIME OFFSET = +{}s (TEST MODE)", cfg.time_offset);
+    }
 
     out.registry = sys.spawn<ServiceRegistry>(cfg.allow_cross_node);
     out.checkpoint_mgr
