@@ -158,6 +158,29 @@ void backdoor_time_offset(const app_config& cfg) {
     run_time_offset_test();
 }
 
+/// 运行期卸载验证后门（--test-unload=<插件名>）：request PluginManager
+/// unload_atom 走完整退役链——quiesce 断流 → save_state 排空屏障 →
+/// unregister（proxy 退役 + 统一解绑广播 service_gone 给其他插件主
+/// actor）→ 旧 actor 退役。验证广播链路 + proxy monitor 断环。
+void backdoor_unload_plugin(caf::actor_system& sys, const app_config& cfg,
+                            const BootstrapResult& fw) {
+    if (cfg.test_unload.empty())
+        return;
+    std::cout << "[UnloadTest] unloading plugin: " << cfg.test_unload
+              << std::endl;
+    caf::scoped_actor self{sys};
+    self->request(fw.plugin_mgr, std::chrono::seconds(10), unload_atom{},
+                  cfg.test_unload)
+        .receive(
+            [](bool ok) {
+                std::cout << "[UnloadTest] unload result: " << ok << std::endl;
+            },
+            [](caf::error& e) {
+                std::cout << "[UnloadTest] unload error: "
+                          << caf::to_string(e) << std::endl;
+            });
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -175,6 +198,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_py_script(sys, cfg, fw);
     backdoor_ts_script(sys, cfg, fw);
     backdoor_time_offset(cfg);
+    backdoor_unload_plugin(sys, cfg, fw);
 }
 
 } // namespace caf_plugin_system

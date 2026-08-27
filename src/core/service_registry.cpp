@@ -34,6 +34,12 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
     return sys.spawn([initial_target, allow_cross_node](caf::stateful_actor<ProxyState>* self) {
         self->state().current = initial_target; // 实现
         self->state().allow_cross_node = allow_cross_node;
+        // 监视实现：impl 终止 → down_msg 清 current 自退（防幽灵代理）。
+        // 断引用环关键断点：impl 死亡后 proxy 不再强持 impl，引用计数
+        // 可归零；无人持有的 proxy 也随之销毁。正常注销路径（unregister
+        // send_exit proxy）不经此 handler。CAF monitor 幂等：重复 monitor
+        // 同一目标仍只发一次 down_msg。
+        self->monitor(initial_target);
 
         // CAF 1.1: default_handler 使用 caf::message&（message_view 已移除）
         self->set_default_handler([self](caf::scheduled_actor*, caf::message& msg)
@@ -84,6 +90,20 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
         });
 
         return caf::behavior{
+            [=](const caf::down_msg& dm) {
+                // 实现已终止：清 current 停止转发并自退。断引用环断点——
+                // impl 死亡 → proxy 不再强持 impl；若外部无人再持有 proxy
+                //（引用计数归零），proxy 随之销毁。热更新后的旧 impl 退出
+                // 时 current 已是新实现，地址不匹配则忽略（monitor 仍挂在
+                // 旧 impl 上，down 只可能来自它——过滤保证只处理当前目标）。
+                if (self->state().current
+                    && self->state().current->address() == dm.source) {
+                    self->state().current = nullptr;
+                    LOG_INFO("[Proxy] impl down, retiring proxy");
+                    self->quit(caf::exit_reason::user_shutdown);
+                }
+            },
+
             [=](set_acl_atom, std::vector<caf::actor_addr> allowed) {
                 auto& s = self->state();
                 s.allowed = std::move(allowed);
@@ -112,6 +132,9 @@ caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target
                 auto& s = self->state();
                 s.current = new_target;
                 s.version++;
+                // 热切换后监视新实现（旧 impl 的 monitor 保留但地址过滤
+                // 忽略其 down；CAF 幂等，重复 monitor 不产生重复 down_msg）
+                self->monitor(new_target);
                 s.paused = false;
                 LOG_INFO("[Proxy] v" + std::to_string(s.version) + " resumed, flushing "
                             + std::to_string(s.buffered.size()) + " buffered call(s)");

@@ -52,6 +52,10 @@ struct PluginLifecycleHooks {
     std::function<void(const std::vector<std::byte>&)> on_restore;
     /// 关机清理（可选）：框架在 self->quit() 之前调用。
     std::function<void()> on_shutdown;
+    /// 服务注销通知（可选）：其他插件 unload 时，PM 广播 service_gone——
+    /// 本插件声明的服务名列表。持有者在此释放缓存的代理强引用（跨插件
+    /// 引用环的协作式断点）；子 actor 的弱引用（actor_addr）无需通知。
+    std::function<void(const std::vector<std::string>&)> on_service_removed;
 };
 
 /// 框架公共生命周期 behavior。与插件私有业务 handler 用 or_else 组合：
@@ -86,5 +90,12 @@ inline caf::message_handler plugin_lifecycle(caf::event_based_actor* self,
             // 退出语义框架统一：插件忘 quit 的坑消失（不 quit 会导致
             // 退役流程等不到 down_msg，retired_ 泄漏）。
             self->quit();
+        },
+        // 服务注销通知（框架统一接住，防 print_and_drop 噪音）：PM 统一
+        // 解绑广播（其他插件 unload 时）——插件在 on_service_removed 钩子
+        // 里释放缓存的代理强引用；不注册钩子 = 无操作（广播静默消化）。
+        [=](service_gone_atom, const std::vector<std::string>& gone) {
+            if (hooks.on_service_removed)
+                hooks.on_service_removed(gone);
         }};
 }

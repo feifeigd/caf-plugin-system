@@ -349,6 +349,8 @@ framework_config::framework_config() {
              "global business time offset in seconds (test mode; business_now() = now + offset)")
         .add(test_time_offset, "test-time-offset",
              "verify time service: business_now() - now == configured offset after startup")
+        .add(test_unload, "test-unload",
+             "unload a plugin at runtime: quiesce -> save_state -> unregister (broadcast) -> retire")
         .add(bridge_port, "bridge-port",
              "bridge sidecar TCP port for external-language nodes (0 = disabled)")
         .add(test_bridge_call, "test-bridge-call",

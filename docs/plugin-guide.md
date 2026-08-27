@@ -362,3 +362,45 @@ struct MyPlugin : PluginEntry {
   开放 unload，配 drain → down_msg → 全链路句柄清零 → quarantine 延迟卸载
   协议（漏一处句柄就是远期崩溃）；或进程隔离插件宿主（杀进程即卸载，
   OS 兜底）。
+
+## 11. 服务引用纪律与统一解绑（防循环依赖泄漏）
+
+> 场景：`serviceA → proxyB → serviceB → proxyA → serviceA` 的跨插件引用环。
+> CAF 的 `caf::actor` 是强引用句柄——**持有即保活**。环内任何一方注销，
+> 其余方的强引用会让环内对象引用计数永不归零（互保泄漏）。§10 的
+> "down_msg → destroy" 回收粒度救不了引用环：down 只表示 actor 停止运行，
+> control_block 要等最后一个强引用释放才析构。
+
+### 11.1 三要素（缺一不可）
+
+| # | 要素 | 机制 | 实现 |
+|---|---|---|---|
+| ① | **unregister 顺序反转 + proxy monitor** | registry 注销时摘台账先于 proxy 退役；`spawn_service_proxy` 内 `monitor(impl)`，impl 终止 → down_msg 清 `current` 并自退——**断环唯一机制断点** | `service_registry.cpp`（已实现） |
+| ② | **service_gone 广播（PM 统一解绑）** | unload 时 PM 遍历其他插件主 actor，`send(service_gone_atom, 被注销服务名列表)`；持有者在 `on_service_removed` 钩子释放缓存的强句柄。协作式断点，只覆盖**主 actor** | `plugin_manager.cpp` + `plugin_lifecycle.hpp`（已实现） |
+| ③ | **弱引用纪律（长期持有用 `actor_addr`）** | 服务间长期引用存**弱句柄**（不增加引用计数），调用时 `actor_cast<caf::actor>` 升级；升级失败 = 目标已注销 → 自行清理。**子 actor 也天然安全** | 本文档纪律 |
+
+### 11.2 引用纪律规则
+
+- **临时调用**：`resolve → request → 弃`。不缓存 proxy，环不存在；
+- **必须长期持有**（订阅目标、回调地址、deps 注入）：存 `caf::actor_addr`
+  （弱引用），用时 `actor_cast<caf::actor>(addr)` 升级（失败 = 已死，清理）；
+- **主 actor 缓存了强句柄**：在 `PluginLifecycleHooks::on_service_removed`
+  钩子里释放（收到广播 = 服务已注销）；
+- **子 actor**：不需要登记、不需要广播——只要子 actor 的持有也用弱引用，
+  目标注销即引用计数归零，自动回收。
+
+### 11.3 为什么不是"每次 spawn 都登记进 PM"
+
+PM 台账只认识插件主 actor。插件内部 spawn 的 worker/脚本/桥接子 actor
+是业务自由，框架不该管也管不全（临时 actor、detached、动态 spawn）。
+"统一管理所有 actor"是错误方向——正确的解是**引用形态**（弱引用），
+不是**引用台账**（登记）。
+
+### 11.4 验证后门
+
+`--caf-plugin-system.test-unload=<插件名>`：启动后 request PM unload，
+走完整退役链（quiesce → save_state 屏障 → unregister → 广播 → 退役）。
+日志观察点：`[Proxy] impl down, retiring proxy`（① 生效）与插件钩子
+收到的 `service_gone`（② 生效）；shutdown 后无 `[LeakCheck] actors
+remaining` 即无残留。
+

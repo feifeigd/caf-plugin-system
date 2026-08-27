@@ -16,9 +16,10 @@
 
 namespace caf_plugin_system {
 
-/// 所有 --test-* 验证后门的统一入口。内部按 cfg 的字段分发：
-///   test_auto_shutdown / test_cross_call / test_cross_call_ex /
-///   test_bridge_call / test_remote_reload / test_quit / test_ctrl_c
+// 所有 --test-* 验证后门的统一入口。内部按 cfg 的字段分发：
+//   test_auto_shutdown / test_cross_call / test_cross_call_ex /
+//   test_bridge_call / test_remote_reload / test_quit / test_ctrl_c
+//   test_unload（运行期卸载 + 统一解绑广播验证）
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
                         const cluster::BootstrapResult& nb,
                         const BootstrapResult& fw);
