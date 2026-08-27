@@ -52,6 +52,18 @@ public:
 
 } // namespace
 
+// ------------------------------------------------------------------
+// 日志 actor 句柄单例实体（DLL 单一实体，见 logging_service.hpp 注释）
+// ------------------------------------------------------------------
+caf::actor& current_logger() {
+    static caf::actor logger;
+    return logger;
+}
+
+void set_logger(const caf::actor& a) {
+    current_logger() = a;
+}
+
 caf::actor spawn_logging_service(caf::actor_system& sys) {
     // 幂等：重复 bootstrap（理论上不会）直接返回既有实例
     if (current_logger())

@@ -406,15 +406,14 @@ class MongoPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"MongoPlugin", "1.0.0",
-                {"logging_service"},
+                 {},
                 {"mongo_service"}, 0, {}};
     }
 
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        caf_plugin_system::set_logger(logger);
+        caf::actor logger = caf_plugin_system::current_logger();
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         // mongocxx 驱动单例：instance.hpp 要求 "exactly one instance must be

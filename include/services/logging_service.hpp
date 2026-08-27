@@ -8,15 +8,18 @@
 //   - 调用方一律用本头的 LOG_INFO/LOG_WARN/LOG_ERROR 宏：变参 fmt::format
 //     调用点格式化（fmt::runtime，兼容运行时拼接串和字面量格式串）+ 自动
 //     带 [文件:行号]（__FILE__/__LINE__）。
-//   - actor 目标经 current_logger() 解析——每模块一份（exe / 各插件 DLL
-//     的 inline 静态各自独立，见下），不存在 framework_log 的全局注入：
+//   - actor 目标经 current_logger() 解析——DLL 单一实体（caf_plugin_core
+//     动态库内定义，方案 B：exe 与各插件 DLL 链接同一动态库共享一份）：
 //       exe 侧：bootstrap_system_components 最先 spawn 后 set_logger()；
-//       插件侧：spawn 时 set_logger(deps[0]) + set_log_source(PLUGIN_NAME)。
+//       插件侧：无需 set_logger（DLL 实体已由 exe 注入）→ manifest 不再
+//       依赖 logging_service；set_log_source(PLUGIN_NAME) 仍保留（每模块
+//       inline 副本，日志来源区分）。
 //   - 开关机流程单独落 shutdown-trace.log（控制台销毁时唯一可靠证据），
 //     与 app.log 并存，见 docs/windows-shutdown-experience.md。
 // ------------------------------------------------------------------
 
 #include "common/message_tags.hpp"
+#include "common/core_export.hpp"
 
 #include <caf/all.hpp>
 #include <fmt/format.h>
@@ -27,24 +30,23 @@
 namespace caf_plugin_system {
 
 // ------------------------------------------------------------------
-// 每模块日志 actor 单例
-//
-// inline 函数里的 static 局部变量按"模块"（exe / 每个插件 DLL）各自实例化：
-// exe 内所有 TU 合并为一份，插件 DLL 内合并为一份，互不干扰。这解决了
-// caf_plugin_core 是静态库、被 exe 和各插件 DLL 各链一份的隔离问题——
-// 插件拿不到 exe 的全局，但每个模块自己 set_logger 一次即可。
-// 空 = 尚未初始化（理论上不会发生：exe 侧 spawn 在最前，插件侧 spawn 时注入）。
+// 日志 actor 句柄单例（方案 B，2026-08-27：core 动态库化后为 DLL 单一
+// 实体）。定义在 logging_service.cpp（caf_plugin_core.dll 内），exe 与
+// 各插件 DLL 链接同一动态库 → 进程内只有一份：
+//   - exe 侧：bootstrap_system_components 最先 spawn 后 set_logger()；
+//   - 插件侧：**无需再 set_logger**（DLL 实体已由 exe 注入）——这就是
+//     插件 manifest 不再依赖 logging_service 的根基（旧实现里每个插件
+//     DLL 有独立 inline 副本，必须 set_logger(deps[0]) 自注入）。
+// 空 = 尚未初始化（理论上不会发生：exe 侧 spawn 在最前）。
 // ------------------------------------------------------------------
-inline caf::actor& current_logger() {
-    static caf::actor logger;
-    return logger;
-}
+extern CORE_API caf::actor& current_logger();
 
-inline void set_logger(const caf::actor& a) {
-    current_logger() = a;
-}
+extern CORE_API void set_logger(const caf::actor& a);
 
 /// 日志来源名：exe 侧默认 "core"；插件侧 spawn 时设为 PLUGIN_NAME。
+/// 注意：log_source 刻意保持"每模块 inline 副本"（非 DLL 实体）——
+/// 插件模块内 set_log_source(PLUGIN_NAME) 只影响本模块，日志里才能
+/// 区分来源；若也做成单一实体，插件一设置全局 source 都会变。
 inline std::string& log_source() {
     static std::string source = "core";
     return source;

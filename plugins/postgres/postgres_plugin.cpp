@@ -287,15 +287,14 @@ class PostgresPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"PostgresPlugin", "1.0.0",
-                {"logging_service"},
+                 {},
                 {"pg_service"}, 0, {}};
     }
 
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        caf_plugin_system::set_logger(logger);
+        caf::actor logger = caf_plugin_system::current_logger();
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         // 声明式配置读取（PLUGIN_CONFIG）：字段、默认值、解析全部自动

@@ -629,15 +629,14 @@ class TsHostPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"TsHostPlugin", "1.0.0",
-                {"logging_service"},
+                 {},
                 {"ts_host_service"}, 0, {}};
     }
 
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        caf_plugin_system::set_logger(logger);
+        caf::actor logger = caf_plugin_system::current_logger();
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         auto cfg = load_plugin_config(sys.config());

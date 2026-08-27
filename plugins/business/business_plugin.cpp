@@ -51,7 +51,7 @@ public:
         // acl_allow 演示：business_service 进入受限策略，信任核心日志服务（logging_service
     // 为核心内置服务，plugin_manager 的 ACL 解析会回退到 ServiceRegistry）
         // 的调用，其余 sender（包括外部/入口 actor）在代理处被 ACL 拦截
-        return {"BusinessPlugin", BIZ_VERSION_STR, {"logging_service"}, {"business_service"},
+        return {"BusinessPlugin", BIZ_VERSION_STR, {}, {"business_service"},
                 0, {"logging_service"}};
     }
 
@@ -59,9 +59,7 @@ public:
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        // 注册为本插件模块（DLL）的日志单例：本文件所有 LOG_* 宏直接生效
-        caf_plugin_system::set_logger(logger);
+        // 日志句柄走 DLL 单一实体（exe 已注入），无需 deps 注入
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         return sys.spawn([](caf::stateful_actor<int>* self) -> caf::behavior {
