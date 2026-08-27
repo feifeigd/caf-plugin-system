@@ -26,7 +26,7 @@ public:
         return {
             "PlatformPlugin",
             "1.0.0",
-            {"logging_service"},   // 日志走 logging_service（不再直接 std::cout）
+             {},   // 日志走 logging_service（不再直接 std::cout）
             {"config_service", "metrics_service"},
             -100
         };
@@ -35,9 +35,7 @@ public:
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        // 注册为本插件模块（DLL）的日志单例：本文件所有 LOG_* 宏直接生效
-        caf_plugin_system::set_logger(logger);
+        // 日志句柄走 DLL 单一实体（exe 已注入），无需 deps 注入
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         return sys.spawn([](caf::stateful_actor<PlatformState>* self) -> caf::behavior {

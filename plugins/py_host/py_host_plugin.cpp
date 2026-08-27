@@ -635,15 +635,14 @@ class PythonHostPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         return {"PythonHostPlugin", "1.0.0",
-                {"logging_service"},
+                 {},
                 {"py_host_service"}, 0, {}};
     }
 
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        caf_plugin_system::set_logger(logger);
+        caf::actor logger = caf_plugin_system::current_logger();
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         // Python 解释器只初始化一次，随后释放 GIL（worker 用 PyGILState）

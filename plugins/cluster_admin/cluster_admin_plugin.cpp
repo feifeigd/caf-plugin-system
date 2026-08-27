@@ -61,7 +61,7 @@ class ClusterAdminPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
         // acl_allow 空 = 开放策略：任何 sender（含 bridge 外部调用）可调
-        return {"ClusterAdminPlugin", "0.1.0", {"logging_service"},
+        return {"ClusterAdminPlugin", "0.1.0",  {},
                 {"system.nodes", "system.services", "system.ping"},
                 0, {}};
     }
@@ -69,8 +69,7 @@ public:
     caf::actor spawn(caf::actor_system& sys,
                      const std::vector<caf::actor>& deps,
                      const std::string&) override {
-        caf::actor logger = deps.empty() ? caf::actor{} : deps[0];
-        caf_plugin_system::set_logger(logger);
+        // 日志句柄走 DLL 单一实体（exe 已注入），无需 deps 注入
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
         // registry().get() 返回 strong_actor_ptr，升级为 actor 再 request
