@@ -150,6 +150,14 @@ void backdoor_ts_script(caf::actor_system& sys, const app_config& cfg,
     run_ts_script_test(sys, fw);
 }
 
+/// 统一时间源验证后门（--test-time-offset）：校验全局业务时间偏移
+/// 注入生效（business_now() - now == 配置值）。不依赖任何服务。
+void backdoor_time_offset(const app_config& cfg) {
+    if (!cfg.test_time_offset)
+        return;
+    run_time_offset_test();
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -166,6 +174,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_lua_script(sys, cfg, fw);
     backdoor_py_script(sys, cfg, fw);
     backdoor_ts_script(sys, cfg, fw);
+    backdoor_time_offset(cfg);
 }
 
 } // namespace caf_plugin_system

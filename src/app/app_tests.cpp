@@ -7,11 +7,13 @@
 #include "cluster/remote_caller.hpp"
 #include "common/message_tags.hpp"
 #include "common/plugin_envelope.hpp"
+#include "services/time_service.hpp"
 
 #include <caf/all.hpp>
 
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -473,6 +475,36 @@ void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
     }
     // 清理 RemoteCaller（同 run_cross_call_test：不杀则析构挂起）
     self->send_exit(caller, caf::exit_reason::user_shutdown);
+}
+
+// ------------------------------------------------------------------
+// 统一时间源验证（--test-time-offset）：校验全局偏移注入生效。
+// business_now() - 真实 now 必须 == 配置的 time-offset；同时打印
+// 业务时间串与真实时间串（日志时间戳 = 业务时间，同源）。
+// ------------------------------------------------------------------
+
+void run_time_offset_test() {
+    const auto real = std::chrono::system_clock::now();
+    const auto biz  = business_now();
+    const auto diff = std::chrono::duration_cast<std::chrono::seconds>(biz - real);
+    const auto expect = time_offset();
+    const bool pass = diff == expect;
+
+    const auto rt = std::chrono::system_clock::to_time_t(real);
+    std::tm rtm{};
+#ifdef _WIN32
+    localtime_s(&rtm, &rt);
+#else
+    localtime_r(&rt, &rtm);
+#endif
+    char rbuf[32];
+    std::strftime(rbuf, sizeof rbuf, "%Y-%m-%d %H:%M:%S", &rtm);
+
+    std::cout << "[TimeTest] business_now() - now = " << diff.count()
+              << "s | configured offset = " << expect.count()
+              << "s -> " << (pass ? "PASS" : "FAIL") << std::endl;
+    std::cout << "[TimeTest] business now = " << format_business_now()
+              << " | real now = " << rbuf << std::endl;
 }
 
 } // namespace caf_plugin_system

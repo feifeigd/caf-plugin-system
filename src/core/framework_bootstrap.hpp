@@ -95,6 +95,14 @@ struct framework_config : caf::actor_system_config {
     std::string mongo_uris = "default=mongodb://127.0.0.1:27017";
     /// SQL 插件连接池大小（每个命名连接的 worker/连接数，全局统一）
     int db_pool_size = 2;
+    /// 全局业务时间偏移（秒，--time-offset；默认 0 = 真实时间）。
+    /// 统一时间源：启动时注入 time_service 全局原子，业务代码读
+    /// business_now()。测试未来时间用，不改机器时钟。非零时启动打
+    /// [WARN] TIME OFFSET ... (TEST MODE) 告警防误上生产。
+    std::int64_t time_offset = 0;
+    /// 时间服务验证后门（--test-time-offset）：启动后校验
+    /// business_now() - 真实 now == 配置偏移，打印 [TimeTest] 结果。
+    bool test_time_offset = false;
 
     framework_config();
 };
