@@ -1,32 +1,32 @@
 // ------------------------------------------------------------------
-// Lua 脚本宿主插件（lua_host）
+// Python 脚本宿主插件（py_host）
 //
-// 目标：让 .lua 脚本也能当插件用——把 scripts/ 目录下的每个 .lua 包装成
-// 一个一等 CAF 服务（一个 actor + 一个专属 lua_State + 一个 worker 线程），
-// 复用框架的 lifecycle / registry / 优雅关机 / 热更（简单换实现）。
+// 目标：让 .py 脚本也能当插件用——把 scripts/ 目录下的每个 .py 包装成
+// 一个一等 CAF 服务（一个 actor + 一个模块命名空间 + 一个 worker 线程），
+// 复用框架的 lifecycle / registry / 优雅关机 / 热更（完整 quiesce/快照）。
 //
-// 脚本约定（可选定义）：
-//   plugin = { name=..., version=..., provides="服务名", deps={...} }
-//   function on_init(manager) ... end          -- 初始化（可 bridge.call 依赖服务）
-//   function on_call(sub_proto, payload) return "..." end  -- envelope 业务入口
-//   function on_string(cmd) return "..." end               -- 字符串命令入口
-//   function on_save() return "状态串" end
-//   function on_restore(state_str) ... end
-//   function on_shutdown() ... end               -- 快清理，禁止阻塞 call
+// 与 lua_host 的差异只在运行时：CPython 有 GIL。v1 用【共享解释器】：
+// Py_Initialize 一次，每脚本 worker 线程用 PyGILState_Ensure/Release 持 GIL
+// 跑 Python，bridge.call 阻塞期间 Py_BEGIN_ALLOW_THREADS 释放 GIL（I/O 型
+// 脚本可互相重叠）。子解释器（PEP 684 每解释器 GIL，真并行）留后续。
 //
-// 桥接 API（脚本全局可用）：
-//   log(level, msg)
-//   call(service, sub_proto, payload) -> ok, reply   -- 同步阻塞调用服务
-//   call_string(service, cmd) -> ok, reply
-//   config(key) -> value
-//   self_name() -> 服务名
-//   now() -> 毫秒时间戳
+// 脚本约定（.py 侧，与 .lua 对齐）：
+//   plugin = {"name":..., "version":..., "provides":..., "deps":[...]}
+//   def on_init(manager): ...
+//   def on_call(sub_proto, payload): return "..."    # envelope 业务入口
+//   def on_string(cmd): return "..."
+//   def on_save(): return "状态串"
+//   def on_restore(state_str): ...
+//   def on_shutdown(): ...
+//
+// 桥接 API（脚本全局可用）：log / call / call_string / config / self_name / now。
 //
 // 关键决策：
 //   - 零新 type_id / 免 register_meta_objects：全程 plugin_envelope(228) +
-//     std::string，宿主像 DB 插件一样不需要 register_meta_objects 导出。
-//   - 单 worker 独占 lua_State：所有 Lua 执行走 JobQueue，event actor 不阻塞；
-//     bridge.call() 在 worker 线程用 scoped_actor 阻塞 request，Lua 里同步化。
+//     std::string。
+//   - 每脚本一个模块 dict（共享解释器内隔离 globals）；桥接上下文用 TLS。
+//   - 单 worker 独占脚本模块：event actor 不阻塞，bridge.call 在 worker 线程
+//     阻塞 request（先释放 GIL），Lua 版同构。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
@@ -39,16 +39,29 @@
 #include <caf/all.hpp>
 #include <caf/actor_registry.hpp>
 
-#include <sol/sol.hpp>
+// Python.h 必须最先包含（它要压 Windows 头警告）；标准安装只发货 release
+// 库（python314.lib），debug 构建下 _DEBUG 会触发 auto-link python314_d.lib
+// （不存在）→ 链接失败。局部 undef _DEBUG 让 Python.h 链 release 库，随后
+// 立即恢复，不影响本 TU 其余部分。
+#ifdef _DEBUG
+#define PY_HOST_UNDEFD_DEBUG 1
+#undef _DEBUG
+#endif
+#include <Python.h>
+#ifdef PY_HOST_UNDEFD_DEBUG
+#define _DEBUG
+#endif
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <string>
@@ -58,18 +71,17 @@
 
 namespace {
 
-// 声明式配置（PLUGIN_CONFIG，见 common/plugin_config.hpp）：
-// 读取路径 caf-plugin-system.lua_host.<字段名>。scripts_dir 留空 = 用
-// asset_dir/scripts（框架注入的 DLL 所在目录）。
-#define LUA_FIELDS(X, XC)                                                      \
+// 声明式配置（PLUGIN_CONFIG，见 common/plugin_config.hpp）。
+// scripts_dir 留空 = 用 asset_dir/scripts。
+#define PY_FIELDS(X, XC)                                                       \
     X(std::string, scripts_dir, "")
-PLUGIN_CONFIG(LUA_FIELDS)
-#undef LUA_FIELDS
+PLUGIN_CONFIG(PY_FIELDS)
+#undef PY_FIELDS
 
-// 保留的宿主管理子协议号（走 plugin_envelope，发给 lua_host_service）
-constexpr uint16_t lua_reload_sub_proto = 1;   // payload = 脚本服务名 → 重载
+// 保留的宿主管理子协议号（走 plugin_envelope，发给 py_host_service）
+constexpr uint16_t py_reload_sub_proto = 1;   // payload = 脚本服务名 → 重载
 
-// 脚本清单（从 Lua `plugin` 表读取）
+// 脚本清单（从 Python `plugin` dict 读取）
 struct ScriptManifest {
     std::string name;
     std::string version;
@@ -90,10 +102,9 @@ struct ScriptJob {
     std::function<void(std::vector<std::byte>)> done_bytes;   // Save 回执
     std::function<void()> done_void;                          // Init/Restore/Shutdown 完成
 
-    // JobQueue::fail_all / worker 异常路径统一交付
     void fail(const std::string& err) {
         if (done_str)
-            done_str("lua error: " + err);
+            done_str("python error: " + err);
         else if (done_bytes)
             done_bytes({});
         else if (done_void)
@@ -105,12 +116,12 @@ using JobQueue = caf_plugin_system::JobQueue<ScriptJob>;
 
 // 脚本实例共享状态：子 actor 与 worker 线程共同持有
 struct ScriptState {
-    std::shared_ptr<sol::state> lua;
+    PyObject* module_dict = nullptr;   // 脚本命名空间（globals dict，worker 退出时 DECREF）
     ScriptManifest manifest;
-    caf::actor logger;        // 日志服务 actor
-    caf::actor registry;      // 服务注册表（bridge.call 解析用）
+    caf::actor logger;
+    caf::actor registry;
     caf::actor_system* sys = nullptr;
-    std::string self_name;    // 服务名
+    std::string self_name;
     std::shared_ptr<JobQueue> queue;
     std::shared_ptr<std::thread> worker;
     std::atomic<bool> stopped{false};
@@ -120,8 +131,10 @@ struct ScriptState {
 // 桥接辅助（跑在 worker 线程，脚本里同步调用）
 // ------------------------------------------------------------------
 
+/// TLS 当前脚本（桥接函数读它定位上下文，等价 lua_host 里 lambda 捕获 st）
+thread_local ScriptState* g_current_script = nullptr;
+
 /// 同步调用服务：resolve → 发 plugin_envelope → 等 std::string 回复。
-/// v1 契约：目标服务须回复 std::string（脚本服务 / 信封/字符串协议服务）。
 std::pair<bool, std::string> call_service(caf::actor_system& sys,
                                           caf::actor registry,
                                           const std::string& service,
@@ -184,26 +197,6 @@ std::pair<bool, std::string> call_string_service(caf::actor_system& sys,
     return {ok, reply};
 }
 
-/// 取 Lua 函数结果里的第一个字符串（nil/非字符串 → 空串）。
-std::string first_string(const sol::protected_function_result& r) {
-    if (!r.valid() || r.return_count() == 0)
-        return {};
-    sol::object o = r.get<sol::object>();
-    if (o.is<std::string>())
-        return o.as<std::string>();
-    if (o.is<double>())
-        return std::to_string(o.as<double>());
-    if (o.is<bool>())
-        return o.as<bool>() ? "true" : "false";
-    return {};
-}
-
-/// 调用 Lua 函数（不存在则跳过），异常由 worker 的 try/catch 兜底。
-sol::protected_function lua_fn(sol::state& L, const char* name) {
-    sol::protected_function f = L[name];
-    return f;
-}
-
 /// 沙箱：bridge.call 只允许脚本在 plugin.deps 声明的服务 + 无害的 logging_service。
 bool sandbox_allows(const std::vector<std::string>& deps, const std::string& service) {
     if (service == "logging_service")
@@ -214,76 +207,173 @@ bool sandbox_allows(const std::vector<std::string>& deps, const std::string& ser
     return false;
 }
 
-/// 把桥接 API 绑定到脚本全局命名空间。
-void bind_bridge(sol::state& L, ScriptState* st) {
-    L.set_function("log", [st](const std::string& level, const std::string& msg) {
-        if (st->logger)
-            caf::anon_send(st->logger, log_atom{}, st->self_name, level,
-                           "[lua] " + msg);
-    });
-    L.set_function("call",
-                   [st](const std::string& service, uint16_t sub_proto,
-                        const std::string& payload) {
-                       if (!st->sys)
-                           return std::make_pair(false, std::string("no system"));
-                       if (!sandbox_allows(st->manifest.deps, service))
-                           return std::make_pair(
-                               false, std::string("sandbox: service '") + service
-                                          + "' not in deps allowlist");
-                       return call_service(*st->sys, st->registry, service,
-                                           sub_proto, payload);
-                   });
-    L.set_function("call_string",
-                   [st](const std::string& service, const std::string& cmd) {
-                       if (!st->sys)
-                           return std::make_pair(false, std::string("no system"));
-                       if (!sandbox_allows(st->manifest.deps, service))
-                           return std::make_pair(
-                               false, std::string("sandbox: service '") + service
-                                          + "' not in deps allowlist");
-                       return call_string_service(*st->sys, st->registry,
-                                                  service, cmd);
-                   });
-    L.set_function("config", [st](const std::string& key) {
-        if (!st->sys)
-            return std::string{};
-        return caf::get_or(st->sys->config(),
-                           "caf-plugin-system.lua_host." + key, std::string{});
-    });
-    L.set_function("self_name", [st]() { return st->self_name; });
-    L.set_function("now", []() {
-        return static_cast<double>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count());
-    });
+/// 受限 builtins：去掉 __import__/open/eval/exec 等，阻止脚本 import os/读写文件。
+/// 注：CPython 进程内沙箱是 best-effort（存在 object.__subclasses__ 等绕过），
+/// 真正的隔离需进程级（用户暂缓子进程方案）。返回新引用，调用方 DECREF。
+PyObject* restricted_builtins() {
+    PyObject* mod = PyImport_ImportModule("builtins");
+    if (!mod)
+        return nullptr;
+    PyObject* dst = PyDict_Copy(PyModule_GetDict(mod));
+    static const char* danger[] = {
+        "__import__", "open", "eval", "exec", "compile", "input",
+        "breakpoint", "exit", "quit",
+    };
+    for (const char* name : danger)
+        PyDict_DelItemString(dst, name);
+    return dst;
 }
 
-/// 读脚本顶层的 `plugin` 表（manifest）。
-void read_manifest(sol::state& L, ScriptManifest& m,
-                   const std::filesystem::path& path) {
-    sol::optional<sol::table> pt = L["plugin"];
-    if (!pt)
-        return;
-    m.name = (*pt)["name"].get_or(std::string{});
-    m.version = (*pt)["version"].get_or(std::string{});
-    m.provides = (*pt)["provides"].get_or(std::string{});
-    if (auto deps = (*pt)["deps"].get<sol::optional<sol::table>>()) {
-        for (const auto& kv : *deps)
-            if (kv.second.is<std::string>())
-                m.deps.push_back(kv.second.as<std::string>());
+// ------------------------------------------------------------------
+// 桥接函数（暴露给脚本的 C 函数，METH_VARARGS/METH_NOARGS）
+// ------------------------------------------------------------------
+
+static PyObject* py_log(PyObject*, PyObject* args) {
+    const char* level = nullptr;
+    const char* msg = nullptr;
+    if (!PyArg_ParseTuple(args, "ss", &level, &msg))
+        return nullptr;
+    if (g_current_script && g_current_script->logger)
+        caf::anon_send(g_current_script->logger, log_atom{},
+                       g_current_script->self_name, std::string(level),
+                       std::string("[py] ") + msg);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_call(PyObject*, PyObject* args) {
+    const char* service = nullptr;
+    int sub_proto = 0;
+    const char* payload = nullptr;
+    if (!PyArg_ParseTuple(args, "sis", &service, &sub_proto, &payload))
+        return nullptr;
+    if (!g_current_script || !g_current_script->sys) {
+        PyErr_SetString(PyExc_RuntimeError, "no script context");
+        return nullptr;
+    }
+    if (!sandbox_allows(g_current_script->manifest.deps, service)) {
+        std::string msg = "sandbox: service '" + std::string(service)
+                          + "' not in deps allowlist";
+        return Py_BuildValue("(Os)", Py_False, msg.c_str());
+    }
+    bool ok = false;
+    std::string reply;
+    Py_BEGIN_ALLOW_THREADS
+    auto r = call_service(*g_current_script->sys, g_current_script->registry,
+                          service, static_cast<uint16_t>(sub_proto), payload);
+    ok = r.first;
+    reply = std::move(r.second);
+    Py_END_ALLOW_THREADS
+    return Py_BuildValue("(Os)", ok ? Py_True : Py_False, reply.c_str());
+}
+
+static PyObject* py_call_string(PyObject*, PyObject* args) {
+    const char* service = nullptr;
+    const char* cmd = nullptr;
+    if (!PyArg_ParseTuple(args, "ss", &service, &cmd))
+        return nullptr;
+    if (!g_current_script || !g_current_script->sys) {
+        PyErr_SetString(PyExc_RuntimeError, "no script context");
+        return nullptr;
+    }
+    if (!sandbox_allows(g_current_script->manifest.deps, service)) {
+        std::string msg = "sandbox: service '" + std::string(service)
+                          + "' not in deps allowlist";
+        return Py_BuildValue("(Os)", Py_False, msg.c_str());
+    }
+    bool ok = false;
+    std::string reply;
+    Py_BEGIN_ALLOW_THREADS
+    auto r = call_string_service(*g_current_script->sys,
+                                 g_current_script->registry, service, cmd);
+    ok = r.first;
+    reply = std::move(r.second);
+    Py_END_ALLOW_THREADS
+    return Py_BuildValue("(Os)", ok ? Py_True : Py_False, reply.c_str());
+}
+
+static PyObject* py_config(PyObject*, PyObject* args) {
+    const char* key = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &key))
+        return nullptr;
+    std::string v;
+    if (g_current_script && g_current_script->sys)
+        v = caf::get_or(g_current_script->sys->config(),
+                        "caf-plugin-system.py_host." + std::string(key),
+                        std::string{});
+    return PyUnicode_FromString(v.c_str());
+}
+
+static PyObject* py_self_name(PyObject*, PyObject*) {
+    if (!g_current_script)
+        return PyUnicode_FromString("");
+    return PyUnicode_FromString(g_current_script->self_name.c_str());
+}
+
+static PyObject* py_now(PyObject*, PyObject*) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+    return PyLong_FromLongLong(static_cast<long long>(ms));
+}
+
+static PyMethodDef bridge_methods[] = {
+    {"log", py_log, METH_VARARGS, "log(level, msg)"},
+    {"call", py_call, METH_VARARGS,
+     "call(service, sub_proto, payload) -> (ok, reply)"},
+    {"call_string", py_call_string, METH_VARARGS,
+     "call_string(service, cmd) -> (ok, reply)"},
+    {"config", py_config, METH_VARARGS, "config(key) -> value"},
+    {"self_name", py_self_name, METH_NOARGS, "self_name() -> name"},
+    {"now", py_now, METH_NOARGS, "now() -> ms"},
+    {nullptr, nullptr, 0, nullptr}
+};
+
+/// 把桥接函数注入脚本 globals（等价 lua_host 的 sol2 set_function）
+void inject_bridge(PyObject* globals) {
+    for (PyMethodDef* m = bridge_methods; m->ml_name; ++m) {
+        PyObject* fn = PyCFunction_New(m, nullptr);
+        PyDict_SetItemString(globals, m->ml_name, fn);
+        Py_DECREF(fn);
     }
 }
 
-/// 执行单个 job 的 Lua 逻辑（在 worker 线程调用）。
+/// 读脚本 `plugin` dict（manifest）。须在持 GIL 下调用。
+void read_manifest(ScriptState& st) {
+    PyObject* plugin = PyDict_GetItemString(st.module_dict, "plugin");
+    if (!plugin || !PyDict_Check(plugin))
+        return;
+    PyObject* name = PyDict_GetItemString(plugin, "name");
+    if (name && PyUnicode_Check(name))
+        st.manifest.name = PyUnicode_AsUTF8(name);
+    PyObject* version = PyDict_GetItemString(plugin, "version");
+    if (version && PyUnicode_Check(version))
+        st.manifest.version = PyUnicode_AsUTF8(version);
+    PyObject* provides = PyDict_GetItemString(plugin, "provides");
+    if (provides && PyUnicode_Check(provides))
+        st.manifest.provides = PyUnicode_AsUTF8(provides);
+    PyObject* deps = PyDict_GetItemString(plugin, "deps");
+    if (deps && PyList_Check(deps)) {
+        for (Py_ssize_t i = 0; i < PyList_Size(deps); ++i) {
+            PyObject* d = PyList_GetItem(deps, i);
+            if (d && PyUnicode_Check(d))
+                st.manifest.deps.push_back(PyUnicode_AsUTF8(d));
+        }
+    }
+}
+
+/// 执行单个 job 的 Python 逻辑（在 worker 线程调用，内部持 GIL）。
 void run_job(ScriptState& st, ScriptJob& job) {
-    sol::state& L = *st.lua;
+    PyGILState_STATE gil = PyGILState_Ensure();
+    g_current_script = &st;
+
     switch (job.op) {
         case ScriptOp::Init: {
-            auto f = lua_fn(L, "on_init");
-            if (f.valid()) {
-                auto r = f(std::string("<manager>"));
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_init");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(f, "s", "<manager>");
+                if (!r)
+                    PyErr_Print();
+                Py_XDECREF(r);
             }
             if (job.done_void) job.done_void();
             break;
@@ -293,33 +383,50 @@ void run_job(ScriptState& st, ScriptJob& job) {
                 reinterpret_cast<const char*>(job.env.payload.data()),
                 job.env.payload.size());
             std::string out;
-            auto f = lua_fn(L, "on_call");
-            if (f.valid()) {
-                auto r = f(static_cast<uint16_t>(job.env.sub_proto), payload);
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
-                out = first_string(r);
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_call");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(
+                    f, "is", static_cast<int>(job.env.sub_proto),
+                    payload.c_str());
+                if (r) {
+                    if (PyUnicode_Check(r))
+                        out = PyUnicode_AsUTF8(r);
+                    Py_DECREF(r);
+                } else {
+                    PyErr_Print();
+                }
             }
             if (job.done_str) job.done_str(out);
             break;
         }
         case ScriptOp::String: {
             std::string out;
-            auto f = lua_fn(L, "on_string");
-            if (f.valid()) {
-                auto r = f(job.str);
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
-                out = first_string(r);
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_string");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(f, "s", job.str.c_str());
+                if (r) {
+                    if (PyUnicode_Check(r))
+                        out = PyUnicode_AsUTF8(r);
+                    Py_DECREF(r);
+                } else {
+                    PyErr_Print();
+                }
             }
             if (job.done_str) job.done_str(out);
             break;
         }
         case ScriptOp::Save: {
             std::string out;
-            auto f = lua_fn(L, "on_save");
-            if (f.valid()) {
-                auto r = f();
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
-                out = first_string(r);
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_save");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(f, nullptr);
+                if (r) {
+                    if (PyUnicode_Check(r))
+                        out = PyUnicode_AsUTF8(r);
+                    Py_DECREF(r);
+                } else {
+                    PyErr_Print();
+                }
             }
             if (job.done_str) job.done_str(out);
             break;
@@ -328,28 +435,35 @@ void run_job(ScriptState& st, ScriptJob& job) {
             std::string data(
                 reinterpret_cast<const char*>(job.bytes.data()),
                 job.bytes.size());
-            auto f = lua_fn(L, "on_restore");
-            if (f.valid()) {
-                auto r = f(data);
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_restore");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(f, "s", data.c_str());
+                if (!r)
+                    PyErr_Print();
+                Py_XDECREF(r);
             }
             if (job.done_void) job.done_void();
             break;
         }
         case ScriptOp::Shutdown: {
-            auto f = lua_fn(L, "on_shutdown");
-            if (f.valid()) {
-                auto r = f();
-                if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
+            PyObject* f = PyDict_GetItemString(st.module_dict, "on_shutdown");
+            if (f && PyCallable_Check(f)) {
+                PyObject* r = PyObject_CallFunction(f, nullptr);
+                if (!r)
+                    PyErr_Print();
+                Py_XDECREF(r);
             }
             if (job.done_void) job.done_void();
             break;
         }
     }
+
+    g_current_script = nullptr;
+    PyGILState_Release(gil);
 }
 
-/// worker 主循环：独占 lua_State，串行执行队列。
-void lua_worker_main(std::shared_ptr<ScriptState> st) {
+/// worker 主循环：独占脚本模块，串行执行队列。
+void py_worker_main(std::shared_ptr<ScriptState> st) {
     for (;;) {
         auto job = st->queue->pop();
         if (!job)
@@ -361,6 +475,13 @@ void lua_worker_main(std::shared_ptr<ScriptState> st) {
             job->fail(e.what());
         }
     }
+    // 退出前回收脚本命名空间（持 GIL DECREF）
+    PyGILState_STATE gil = PyGILState_Ensure();
+    if (st->module_dict) {
+        Py_DECREF(st->module_dict);
+        st->module_dict = nullptr;
+    }
+    PyGILState_Release(gil);
 }
 
 /// 幂等停 worker：stop 队列 + join 线程。
@@ -374,8 +495,6 @@ void stop_worker(const std::shared_ptr<ScriptState>& st) {
 }
 
 // ---- 状态聚合帧（宿主 on_save 聚合子脚本状态，on_restore 拆帧分发）----
-// 帧格式：[4B name_len][name][4B data_len][data]，多帧首尾相接。同进程
-// 内读写，字节序一致即可。
 
 void append_frame(std::string& buf, const std::string& name,
                   const std::vector<std::byte>& data) {
@@ -417,35 +536,64 @@ parse_frames(const std::vector<std::byte>& blob) {
     return out;
 }
 
-/// 从 .lua 文件构建一个完整 ScriptState（加载脚本 + 起 worker）。
-/// 失败返回 nullptr。
+/// 从 .py 文件构建 ScriptState（编译进独立命名空间 + 起 worker）。失败返回 null。
 std::shared_ptr<ScriptState> load_script_state(caf::actor_system& sys,
                                                caf::actor logger,
                                                caf::actor registry,
                                                const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        LOG_ERROR("script open failed: {}", path.string());
+        return nullptr;
+    }
+    std::string src((std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
+
     auto st = std::make_shared<ScriptState>();
     st->sys = &sys;
     st->logger = logger;
     st->registry = registry;
-    st->lua = std::make_shared<sol::state>();
-    st->lua->open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
-                            sol::lib::math, sol::lib::utf8);
-    bind_bridge(*st->lua, st.get());
 
-    auto result = st->lua->safe_script_file(path.string());
-    if (!result.valid()) {
-        sol::error err = result;
-        LOG_ERROR("script load failed {}: {}", path.string(), err.what());
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* globals = PyDict_New();
+    inject_bridge(globals);
+    // 沙箱：受限 builtins（无 __import__/open/eval/exec 等）
+    PyObject* rb = restricted_builtins();
+    if (rb) {
+        PyDict_SetItemString(globals, "__builtins__", rb);
+        Py_DECREF(rb);
+    }
+    PyObject* code = Py_CompileString(src.c_str(), path.string().c_str(),
+                                      Py_file_input);
+    bool ok = true;
+    if (!code) {
+        PyErr_Print();
+        ok = false;
+    } else {
+        PyObject* result = PyEval_EvalCode(code, globals, globals);
+        Py_DECREF(code);
+        if (!result) {
+            PyErr_Print();
+            ok = false;
+        } else {
+            Py_DECREF(result);
+        }
+    }
+    if (!ok) {
+        Py_DECREF(globals);
+        PyGILState_Release(gil);
         return nullptr;
     }
 
-    read_manifest(*st->lua, st->manifest, path);
+    st->module_dict = globals;   // 转移所有权（worker 退出时 DECREF）
+    read_manifest(*st);
     if (st->manifest.provides.empty())
         st->manifest.provides = path.stem().string();
     st->self_name = st->manifest.provides;
+    PyGILState_Release(gil);
 
     st->queue = std::make_shared<JobQueue>();
-    st->worker = std::make_shared<std::thread>(lua_worker_main, st);
+    st->worker = std::make_shared<std::thread>(py_worker_main, st);
     return st;
 }
 
@@ -478,7 +626,6 @@ caf::actor spawn_script_actor(caf::actor_system& sys,
                 };
                 st->queue->push(std::move(job));
             },
-            // 被 send_exit（宿主卸载/重载退役）时：停 worker 再退，避免悬空线程
             [=](caf::exit_msg& em) {
                 stop_worker(st);
                 self->quit(em.reason);
@@ -490,8 +637,6 @@ caf::actor spawn_script_actor(caf::actor_system& sys,
                 job->op = ScriptOp::Init;
                 st->queue->push(std::move(job));
             },
-            // 同步移交：on_save 的 request 需要同步字节返回，用 future 阻塞
-            // actor 线程等 worker 序列化完成（单 worker 独占 lua_State，无竞态）。
             .on_save = [st]() -> std::vector<std::byte> {
                 std::promise<std::string> p;
                 auto f = p.get_future();
@@ -512,8 +657,6 @@ caf::actor spawn_script_actor(caf::actor_system& sys,
                 job->bytes = data;
                 st->queue->push(std::move(job));
             },
-            // 先跑 Lua on_shutdown（经 worker），再停 worker。on_shutdown 约定
-            // 快清理、禁止阻塞 call，避免与停机链互等。
             .on_shutdown = [st]() {
                 std::promise<void> p;
                 auto f = p.get_future();
@@ -528,17 +671,23 @@ caf::actor spawn_script_actor(caf::actor_system& sys,
     });
 }
 
+/// 进程级 Python 初始化状态（spawn 时 Py_Initialize 一次）。
+std::atomic<bool>& python_ready() {
+    static std::atomic<bool> ready{false};
+    return ready;
+}
+
 } // namespace
 
 // ------------------------------------------------------------------
 // 宿主插件本体
 // ------------------------------------------------------------------
-class LuaHostPlugin : public PluginEntry {
+class PythonHostPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
-        return {"LuaHostPlugin", "1.0.0",
+        return {"PythonHostPlugin", "1.0.0",
                 {"logging_service"},
-                {"lua_host_service"}, 0, {}};
+                {"py_host_service"}, 0, {}};
     }
 
     caf::actor spawn(caf::actor_system& sys,
@@ -548,16 +697,19 @@ public:
         caf_plugin_system::set_logger(logger);
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
+        // Python 解释器只初始化一次，随后释放 GIL（worker 用 PyGILState）
+        if (!python_ready().exchange(true)) {
+            Py_Initialize();
+            PyEval_SaveThread();   // 释放主 GIL；返回值（主线程状态）不再恢复
+        }
+
         auto cfg = load_plugin_config(sys.config());
-        // 脚本目录：显式配置优先，否则 asset_dir/scripts（框架注入 DLL 目录）
         std::string scripts_dir = cfg.scripts_dir.empty()
                                       ? this->asset_path("scripts")
                                       : cfg.scripts_dir;
 
         return sys.spawn([logger, scripts_dir](caf::event_based_actor* self)
                              -> caf::behavior {
-            // 服务注册表：动态注册/换实现脚本服务用。与 shutdown_mgr 同款
-            // 注入方式（见 framework_bootstrap.cpp 的 put("service_registry")）。
             caf::actor registry = caf::actor_cast<caf::actor>(
                 self->system().registry().get("service_registry"));
 
@@ -565,7 +717,6 @@ public:
             auto instances = std::make_shared<
                 std::map<std::string, std::pair<caf::actor, std::string>>>();
 
-            // 加载一个脚本并注册为服务（on_init 里逐个调用）
             auto spawn_script = [=](caf::event_based_actor* self,
                                     const std::string& path) {
                 auto st = load_script_state(self->system(), logger, registry,
@@ -576,25 +727,15 @@ public:
                 }
                 auto child = spawn_script_actor(self->system(), st);
                 self->send(registry, register_atom{}, st->self_name, child,
-                           "LuaHostPlugin");
+                           "PythonHostPlugin");
                 (*instances)[st->self_name] = {child, path};
-                // 触发子脚本 on_init（框架只对 PluginManager 加载的插件发
-                // init_atom，子脚本是宿主直接 spawn 的，须宿主补发）
                 self->send(child, init_atom{}, caf::actor{self}, std::string{});
                 LOG_INFO_SELF(self, "script loaded: {} (service={}, deps={})",
                               std::filesystem::path{path}.filename().string(),
                               st->self_name, st->manifest.deps.size());
             };
 
-            // 重载脚本（完整热更，镜像框架 §8 先排空后快照）：
-            //   1. 准备：加载新脚本 + spawn 新实例（失败时未动旧实现）；
-            //   2. quiesce 该脚本服务代理并等 ack——ack 前到达的调用都已
-            //      委托给旧实例，此后新调用进缓冲（断流）；
-            //   3. request 旧实例 save_state：邮箱到达序屏障，响应时旧实例
-            //      已处理完全部在途调用，快照即终态；
-            //   4. 新实例 restore（如有状态）+ init；
-            //   5. registry hot_reload 台账 + resume 代理（切目标 + 冲刷缓冲）；
-            //   6. 旧实例立即 send_exit 退役（快照后无新工作，状态冻结）。
+            // 完整热更（镜像框架 §8 先排空后快照）
             auto reload_script = [=](caf::event_based_actor* self,
                                      const std::string& service_name) {
                 auto it = instances->find(service_name);
@@ -605,7 +746,6 @@ public:
                 std::string path = it->second.second;
                 caf::actor old_child = it->second.first;
 
-                // 1. 准备新实例（失败直接返回，旧实现不受影响）
                 auto st = load_script_state(self->system(), logger, registry,
                                             std::filesystem::path{path});
                 if (!st) {
@@ -615,8 +755,6 @@ public:
                 auto new_child = spawn_script_actor(self->system(), st);
 
                 caf::scoped_actor blocking{self->system()};
-
-                // 2. quiesce 代理：静默 + 缓冲，等 ack（失败则销毁新实例回滚）
                 caf::actor proxy;
                 blocking->request(registry, caf::infinite, resolve_atom_v, service_name)
                     .receive([&](caf::actor a) { proxy = std::move(a); },
@@ -633,31 +771,24 @@ public:
                     return;
                 }
 
-                // 3. 快照：旧实例已排空，save_state 响应即终态
                 std::vector<std::byte> state;
                 blocking->request(old_child, std::chrono::seconds(5), save_state_atom_v)
                     .receive([&](const std::vector<std::byte>& d) { state = d; },
                              [](caf::error&) {});
 
-                // 4. 新实例：restore 状态 + init
                 if (!state.empty())
                     self->send(new_child, restore_state_atom_v, state);
                 self->send(new_child, init_atom{}, caf::actor{self}, std::string{});
 
-                // 5. registry 换实现 + resume 代理（切目标 + 冲刷缓冲）
                 self->send(registry, hot_reload_atom{}, service_name, new_child);
                 if (proxy)
                     self->send(proxy, resume_atom{}, new_child);
-
-                // 6. 旧实例退役：快照即终态，立即 send_exit（exit 后邮箱消息
-                //    被 CAF 丢弃，状态冻结在快照时刻）
                 self->send_exit(old_child, caf::exit_reason::user_shutdown);
                 it->second.first = new_child;
                 LOG_INFO_SELF(self, "script reloaded: {}", service_name);
             };
 
             caf::message_handler business{
-                // 列已加载脚本服务名
                 [=](list_atom) -> std::vector<std::string> {
                     std::vector<std::string> names;
                     names.reserve(instances->size());
@@ -665,9 +796,8 @@ public:
                         names.push_back(service_name);
                     return names;
                 },
-                // 管理信封：sub_proto=1 → 重载脚本（payload = 服务名）
                 [=](plugin_envelope env) {
-                    if (env.sub_proto != lua_reload_sub_proto)
+                    if (env.sub_proto != py_reload_sub_proto)
                         return;
                     std::string service_name(
                         reinterpret_cast<const char*>(env.payload.data()),
@@ -678,7 +808,7 @@ public:
 
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 .on_init = [=](caf::actor, const std::string&) {
-                    LOG_INFO_SELF(self, "LuaHostPlugin initializing, scripts dir: {}",
+                    LOG_INFO_SELF(self, "PythonHostPlugin initializing, scripts dir: {}",
                                   scripts_dir);
                     if (!std::filesystem::exists(scripts_dir)) {
                         LOG_WARN_SELF(self, "scripts dir not found: {}", scripts_dir);
@@ -688,13 +818,11 @@ public:
                          std::filesystem::directory_iterator(scripts_dir)) {
                         if (!entry.is_regular_file())
                             continue;
-                        if (entry.path().extension().string() != ".lua")
+                        if (entry.path().extension().string() != ".py")
                             continue;
                         spawn_script(self, entry.path().string());
                     }
                 },
-                // 聚合子脚本状态为单一字节串（checkpoint 按宿主名落盘，
-                // 下次启动 PluginManager 会 restore_state_atom 回宿主）
                 .on_save = [=]() -> std::vector<std::byte> {
                     caf::scoped_actor blocking{self->system()};
                     std::string buf;
@@ -715,7 +843,6 @@ public:
                         reinterpret_cast<const std::byte*>(buf.data())
                             + buf.size());
                 },
-                // 恢复：拆帧后逐个发给子脚本（子脚本 on_restore 走 worker）
                 .on_restore = [=](const std::vector<std::byte>& blob) {
                     for (auto& [service_name, data] : parse_frames(blob)) {
                         auto it = instances->find(service_name);
@@ -724,9 +851,6 @@ public:
                                        data);
                     }
                 },
-                // 关机：先摘服务，再发 shutdown_atom（子脚本 on_shutdown 跑
-                // Lua 清理 + 停 worker，随后自 quit），最后 wait_for 等子脚本
-                // 全部退出——保证 worker 线程在宿主退出前 join，不遗留悬空线程
                 .on_shutdown = [=]() {
                     size_t n = instances->size();
                     caf::scoped_actor blocking{self->system()};
@@ -742,7 +866,11 @@ public:
                     for (auto& c : children)
                         blocking->wait_for(c);
                     instances->clear();
-                    std::cout << "[LuaHostPlugin] shutdown hook: " << n
+                    // 所有 worker 已 join，finalize Python（进程即将退出）
+                    PyGILState_STATE gil = PyGILState_Ensure();
+                    Py_FinalizeEx();
+                    PyGILState_Release(gil);
+                    std::cout << "[PythonHostPlugin] shutdown hook: " << n
                               << " script(s) torn down" << std::endl;
                 },
             }))};
@@ -751,7 +879,7 @@ public:
 };
 
 extern "C" PLUGIN_API PluginEntry* create_plugin() {
-    return new LuaHostPlugin();
+    return new PythonHostPlugin();
 }
 
 extern "C" PLUGIN_API void destroy_plugin(PluginEntry* p) {
