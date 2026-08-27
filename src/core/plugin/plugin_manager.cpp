@@ -407,6 +407,18 @@ caf::behavior PluginManager::make_behavior() {
                 self->send(registry_, unregister_atom{}, svc);
             }
 
+            // 统一解绑广播：通知其他插件"这些服务已注销"。持有者（主
+            // actor 缓存的 proxy 强引用）在 on_service_removed 钩子里释放；
+            // 子 actor 的弱引用（actor_addr）无需通知，引用计数自动归零。
+            // 不阻塞 unload 流程（fire-and-forget，无 request/ack）。
+            const auto& gone = it->second.manifest.provides;
+            if (!gone.empty()) {
+                for (const auto& [other_name, other] : plugins_) {
+                    if (other_name == name) continue;   // 自己即将退出
+                    self->send(other.actor, service_gone_atom{}, gone);
+                }
+            }
+
             self->send_exit(it->second.actor, caf::exit_reason::user_shutdown);
             retired_.push_back(std::move(it->second));
             plugins_.erase(it);

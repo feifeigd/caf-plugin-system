@@ -103,6 +103,10 @@ struct framework_config : caf::actor_system_config {
     /// 时间服务验证后门（--test-time-offset）：启动后校验
     /// business_now() - 真实 now == 配置偏移，打印 [TimeTest] 结果。
     bool test_time_offset = false;
+    /// 运行期卸载验证后门（--test-unload=<插件名>）：启动后 request
+    /// PluginManager unload_atom，走完整退役链（quiesce → save_state
+    /// 屏障 → unregister → 统一解绑广播 → 旧 actor 退役），验证广播。
+    std::string test_unload;
 
     framework_config();
 };
