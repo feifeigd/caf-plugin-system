@@ -141,6 +141,15 @@ void backdoor_py_script(caf::actor_system& sys, const app_config& cfg,
     run_py_script_test(sys, fw);
 }
 
+/// 脚本插件验证后门（--test-ts-script）：resolve echo_service 并调
+/// envelope + string + 热更，校验 ts_host 桥接层。
+void backdoor_ts_script(caf::actor_system& sys, const app_config& cfg,
+                        const BootstrapResult& fw) {
+    if (!cfg.test_ts_script)
+        return;
+    run_ts_script_test(sys, fw);
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -156,6 +165,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_ctrl_c(sys, cfg, fw.shutdown_mgr);
     backdoor_lua_script(sys, cfg, fw);
     backdoor_py_script(sys, cfg, fw);
+    backdoor_ts_script(sys, cfg, fw);
 }
 
 } // namespace caf_plugin_system

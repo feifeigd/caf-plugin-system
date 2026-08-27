@@ -269,6 +269,79 @@ void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
 }
 
 // ------------------------------------------------------------------
+// 脚本插件验证（--test-ts-script）：镜像 run_py_script_test，验证
+// ts_host 桥接层（on_call/on_string）+ 热更状态交接。
+// ------------------------------------------------------------------
+
+void run_ts_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
+    caf::scoped_actor self{sys};
+
+    caf::actor echo_proxy;
+    for (int i = 0; i < 20 && !echo_proxy; ++i) {
+        self->request(fw.registry, caf::infinite, resolve_atom{}, "echo_service")
+            .receive([&](const caf::actor& a) { echo_proxy = a; },
+                     [](caf::error&) {});
+        if (!echo_proxy)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (!echo_proxy) {
+        std::cout << "[TsTest] echo_service not registered "
+                     "(TsHostPlugin not loaded?)" << std::endl;
+        return;
+    }
+
+    plugin_envelope env;
+    env.sub_proto = 1;
+    const char* text = "ping";
+    env.payload.assign(reinterpret_cast<const std::byte*>(text),
+                      reinterpret_cast<const std::byte*>(text)
+                          + std::strlen(text));
+    self->request(echo_proxy, std::chrono::seconds(5), env)
+        .receive([](const std::string& r) {
+                     std::cout << "[TsTest] envelope call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[TsTest] envelope call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    self->request(echo_proxy, std::chrono::seconds(5), std::string("hello"))
+        .receive([](const std::string& r) {
+                     std::cout << "[TsTest] string call -> " << r << std::endl;
+                 },
+                 [](const caf::error& e) {
+                     std::cout << "[TsTest] string call error: "
+                               << caf::to_string(e) << std::endl;
+                 });
+
+    caf::actor host_proxy;
+    self->request(fw.registry, caf::infinite, resolve_atom{}, "ts_host_service")
+        .receive([&](const caf::actor& a) { host_proxy = a; },
+                 [](caf::error&) {});
+    if (host_proxy) {
+        plugin_envelope reload_env;
+        reload_env.sub_proto = 1;
+        const char* svc = "echo_service";
+        reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
+                                 reinterpret_cast<const std::byte*>(svc)
+                                     + std::strlen(svc));
+        std::cout << "[TsTest] triggering reload of echo_service" << std::endl;
+        self->send(host_proxy, reload_env);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+        self->request(echo_proxy, std::chrono::seconds(5), env)
+            .receive([](const std::string& r) {
+                         std::cout << "[TsTest] post-reload envelope call -> "
+                                   << r << std::endl;
+                     },
+                     [](const caf::error& e) {
+                         std::cout << "[TsTest] post-reload call error: "
+                                   << caf::to_string(e) << std::endl;
+                     });
+    }
+}
+
+// ------------------------------------------------------------------
 // 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 // RemoteCaller actor 缓存句柄 + 失败自动重试（模式 B）；循环调用
 // 观察杀/重启目标节点时 "失败 → 自动恢复"（缓存失效 → 重新 resolve）。
