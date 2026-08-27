@@ -25,6 +25,9 @@ void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw);
 /// 脚本插件验证（--test-py-script）：同 lua 版，验证 py_host 桥接层 + 热更状态交接。
 void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw);
 
+/// 脚本插件验证（--test-ts-script）：同 lua 版，验证 ts_host 桥接层 + 热更状态交接。
+void run_ts_script_test(caf::actor_system& sys, const BootstrapResult& fw);
+
 /// 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 /// RemoteCaller 缓存句柄 + 失败自动重试；循环调用观察杀/重启目标节点时
 /// "失败 → 自动恢复"（缓存失效 → 重新 resolve）。
