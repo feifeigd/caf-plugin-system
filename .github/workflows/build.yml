@@ -26,7 +26,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake ninja-build g++ build-essential
+        sudo apt-get install -y cmake ninja-build g++ build-essential autoconf autoconf-archive automake libtool
 
     - name: Setup vcpkg
       run: |
