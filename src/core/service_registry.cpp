@@ -254,6 +254,9 @@ caf::behavior ServiceRegistry::make_behavior() {
         // 顺便停掉所有服务 proxy，不让它们悬挂到进程退出。
         [=, this](shutdown_atom) {
             for (auto& [name, entry] : services_) {
+                // 清 CAF 镜像（register 时 put 的条目）——漏清会让 proxy 的
+                // strong_actor_ptr 残留到进程退出，actor 对象树整体报泄漏
+                self->system().registry().erase(name);
                 self->send_exit(entry.proxy, caf::exit_reason::user_shutdown);
             }
             services_.clear();

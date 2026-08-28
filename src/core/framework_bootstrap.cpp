@@ -63,6 +63,10 @@ bool g_shutdown_done = false;
 
 } // namespace
 
+void clear_shutdown_manager_ref() {
+    shutdown_manager_ref() = caf::actor{};
+}
+
 bool console_closing() {
     return g_console_closing.load();
 }
