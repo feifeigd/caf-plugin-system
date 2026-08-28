@@ -140,6 +140,10 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
 /// register_cluster_atom 注册），main 只等 shutdown_mgr 退出即可。
 void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw);
 
+/// TODO(leakfix-probe): 清空 shutdown_manager_ref() 静态持有——shutdown_mgr
+/// actor 引用被进程级单例持有，DLL 常驻不析构 → 对象树级联泄漏。
+void clear_shutdown_manager_ref();
+
 /// stdin 管道 EOF 哨兵（WSL interop）：Ctrl+C 只杀 bash，exe 变孤儿；
 /// 父进程/终端消失 → 管道写端关闭 → EOF → 发 shutdown_atom 给 shutdown_mgr
 /// 触发统一关机（优雅关机链由 shutdown_mgr 全权负责）。

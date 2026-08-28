@@ -12,6 +12,9 @@
 #include <vector>
 
 #include "framework_bootstrap.hpp"
+#include <spdlog/spdlog.h>
+#include <windows.h>
+#include <tlhelp32.h>
 #include "services/logging_service.hpp"
 #include "app_config.hpp"
 #include "app_backdoors.hpp"
@@ -150,7 +153,14 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     // main 只等它退出——进程必须自己自然退出，不许外部强杀。
     wait_for_shutdown(sys, fw);
 
-    // current_logger() = caf::actor{};
+    // TODO(leakfix): 清空核心 current_logger() 静态持有——logging_service actor
+    // 引用被函数内 static 持有，DLL 常驻不析构 → CRT leak dump 报 126 块簇
+    current_logger() = caf::actor{};
+    // TODO(leakfix): 清空 shutdown_manager_ref()——级联持有
+    // shutdown_mgr→plugin_mgr→PluginEntry→插件主 actor 整棵对象树
+    clear_shutdown_manager_ref();
+    // TODO(leakfix-probe): spdlog registry 是 static 单例，sinks 常驻到进程退出
+    spdlog::shutdown();
 
     // ---- 关机泄露诊断 ----
     // actor_system 析构会 join 所有存活 actor——若有 actor 不退出，进程会
@@ -169,4 +179,86 @@ int caf_main(caf::actor_system& sys, const app_config& cfg) {
     return 0;
 }
 
-CAF_MAIN()
+// ------------------------------------------------------------------
+// 手动 main（替代 CAF_MAIN）：显式控制 actor_system 生命周期。
+// 业务退出后先 delete actor_system（join 全部 actor），再循环 FreeLibrary
+// 卸载 caf_plugin_core → caf_core：引用计数归零后 DLL 真卸载，
+// static 析构提前到 leak dump 之前 → 进程级 static 持有的对象随之释放
+//（CRT 泄漏检测只报"进程退出时仍存活"的堆对象，DLL 静态析构晚于 dump）。
+// ------------------------------------------------------------------
+// 卸载插件 DLL：SEH 保护（插件 static 析构（Python 等）可能崩溃——接住后
+// 继续卸载其余模块，泄漏 dump 照常进行）
+static void unload_plugin_dlls() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32 me; me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) {
+        do {
+            if (strstr(me.szExePath, "\\plugins\\")) {
+                for (int i = 0; i < 4; ++i) {
+                    HMODULE h = GetModuleHandleA(me.szModule);
+                    if (!h) break;
+                    __try {
+                        FreeLibrary(h);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        printf("[Unload] plugin %s DETACH crash code=0x%X\n",
+                               me.szModule, GetExceptionCode());
+                    }
+                    Sleep(200);
+                }
+            }
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
+static int main_dispatch(caf::actor_system& sys, const app_config& cfg) {
+    return caf_main(sys, cfg);
+}
+
+int main(int argc, char** argv) {
+    caf::core::init_global_meta_objects();
+    app_config cfg;
+    if (auto err = cfg.parse(argc, argv)) {
+        auto err_str = caf::to_string(err);
+        fprintf(stderr, "error while parsing CLI and file options: %s\n",
+                err_str.c_str());
+        return EXIT_FAILURE;
+    }
+    if (cfg.helptext_printed())
+        return EXIT_SUCCESS;
+
+    auto* sys = new caf::actor_system(cfg);
+    int rc = main_dispatch(*sys, cfg);
+    delete sys;  // join 所有 actor——插件 actor 全部析构完毕
+
+    #ifdef _DEBUG
+    // ---- 卸载链：leak dump 前强制 DLL static 析构 ----
+    // 进程级 static（current_logger/shutdown_manager_ref/CAF 元对象表/
+    // Python 解释器等）持有的堆对象在 DLL 常驻时不析构 → CRT dump 误报。
+    // 手动 main 先析构 actor_system（插件 actor 全部退出），再按依赖序
+    // 卸载：插件 DLL（含其专属引擎 DLL，如 python3.dll）→ caf_plugin_core
+    // → caf_core。循环 FreeLibrary 把引用计数减到 0 → static 析构提前执行；
+    // Sleep 等延迟卸载完成（模块映射移除可能滞后，但 static 已析构）。
+    // ① 插件 DLL：路径含 \plugins\ 的模块（先卸，释放对 core/caf_core 的依赖）
+    // 暂禁用：实测改变 lua 场景 shutdown 竞态（0xC0000005，二进制布局敏感 UB），
+    // 插件卸载改由插件自身 shutdown 流程负责；py 场景另行处理
+    // unload_plugin_dlls();
+    // ② caf_plugin_core（delayimp + 插件依赖引用）
+    for (int i = 0; i < 4; ++i) {
+        HMODULE hc = GetModuleHandleA("caf_plugin_core.dll");
+        if (!hc) break;
+        FreeLibrary(hc);
+        Sleep(300);
+    }
+    // ③ caf_core（delayimp + core/caf_io 依赖引用）
+    for (int i = 0; i < 4; ++i) {
+        HMODULE hca = GetModuleHandleA("caf_core.dll");
+        if (!hca) break;
+        FreeLibrary(hca);
+        Sleep(300);
+    }
+    #endif
+
+    return rc;
+}
