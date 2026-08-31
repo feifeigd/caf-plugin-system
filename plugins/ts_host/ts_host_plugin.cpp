@@ -122,15 +122,13 @@ std::pair<bool, std::string> call_service(caf::actor_system& sys,
     if (!proxy)
         return {false, "service not found: " + service};
 
-    plugin_envelope env;
-    env.sub_proto = sub_proto;
-    const char* p = payload.data();
-    env.payload.assign(reinterpret_cast<const std::byte*>(p),
-                      reinterpret_cast<const std::byte*>(p) + payload.size());
+    auto env = plugin_wire::encode_text(sub_proto, payload);
+    if (!env)
+        return {false, "unsupported payload format"};
 
     bool ok = false;
     std::string reply;
-    self->request(proxy, std::chrono::seconds(5), env).receive(
+    self->request(proxy, std::chrono::seconds(5), *env).receive(
         [&](std::string s) {
             ok = true;
             reply = std::move(s);
@@ -374,11 +372,14 @@ void run_job(ScriptState& st, ScriptJob& job) {
             break;
         }
         case ScriptOp::Call: {
-            std::string payload(
-                reinterpret_cast<const char*>(job.env.payload.data()),
-                job.env.payload.size());
+            auto payload = plugin_wire::decode_text(job.env);
+            if (!payload) {
+                if (job.done_str)
+                    job.done_str("unsupported payload format");
+                break;
+            }
             JSValue av[2] = { JS_NewInt32(ctx, static_cast<int>(job.env.sub_proto)),
-                              JS_NewString(ctx, payload.c_str()) };
+                              JS_NewString(ctx, payload->c_str()) };
             std::string out = call_str("on_call", 2, av);
             JS_FreeValue(ctx, av[0]);
             JS_FreeValue(ctx, av[1]);
@@ -733,10 +734,10 @@ public:
                 [=](plugin_envelope env) {
                     if (env.sub_proto != ts_reload_sub_proto)
                         return;
-                    std::string service_name(
-                        reinterpret_cast<const char*>(env.payload.data()),
-                        env.payload.size());
-                    reload_script(self, service_name);
+                    if (auto service_name = plugin_wire::decode_text(env))
+                        reload_script(self, *service_name);
+                    else
+                        LOG_WARN_SELF(self, "ignoring reload with unsupported payload format");
                 },
             };
 

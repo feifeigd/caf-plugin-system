@@ -78,15 +78,21 @@ public:
                 [=](const plugin_envelope& env) {
                     switch (env.sub_proto) {
                         case biz_env_hello: {
-                            std::string text(
-                                reinterpret_cast<const char*>(env.payload.data()),
-                                env.payload.size());
-                            LOG_INFO_SELF(self, "Envelope round-trip OK: {}", text);
+                            auto text = plugin_wire::decode_text(env);
+                            if (!text) {
+                                LOG_WARN_SELF(self, "Unsupported envelope format: {}",
+                                              static_cast<int>(env.format));
+                                if (self->current_message_id().is_request())
+                                    self->make_response_promise<std::string>()
+                                        .deliver("unsupported payload format");
+                                break;
+                            }
+                            LOG_INFO_SELF(self, "Envelope round-trip OK: {}", *text);
                             // 响应式：request 调用方（如跨节点 RemoteCaller）
                             // 拿回执；纯 send 调用无副作用（void handler）
                             if (self->current_message_id().is_request()) {
                                 auto rp = self->make_response_promise<std::string>();
-                                rp.deliver("cross-ok:" + text);
+                                rp.deliver("cross-ok:" + *text);
                             }
                             break;
                         }
@@ -131,13 +137,9 @@ public:
                     self->send(self, biz_ping_atom{});
                     // 方式二·公共信封：不占号段、不用自注册，但载荷要自己编码
                     {
-                        const char* text = "hello-envelope";
-                        plugin_envelope env;
-                        env.sub_proto = biz_env_hello;
-                        env.payload.assign(
-                            reinterpret_cast<const std::byte*>(text),
-                            reinterpret_cast<const std::byte*>(text) + std::strlen(text));
-                        self->send(self, env);
+                        if (auto env = plugin_wire::encode_text(
+                                biz_env_hello, "hello-envelope"))
+                            self->send(self, std::move(*env));
                     }
                 },
                 // drain：无排空动作，回执由框架统一（不注册 on_drain）

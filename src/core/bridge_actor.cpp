@@ -246,6 +246,9 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
                                 }
                                 plugin_envelope env;
                                 env.sub_proto = k_bridge_sub_proto;
+                                // 外部桥接的 payload 是长度前缀的任意字节，不可
+                                // 假定其为 UTF-8 JSON。
+                                env.format = payload_format::raw;
                                 env.payload = string_to_bytes(payload);
                                 self->request(proxy, std::chrono::seconds(5),
                                               std::move(env))

@@ -87,9 +87,12 @@ public:
                     // bridge CALL 转发：plugin_envelope 信封，payload = 命令文本
                     [=](const plugin_envelope& env) {
                         auto rp = self->make_response_promise<std::string>();
-                        auto cmd = trim(std::string(
-                            reinterpret_cast<const char*>(env.payload.data()),
-                            env.payload.size()));
+                        auto text = plugin_wire::decode_text(env);
+                        if (!text) {
+                            rp.deliver("ERROR: unsupported payload format");
+                            return;
+                        }
+                        auto cmd = trim(*text);
                         // 句柄每次实时取：node_client 异步连 master，
                         // spawn 时 cluster.master 可能还没 put（插件加载
                         // 早于节点注册成功）。

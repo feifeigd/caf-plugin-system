@@ -147,12 +147,17 @@ actor 直连路径。
 struct plugin_envelope {
     std::uint16_t sub_proto;            // 子协议号：插件自管，跨插件可重复；
                                         // 高位 0x8000 置 1 表示用户级（§6）
-    std::vector<std::byte> payload;     // 自己序列化
+    payload_format format;              // raw / utf8_json（默认）/ 预留二进制格式
+    std::uint16_t version;              // 该子协议的业务契约版本
+    std::vector<std::byte> payload;
 };
 ```
 
-发送方编码 payload → 发信封；接收方在统一 handler 里 `switch (env.sub_proto)`
-分发并解码。零注册、零协调；代价是失去类型匹配和编译期接口检查。
+发送方通过 `plugin_wire::encode_text` 编码 payload → 发信封；接收方在统一
+handler 里 `switch (env.sub_proto)` 分发并用 `plugin_wire::decode_text` 解码。
+脚本 host 也走同一公共入口，避免重复的字节/字符串转换。当前公共层支持
+`raw` 与 `utf8_json`；收到未实现格式必须明确拒绝，不能按字符串猜测。
+零注册、零协调；代价是失去类型匹配和编译期接口检查。
 用户级信封消息同样适用 §6 的校验责任。
 
 ## 8. 热更新（reload_atom，旁路加载）
@@ -403,4 +408,3 @@ PM 台账只认识插件主 actor。插件内部 spawn 的 worker/脚本/桥接�
 日志观察点：`[Proxy] impl down, retiring proxy`（① 生效）与插件钩子
 收到的 `service_gone`（② 生效）；shutdown 后无 `[LeakCheck] actors
 remaining` 即无残留。
-

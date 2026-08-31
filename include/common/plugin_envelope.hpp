@@ -29,10 +29,35 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
+
+/// payload 的编解码方式。新增格式只追加枚举值；未实现的格式必须拒绝，不能
+/// 猜测为字符串处理。
+enum class payload_format : std::uint8_t {
+    raw = 0,       ///< 不解释的原始字节。
+    utf8_json = 1, ///< UTF-8 JSON；脚本插件的默认格式。
+    msgpack = 2,   ///< 预留：MessagePack。
+    protobuf = 3,  ///< 预留：Protocol Buffers。
+};
+
+/// CAF 不会自动序列化 enum class；在线上传输其稳定的单字节表示。未知值
+/// 保留到接收端，由具体 codec 返回“不支持”，从而允许以后只追加新格式。
+template <class Inspector>
+bool inspect(Inspector& f, payload_format& x) {
+    auto value = static_cast<std::uint8_t>(x);
+    if (!f.apply(value))
+        return false;
+    x = static_cast<payload_format>(value);
+    return true;
+}
 
 struct plugin_envelope {
     std::uint16_t sub_proto = 0;        // 插件内部子协议号（各插件自行管理，可跨插件重复）
+    payload_format format = payload_format::utf8_json;
+    std::uint16_t version = 1;          // sub_proto 对应业务契约的版本
     std::vector<std::byte> payload;     // 载荷（CAF 内置类型，无需额外注册）
 };
 
@@ -40,5 +65,44 @@ struct plugin_envelope {
 template <class Inspector>
 bool inspect(Inspector& f, plugin_envelope& x) {
     return f.object(x).fields(f.field("sub_proto", x.sub_proto),
+                              f.field("format", x.format),
+                              f.field("version", x.version),
                               f.field("payload", x.payload));
 }
+
+// ------------------------------------------------------------------
+// 公共载荷编解码入口
+//
+// 所有 C++ 插件和脚本 host 都应经由这些函数处理文本载荷，禁止自行
+// reinterpret_cast/assign。当前实现 raw 与 utf8_json；JSON 的语法/业务
+// schema 校验属于各 sub_proto 的契约层，不在传输层重复实现。
+// ------------------------------------------------------------------
+namespace plugin_wire {
+
+inline bool is_text_format(payload_format format) noexcept {
+    return format == payload_format::raw || format == payload_format::utf8_json;
+}
+
+inline std::optional<plugin_envelope>
+encode_text(std::uint16_t sub_proto, std::string_view text,
+            payload_format format = payload_format::utf8_json,
+            std::uint16_t version = 1) {
+    if (!is_text_format(format))
+        return std::nullopt;
+    plugin_envelope env;
+    env.sub_proto = sub_proto;
+    env.format = format;
+    env.version = version;
+    env.payload.assign(reinterpret_cast<const std::byte*>(text.data()),
+                       reinterpret_cast<const std::byte*>(text.data()) + text.size());
+    return env;
+}
+
+inline std::optional<std::string> decode_text(const plugin_envelope& env) {
+    if (!is_text_format(env.format))
+        return std::nullopt;
+    return std::string(reinterpret_cast<const char*>(env.payload.data()),
+                       env.payload.size());
+}
+
+} // namespace plugin_wire

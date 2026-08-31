@@ -549,10 +549,11 @@ public:
                 [=](plugin_envelope env) -> caf::result<std::string> {
                     switch (env.sub_proto) {
                     case 1: {
-                        std::string in(
-                            reinterpret_cast<const char*>(env.payload.data()),
-                            env.payload.size());
-                        return std::string("pg:hello:") + in;
+                        auto in = plugin_wire::decode_text(env);
+                        if (!in)
+                            return caf::make_error(caf::sec::invalid_argument,
+                                                   "pg_service: unsupported payload format");
+                        return std::string("pg:hello:") + *in;
                     }
                     default:
                         return caf::make_error(
