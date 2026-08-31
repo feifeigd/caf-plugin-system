@@ -1,6 +1,7 @@
 #pragma once
 #include "plugin/plugin_interface.hpp"
 #include "graceful_shutdown.hpp" // drain_atom
+#include "common/plugin_envelope.hpp" // external_protocol_table
 #include <functional>
 #include <map>
 #include <string>
@@ -16,6 +17,7 @@ struct VersionedEntry {
     caf::actor impl;
     int version = 1;    // 每次热更新时递增，供调用方检查是否过期
     std::string plugin_name;    // dll 注册的名字
+    external_protocol_table protocols;  // 外部协议号→内部 function 契约表（bridge 翻译用）
 };
 
 caf::actor spawn_service_proxy(caf::actor_system& sys, caf::actor initial_target,

@@ -139,3 +139,4 @@ X_TAG(mongo_op_atom, 274)     // Mongo 操作：(collection, op, json) → db_re
 X_TAG(service_gone_atom, 275) // 服务注销广播（PM 统一解绑）：插件 unload 时 PM 通知其他
                               // 插件"这些服务已注销"——持有者在此释放缓存代理引用（防
                               // 跨插件强引用环导致注销后 proxy/impl 互相保命泄漏）
+X_TAG(protocols_atom, 276)    // 查服务外部协议表：(svc) → external_protocol_table

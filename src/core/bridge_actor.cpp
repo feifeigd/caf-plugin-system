@@ -25,7 +25,6 @@ namespace {
 // ------------------------------------------------------------------
 // 行协议常量
 // ------------------------------------------------------------------
-constexpr std::uint16_t k_bridge_sub_proto = 1; // external_echo 信封子协议号
 
 struct BridgeImplState {
     int seq = 0;                            // REQ 序号（rid）
@@ -63,7 +62,9 @@ std::vector<std::byte> string_to_bytes(const std::string& s) {
 // 行协议帧解析（broker 事件驱动版）
 //
 // 帧格式：<KIND> <id> [<status>] <len>\n <payload> \n
-//   KIND = CALL（id, svc, payload）/ RESULT（rid, OK|ERR, payload）
+//   KIND = CALL（id, svc, proto, payload）/ RESULT（rid, OK|ERR, payload）
+//   CALL 的 proto 是外部协议号（服务注册时声明的契约，见
+//   external_protocol_table）——外部客户端不暴露内部函数名。
 // 驱动方式：new_data_msg 的 buf 追加到连接缓冲，循环 try_parse_frame
 // 消费完整帧；缓冲不足返回 false（等更多数据）。
 // ------------------------------------------------------------------
@@ -73,6 +74,7 @@ struct ParsedFrame {
     Kind kind = Kind::Invalid;
     int id = 0;
     std::string svc;  // CALL 的服务名
+    std::uint16_t proto = 0; // CALL 的外部协议号（→ 服务契约 function）
     bool ok = false;  // RESULT 的 OK/ERR
     std::string payload;
 };
@@ -140,7 +142,24 @@ bool try_parse_frame(std::string& buf, ParsedFrame& out) {
     out.payload = std::move(payload);
     if (kind == "CALL") {
         out.kind = ParsedFrame::Kind::Call;
-        out.svc = third;
+        // CALL <id> <svc> <proto> <len>：third = "svc proto"
+        auto sp = third.find(' ');
+        if (sp == std::string::npos) {
+            out.kind = ParsedFrame::Kind::Invalid;
+            return true;
+        }
+        out.svc = third.substr(0, sp);
+        try {
+            auto v = std::stoul(third.substr(sp + 1));
+            if (v > 0xFFFF) {
+                out.kind = ParsedFrame::Kind::Invalid;
+                return true;
+            }
+            out.proto = static_cast<std::uint16_t>(v);
+        } catch (...) {
+            out.kind = ParsedFrame::Kind::Invalid;
+            return true;
+        }
     } else if (kind == "RESULT") {
         out.kind = ParsedFrame::Kind::Result;
         out.ok = (third == "OK");
@@ -336,7 +355,8 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
                                      + std::to_string(frame.payload.size()));
                             if (strong)
                                 caf::anon_send(strong, ext_call_atom_v, frame.id,
-                                               frame.svc, frame.payload);
+                                               frame.svc, frame.proto,
+                                               frame.payload);
                         } else if (frame.kind == ParsedFrame::Kind::Result) {
                             auto strong = caf::actor_cast<caf::actor>(impl_addr);
                             if (strong)

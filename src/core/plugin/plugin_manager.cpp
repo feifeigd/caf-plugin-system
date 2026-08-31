@@ -134,7 +134,8 @@ caf::behavior PluginManager::make_behavior() {
             self->send(actor, init_atom{}, self, "");
 
             for (const auto& svc : manifest.provides) {
-                self->send(registry_, register_atom{}, svc, actor, name);
+                self->send(registry_, register_atom{}, svc, actor, name,
+                           external_protocol_table{});
             }
 
             // 服务代理 ACL：插件在 manifest 声明 acl_allow 时，
@@ -334,7 +335,8 @@ caf::behavior PluginManager::make_behavior() {
                                         it->second.manifest.provides.end(), svc)
                               == it->second.manifest.provides.end();
                 if (is_new) {
-                    self->send(registry_, register_atom{}, svc, new_actor, name);
+                    self->send(registry_, register_atom{}, svc, new_actor,
+                               name, external_protocol_table{});
                     if (!new_svc_allowed.empty()) {
                         self->send(registry_, set_service_acl_atom{}, svc,
                                    new_svc_allowed);

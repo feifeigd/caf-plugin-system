@@ -174,7 +174,8 @@ caf::behavior ServiceRegistry::make_behavior() {
         // 对方没有对应 handler 时会被 print_and_drop 转成 error 并 quit，
         // 因此这些 handler 必须返回 void，失败只在本地记日志。
         [=, this](register_atom, const std::string& name, caf::actor impl,
-            const std::string& plugin) {
+            const std::string& plugin,
+            const external_protocol_table& protocols) {
             if (services_.count(name)) {
                 LOG_ERROR("[Registry] Service already registered: " + name
                               + ". Use hot_reload to switch implementation.");
@@ -182,7 +183,7 @@ caf::behavior ServiceRegistry::make_behavior() {
             }
             auto proxy = spawn_service_proxy(self->system(), impl,
                                              allow_cross_node_);
-            VersionedEntry entry{name, proxy, impl, 1, plugin};
+            VersionedEntry entry{name, proxy, impl, 1, plugin, protocols};
             services_[name] = std::move(entry);
             // 导出到 CAF actor_system registry：集群其他节点可经
             // middleman remote_lookup(name, node) 直接调用本服务代理。
@@ -228,6 +229,14 @@ caf::behavior ServiceRegistry::make_behavior() {
         [=, this](resolve_atom, const std::string& name) -> caf::actor {
             auto it = services_.find(name);
             return (it != services_.end()) ? it->second.proxy : caf::actor{};
+        },
+
+        // 返回服务的外部协议表（协议号→function，bridge 翻译用）
+        [=, this](protocols_atom,
+                  const std::string& name) -> external_protocol_table {
+            auto it = services_.find(name);
+            return (it != services_.end()) ? it->second.protocols
+                                           : external_protocol_table{};
         },
 
         [=, this](list_services_atom) -> std::vector<std::string> {

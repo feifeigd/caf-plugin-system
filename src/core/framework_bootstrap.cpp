@@ -450,7 +450,8 @@ bool bootstrap_system_components(caf::actor_system& sys,
     // ServiceRegistry 会为它建 proxy + 镜像到 CAF sys.registry()，
     // 插件 deps[0]（proxy）与核心 current_logger()（原始 actor）殊途同归。
     self->send(out.registry, register_atom{}, "logging_service",
-               out.logging_service, "@core");   // 虚拟的插件 @core ，它并不是一个真实的 DLL 插件
+               out.logging_service, "@core",
+               external_protocol_table{});   // 核心服务无外部协议表
 
     // 组件就绪（任何进程都 ready：纯节点无 bootstrap_plugins 不会发 ready，
     // 否则 quit 时 GracefulShutdown 走 "Not ready, forcing exit" 强杀路径）
