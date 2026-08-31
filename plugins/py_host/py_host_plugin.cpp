@@ -699,9 +699,14 @@ public:
                 // PYTHONMALLOC=malloc：禁用 pymalloc arena（CPython 的
                 // arena 在 Py_Finalize 后不归还 CRT 堆，Debug CRT 泄漏检测
                 // 会把它报成固定 262168/131096 字节的"泄漏"）。走系统
-                // malloc 后基线降到 6 块（248/120/38/90/82/82 B）=
-                // CPython 3.12+ immortal 对象（Py_FinalizeEx 后解释器
-                // 驻留缓存，8-31 起各轮实测一致，非真泄漏）。
+                // malloc 后基线固定泄漏 6 块（248/120/38/90/82/82 B，
+                // 8-31 起各轮实测一致）。分配栈 hook 实锤：6 块全部由
+                // python312_d.dll 内部（PyMem→type-alloc 路径）分配，
+                // py_host 仅触发者——最小实验（纯 init / 线程结构复刻 /
+                // 桥接注入+完整脚本链）均 0 块，仅在 py_host 的 CAF 环境
+                // （多线程 actor 系统 + 完整关机链）下出现；Py_FinalizeEx
+                // 后解释器驻留，进程退出由 OS 统一回收，非真泄漏
+                // （EXIT 恒 0、与 DLL 卸载无关）。
                 _putenv("PYTHONMALLOC=malloc");
                 Py_Initialize();
                 py_main_thread_state() = PyEval_SaveThread();
