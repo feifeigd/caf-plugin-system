@@ -27,6 +27,14 @@
 //   - 每脚本一个模块 dict（共享解释器内隔离 globals）；桥接上下文用 TLS。
 //   - 单 worker 独占脚本模块：event actor 不阻塞，bridge.call 在 worker 线程
 //     阻塞 request（先释放 GIL），Lua 版同构。
+//
+// 运行时依赖部署（2026-08-31 定稿）：
+//   python 依赖全部随插件走（不进 lib/ 分类目录）：run/plugins/py_host/ 下
+//   放 python312_d.dll + python3_d.dll + Lib/（标准库，标准 <home>/Lib 布局）。
+//   启动必须设 PYTHONHOME=<插件目录>——CPython 3.12 Windows getpath 的
+//   prefix 取 exe 目录 / PYTHONHOME，stdlib 只认 <prefix>/Lib；DLL 目录
+//   混放 .py 不生效（init_fs_encoding 崩）。python312_d.dll 的 DLL 解析走
+//   framework_bootstrap 的 AddDllDirectory(plugins/*/)（USER_DIRS）。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
