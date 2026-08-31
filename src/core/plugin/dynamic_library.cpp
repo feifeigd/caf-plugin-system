@@ -51,6 +51,12 @@ DynamicLibrary& DynamicLibrary::operator=(DynamicLibrary&& other) noexcept {
 #else
 
 std::optional<DynamicLibrary> DynamicLibrary::open(const std::filesystem::path& path) {
+    // 朴素 LoadLibraryW 定稿（历史：LoadLibraryExW(DLL_LOAD_DIR) 方案
+    // 2026-08-30 曾试，当时误判与关机崩溃相关，已证伪作废）。
+    // 依赖解析机制（2026-08-31 定稿）：framework_bootstrap 在
+    // SetDefaultDllDirectories(DEFAULT_DIRS) 下注册 exe → plugins/*/ →
+    // lib/（方案 Y），插件自带第三方依赖（如 lua_host/lua.dll）从
+    // 插件子目录解析，lib/ 只放插件目录里没有的公共第三方依赖。
     HMODULE h = ::LoadLibraryW(path.wstring().c_str());
     if (!h) return std::nullopt;
     return DynamicLibrary(h);

@@ -58,6 +58,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <utility>
 #include <vector>
 
@@ -626,6 +628,48 @@ std::atomic<bool>& python_ready() {
     return ready;
 }
 
+/// PyEval_SaveThread 返回的主线程状态——finalize 时必须恢复（同线程）才能
+/// Py_FinalizeEx；跨线程 finalize 必崩（0xC0000005，CPython 硬约束）。
+PyThreadState*& py_main_thread_state() {
+    static PyThreadState* ts = nullptr;
+    return ts;
+}
+
+/// 专用解释器线程：Py_Initialize/Py_FinalizeEx 都在本线程执行。
+/// CAF 线程池不保证 spawn 与 destroy_plugin 同线程（actor 在 worker 间
+/// 迁移）——pystate.c:1770 断言证明跨线程 RestoreThread 必崩。专用线程
+/// 保证 init/finalize 同线程，脚本 worker 照旧用 PyGILState_Ensure。
+struct PyHostThread {
+    std::thread th;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool init_done = false;
+    bool stop = false;
+};
+PyHostThread& py_host_thread() {
+    static PyHostThread t;
+    return t;
+}
+
+/// 触发解释器 finalize（专用线程执行）。幂等：python_ready 原子交换保证
+/// 只跑一次。shutdown hook（脚本实例已 clear、worker 全退）与
+/// destroy_plugin（热卸载兜底）都调用；关机路径 exit_msg 兜底可能先于
+/// shutdown hook 到达 destroy_plugin——但 python_ready 交换后另一路跳过。
+static void py_finalize_interpreter() {
+    if (!python_ready().exchange(false))
+        return;
+    auto& h = py_host_thread();
+    {
+        std::lock_guard<std::mutex> lk(h.mtx);
+        h.stop = true;
+    }
+    h.cv.notify_all();
+    if (h.th.joinable())
+        h.th.join();
+    std::cout << "[PythonHostPlugin] Py_FinalizeEx done (dedicated thread)"
+              << std::endl;
+}
+
 } // namespace
 
 // ------------------------------------------------------------------
@@ -645,10 +689,43 @@ public:
         caf::actor logger = caf_plugin_system::current_logger();
         caf_plugin_system::set_log_source(PLUGIN_NAME);
 
-        // Python 解释器只初始化一次，随后释放 GIL（worker 用 PyGILState）
+        // Python 解释器只初始化一次，随后释放 GIL（worker 用 PyGILState）。
+        // init/finalize 都在专用解释器线程：CAF 线程池不保证插件 actor 的
+        // handler 同线程（worker 间迁移），跨线程 Py_FinalizeEx 必崩
+        // （pystate.c:1770 断言 / 0xC0000005）。见 PyHostThread 注释。
         if (!python_ready().exchange(true)) {
-            Py_Initialize();
-            PyEval_SaveThread();   // 释放主 GIL；返回值（主线程状态）不再恢复
+            auto& h = py_host_thread();
+            h.th = std::thread([&h]() {
+                // PYTHONMALLOC=malloc：禁用 pymalloc arena（CPython 的
+                // arena 在 Py_Finalize 后不归还 CRT 堆，Debug CRT 泄漏检测
+                // 会把它报成固定 262168/131096 字节的"泄漏"）。走系统
+                // malloc 后基线固定泄漏 6 块（248/120/38/90/82/82 B，
+                // 8-31 起各轮实测一致）。分配栈 hook 实锤：6 块全部由
+                // python312_d.dll 内部（PyMem→type-alloc 路径）分配，
+                // py_host 仅触发者——最小实验（纯 init / 线程结构复刻 /
+                // 桥接注入+完整脚本链）均 0 块，仅在 py_host 的 CAF 环境
+                // （多线程 actor 系统 + 完整关机链）下出现；Py_FinalizeEx
+                // 后解释器驻留，进程退出由 OS 统一回收，非真泄漏
+                // （EXIT 恒 0、与 DLL 卸载无关）。
+                _putenv("PYTHONMALLOC=malloc");
+                Py_Initialize();
+                py_main_thread_state() = PyEval_SaveThread();
+                {
+                    std::lock_guard<std::mutex> lk(h.mtx);
+                    h.init_done = true;
+                }
+                h.cv.notify_all();
+                // 空闲等待 finalize 指令（无 GIL）
+                std::unique_lock<std::mutex> lk(h.mtx);
+                h.cv.wait(lk, [&h]() { return h.stop; });
+                // 同线程（本线程）恢复主线程状态 + finalize
+                if (auto* ts = py_main_thread_state())
+                    PyEval_RestoreThread(ts);
+                Py_FinalizeEx();
+            });
+            // 等解释器初始化完成（脚本 worker 的 PyGILState_Ensure 依赖）
+            std::unique_lock<std::mutex> lk(h.mtx);
+            h.cv.wait(lk, [&h]() { return h.init_done; });
         }
 
         auto cfg = load_plugin_config(sys.config());
@@ -814,9 +891,12 @@ public:
                     for (auto& c : children)
                         blocking->wait_for(c);
                     instances->clear();
-                    // v1 不调 Py_FinalizeEx：CPython 的 finalize 要求与
-                    // Py_Initialize 同线程 + 精细的 GIL 生命周期，跨 CAF 线程
-                    // 调用会挂起/崩溃。进程即将退出，Python 内存由 OS 回收。
+                    // 脚本实例已全部销毁（worker 线程 join 完毕）——现在
+                    // finalize 解释器。必须在专用线程执行（与 Py_Initialize
+                    // 同线程）；此处只发指令并 join，finalize 本身在专用
+                    // 线程完成。destroy_plugin 的 exit_msg 兜底可能先到，
+                    // python_ready() 交换保证只 finalize 一次。
+                    py_finalize_interpreter();
                     std::cout << "[PythonHostPlugin] shutdown hook: " << n
                               << " script(s) torn down" << std::endl;
                 },
@@ -830,5 +910,11 @@ extern "C" PLUGIN_API PluginEntry* create_plugin() {
 }
 
 extern "C" PLUGIN_API void destroy_plugin(PluginEntry* p) {
+    // finalize 只由 shutdown hook 触发（脚本实例 clear、worker 全退之后）。
+    // 本函数在关机路径可能先于 shutdown hook 执行（plugin_mgr 的 exit_msg
+    // 兜底与插件 actor 退出竞态）——此处触发 finalize 会让仍在运行的脚本
+    // worker 在 finalize 后调用 Python API → abort（pystate.c 断言 332/2214）。
+    // 热卸载路径（down_msg destroy）时 shutdown hook 已跑完（actor 退出
+    // 先于 down_msg），python_ready 已 false，无需兜底。
     delete p;
 }

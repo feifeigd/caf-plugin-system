@@ -108,6 +108,16 @@ struct framework_config : caf::actor_system_config {
     /// 屏障 → unregister → 统一解绑广播 → 旧 actor 退役），验证广播。
     std::string test_unload;
 
+    /// 任一验证后门标志被设置（--test-*）。caf_main 据此调用 exe 侧注册的
+    /// 测试后门（set_test_backdoor，2026-08-31 从独立 DLL 移回 exe 编译）。
+    bool has_test_flags() const {
+        return test_auto_shutdown || test_quit || test_ctrl_c
+            || test_time_offset || test_lua_script || test_py_script
+            || test_ts_script || !test_cross_call.empty()
+            || !test_cross_call_ex.empty() || !test_remote_reload.empty()
+            || !test_bridge_call.empty() || !test_unload.empty();
+    }
+
     framework_config();
 };
 
@@ -149,7 +159,7 @@ void clear_shutdown_manager_ref();
 /// 触发统一关机（优雅关机链由 shutdown_mgr 全权负责）。
 /// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发；
 /// 只有"读过数据后 EOF"才触发（空管道不误报，后台启动不误关机）。
-void install_stdin_watchdog(caf::actor shutdown_mgr);
+void install_stdin_watchdog(caf::actor_system& sys);
 
 /// 控制台是否正在销毁（用户点窗口 X 触发 CTRL_CLOSE_EVENT 后为 true）。
 /// 关机链的 stdout 输出必须检查此标志：写正在销毁的控制台句柄会阻塞，
