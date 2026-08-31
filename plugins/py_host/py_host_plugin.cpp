@@ -35,6 +35,13 @@
 //   prefix 取 exe 目录 / PYTHONHOME，stdlib 只认 <prefix>/Lib；DLL 目录
 //   混放 .py 不生效（init_fs_encoding 崩）。python312_d.dll 的 DLL 解析走
 //   framework_bootstrap 的 AddDllDirectory(plugins/*/)（USER_DIRS）。
+//
+//   业务脚本的第三方依赖（将来脚本 import requests/pydantic 等）：用 uv
+//   装进 Lib/site-packages/（PYTHONHOME 布局自动识别，site 模块自动入 path）：
+//     uv pip install --python <vcpkg tools\python3\python.exe> \
+//       --target run/plugins/py_host/Lib/site-packages <pkg>
+//   解释器本体必须 vcpkg debug 版（/MDd + python312_d.lib）；uv 只有 release
+//   版 CPython，CRT 不匹配且 Debug CRT 泄漏检测失效，不可用于解释器。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
