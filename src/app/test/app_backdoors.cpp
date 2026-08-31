@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace caf_plugin_system {
 
@@ -17,6 +18,24 @@ namespace {
 /// ops 从 registry 取（每次瞬时查找，发送即弃——不存引用防环）。
 caf::actor lookup_ops(caf::actor_system& sys) {
     return caf::actor_cast<caf::actor>(sys.registry().get("ops"));
+}
+
+/// 延迟投递 helper（LEAKFIX 2026-08-30）：
+/// 不用 CAF 的 delayed_send——其 action 挂在 scheduler 时间队列，关机时
+/// 残留 1 块 8B（default_action_impl 调度残留，反汇编定案）。改为
+/// detach 线程 sleep 后从 system registry 现取目标发送（镜像
+/// install_stdin_watchdog 修复模式：线程不捕获 actor 强引用，仅捕获
+/// actor_system& + 值参数；进程退出时线程被 OS 回收，无残留）。
+template <class... Ts>
+void delayed_registry_send(caf::actor_system& sys, std::string_view key,
+                           std::chrono::milliseconds delay, Ts... xs) {
+    std::thread([&sys, key = std::string(key), delay, xs...]() mutable {
+        std::this_thread::sleep_for(delay);
+        if (auto target = sys.registry().get(key)) {
+            caf::anon_send(caf::actor_cast<caf::actor>(target),
+                           std::move(xs)...);
+        }
+    }).detach();
 }
 
 /// 组装 reload 命令：完整命令前缀（reload / reload-node / reload-nodes /
@@ -40,8 +59,8 @@ void backdoor_auto_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     run_smoke_tests(sys, fw);
     std::cout << "[OpsTest] auto shutdown after smoke tests (delayed 2s)"
               << std::endl;
-    caf::scoped_actor self{sys};
-    self->delayed_send(fw.shutdown_mgr, std::chrono::seconds(2), shutdown_atom{});
+    delayed_registry_send(sys, "shutdown_mgr", std::chrono::seconds(2),
+                          shutdown_atom{});
 }
 
 /// 集群验证后门：跨节点调用（resolve → connect → lookup → call）。
@@ -76,7 +95,7 @@ void backdoor_bridge_call(caf::actor_system& sys, const app_config& cfg,
 /// 运维验证后门：远程热更（--test-remote-reload=<node>,<plugin>,<path>）。
 /// 复用控制台命令路径：把 reload-node 命令字符串发给本机 OpsActor，
 /// 走与交互控制台完全相同的解析/寻址/热更链路。
-/// delayed_send：给 worker 完成注册留时间（node_resolve 才能命中）。
+/// 延迟投递：给 worker 完成注册留时间（node_resolve 才能命中）。
 void backdoor_remote_reload(caf::actor_system& sys, const app_config& cfg) {
     if (cfg.test_remote_reload.empty())
         return;
@@ -88,9 +107,8 @@ void backdoor_remote_reload(caf::actor_system& sys, const app_config& cfg) {
     auto cmd = build_reload_command(cfg.test_remote_reload);
     std::cout << "[OpsTest] " << cmd
               << " (delayed 12s for worker registration)" << std::endl;
-    caf::scoped_actor self{sys};
-    self->delayed_send(ops, std::chrono::seconds(12),
-                       console_cmd_atom_v, cmd);
+    delayed_registry_send(sys, "ops", std::chrono::seconds(12),
+                          console_cmd_atom_v, cmd);
 }
 
 /// 运维验证后门：自动 quit（--test-quit，任何模式）。
@@ -105,9 +123,8 @@ void backdoor_quit(caf::actor_system& sys, const app_config& cfg) {
         return;
     }
     std::cout << "[OpsTest] triggering quit (delayed 2s)" << std::endl;
-    caf::scoped_actor self{sys};
-    self->delayed_send(ops, std::chrono::seconds(2),
-                       console_cmd_atom_v, std::string("quit"));
+    delayed_registry_send(sys, "ops", std::chrono::seconds(2),
+                          console_cmd_atom_v, std::string("quit"));
 }
 
 /// 运维验证后门：模拟 Ctrl+C（--test-ctrl-c，任何模式）。
@@ -119,8 +136,15 @@ void backdoor_ctrl_c(caf::actor_system& sys, const app_config& cfg,
         return;
     std::cout << "[OpsTest] simulating Ctrl+C (direct shutdown_atom, delayed 2s)"
               << std::endl;
-    caf::scoped_actor self{sys};
-    self->delayed_send(shutdown_mgr, std::chrono::seconds(2), shutdown_atom{});
+    // TEMP-EXPERIMENT(2026-08-31): 崩溃对照——delayed_registry_send 模板
+    // （std::move(xs)...）vs 显式 anon_send。stdin EOF 路径（watchdog
+    // 线程同样 anon_send shutdown_atom）干净，delayed 线程触发必崩。
+    std::thread([&sys]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (auto target = sys.registry().get("shutdown_mgr"))
+            caf::anon_send(caf::actor_cast<caf::actor>(target),
+                           shutdown_atom_v);
+    }).detach();
 }
 
 /// 脚本插件验证后门（--test-lua-script）：resolve echo_service 并调

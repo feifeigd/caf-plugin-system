@@ -11,6 +11,7 @@
 #include "app_config.hpp"
 #include "framework_bootstrap.hpp"
 #include "cluster/bootstrap.hpp"
+#include "plugin/plugin_interface.hpp"
 
 #include <caf/actor_system.hpp>
 
@@ -20,8 +21,12 @@ namespace caf_plugin_system {
 //   test_auto_shutdown / test_cross_call / test_cross_call_ex /
 //   test_bridge_call / test_remote_reload / test_quit / test_ctrl_c
 //   test_unload（运行期卸载 + 统一解绑广播验证）
-void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
-                        const cluster::BootstrapResult& nb,
-                        const BootstrapResult& fw);
+// extern "C" + PLUGIN_API：core 经 dll_main 的 test_hook 函数指针调用
+//（2026-08-31：从独立 DLL 移回 exe 编译——修复 test DLL 卸载后
+// delayed 线程执行已卸载代码段 → 0xC0000005 的根因；改测试只重编 exe，
+// core/插件全链不重建）。
+extern "C" PLUGIN_API void run_test_backdoors(
+    caf::actor_system& sys, const app_config& cfg,
+    const cluster::BootstrapResult& nb, const BootstrapResult& fw);
 
 } // namespace caf_plugin_system

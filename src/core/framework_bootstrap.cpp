@@ -88,7 +88,7 @@ std::mutex& trace_file_mutex() {
     return m;
 }
 
-void install_stdin_watchdog(caf::actor shutdown_mgr) {
+void install_stdin_watchdog(caf::actor_system& sys) {
 #ifdef _WIN32
     // 交互控制台（含 ConPTY 伪终端）不装 watchdog：用户可直接 Ctrl+C，
     // console_handler 走优雅关机。只有非交互 stdin 才需要 EOF 哨兵。
@@ -109,7 +109,10 @@ void install_stdin_watchdog(caf::actor shutdown_mgr) {
 #endif
     // 哨兵状态走统一日志（logging_service > CAF log > cout）。
     LOG_INFO("[Watchdog] stdin EOF watchdog armed (pipe stdin)");
-    std::thread([shutdown_mgr] {
+    // 线程不捕获 shutdown_mgr 强引用（否则 fread 阻塞期间引用计数恒 >0，
+    // shutdown_mgr 永不析构 → registry_/plugin_mgr_ 级联吊住 → 全链泄漏）。
+    // 触发时从 system registry 现取，与 ops_actor 同款弱持有模式。
+    std::thread([&sys] {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         char buf[64];
         size_t total = 0;
@@ -120,7 +123,9 @@ void install_stdin_watchdog(caf::actor shutdown_mgr) {
         if (total == 0)
             return;
         // 统一关机：EOF = 父进程消失 → shutdown_mgr 优雅关机链
-        caf::anon_send(shutdown_mgr, shutdown_atom{});
+        if (auto shutdown_mgr = sys.registry().get("shutdown_mgr"))
+            caf::anon_send(caf::actor_cast<caf::actor>(shutdown_mgr),
+                           shutdown_atom{});
     }).detach();
 }
 
@@ -151,7 +156,13 @@ void disable_quick_edit() {
 /// SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) 让普通
 /// LoadLibrary 也走 USER_DIRS（AddDllDirectory 注册的目录），且保留
 /// exe 目录优先（旧布局兼容）。
-void setup_dll_search_path() {
+/// 注册顺序（USER_DIRS 按调用顺序探测）：exe_dir → plugins/*/ → lib/。
+/// 插件子目录必须排在 lib/ 之前：插件自带依赖（lua_host/lua.dll）应优先
+/// 从插件自身目录解析（依赖自包含原则），避免被 lib/ 里的同名副本影子化
+/// 绑到非预期版本（曾导致 LuaHost 加载异常；2026-08-30 曾误判影子化与
+/// 关机崩溃相关，已证伪——崩溃真根因是 test DLL 卸载后 delayed 线程执行
+/// 已卸载代码段，见 __main.cpp 注释）。
+void setup_dll_search_path(const std::string& plugins_dir = std::string{}) {
 #ifdef _WIN32
     wchar_t buf[MAX_PATH];
     if (GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0)
@@ -159,6 +170,19 @@ void setup_dll_search_path() {
     std::filesystem::path exe_dir = std::filesystem::path(buf).parent_path();
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     AddDllDirectory(exe_dir.c_str());              // 兼容旧布局（DLL 在 exe 同级）
+    // 插件子目录（plugins/*/）逐个注册：插件自带第三方依赖（如
+    // lua_host/lua.dll）在 DEFAULT_DIRS 模式下不被加载模块自身目录
+    // 覆盖，必须显式注册才能被 import 解析命中。
+    if (!plugins_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::path pdir = std::filesystem::absolute(plugins_dir);
+        if (std::filesystem::is_directory(pdir, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(pdir, ec)) {
+                if (entry.is_directory(ec))
+                    AddDllDirectory(entry.path().c_str());
+            }
+        }
+    }
     AddDllDirectory((exe_dir / L"lib").c_str());   // 分类目录
 #endif
 }
@@ -301,7 +325,7 @@ framework_config::framework_config() {
     // 预注册阶段的 LoadLibrary 同样要能解析 run/lib 下的第三方依赖，
     // 否则非 delayload 依赖的插件在预注册阶段会加载失败（静默跳过）。
     // 幂等——bootstrap_system_components 里还有一次兜底调用。
-    setup_dll_search_path();
+    setup_dll_search_path(plugins_dir);
     // 插件私有消息类型的元对象：扫描插件目录并调用可选导出
     // register_meta_objects()。注册了元对象的插件 DLL 自此常驻。
     preregister_plugin_meta(plugins_dir);
@@ -366,7 +390,7 @@ bool bootstrap_system_components(caf::actor_system& sys,
                                  BootstrapResult& out) {
     // DLL 分类目录（exe_dir/lib/）注册：必须在任何 LoadLibrary 之前
     //（插件扫描在 bootstrap_plugins 里，此处早于它）
-    setup_dll_search_path();
+    setup_dll_search_path(cfg.plugins_dir);
     // ---- 日志服务最先 spawn（进程第一个 actor）----
     // 系统组件（registry/shutdown_mgr 等）从创建起就要打日志；插件也依赖
     // "logging_service" 核心内置服务。spdlog 在此创建 sinks 并常驻到关机链
@@ -529,9 +553,16 @@ void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     // 信号处理已在 bootstrap_system_components 注册（console_handler /
     // signal_handler），不重复注册（SetConsoleCtrlHandler 重复注册会让
     // handler 被调用两次 → 双 shutdown_atom）。
-    install_stdin_watchdog(fw.shutdown_mgr);
-    caf::scoped_actor self{sys};
-    self->wait_for(fw.shutdown_mgr);
+    // EXPERIMENT(2026-08-29): 修复 watchdog 强引用泄漏——恢复安装。
+    // 线程不再捕获 shutdown_mgr（改为 registry 现取），修复后可放心启用。
+    install_stdin_watchdog(sys);
+    // LEAKFIX(2026-08-30): 不用 self->wait_for(shutdown_mgr)——其内部
+    // attach_functor 把捕获 actor 的 lambda（8B functor_attachable）挂到
+    // shutdown_mgr 的 attach 链，CAF 1.1 关机路径不完整释放 → 每次进程
+    // 恰好残留 1 块 8B（反汇编+对照实验定案：注释 wait_for 即消失）。
+    // 改为轮询 registry：shutdown_mgr 注销即关机完成，不留任何引用。
+    for (int i = 0; i < 400 && sys.registry().get("shutdown_mgr"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     LOG_INFO("framework shutdown complete");
 }
 

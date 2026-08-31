@@ -11,11 +11,22 @@
 #include <cstring>
 #include <algorithm>
 
+// ------------------------------------------------------------------
+// PluginManager：插件宿主 actor。加载/解析/运行期卸载/热更新。
+//
+// 插件 DLL 生命周期（2026-08-31 定稿）：
+//   - 加载：LoadLibrary 后句柄进 plugin_lib_pool（deque 保址），
+//     进程级常驻。
+//   - 卸载：不显式 FreeLibrary。exe 静态导入 core.dll（进程退出才
+//     卸载），插件 DLL 由 OS 在进程退出时统一清理。A/B 实测：
+//     显式卸载泄漏数字无差异（py 6 块 immortal 基线 / lua-ts 0 块），
+//     且卸载期插件 static 析构存在竞态（偶发退出码异常）→ 移除。
+//   - 热更新：旧 DLL 同样常驻（actor vtable/lambda 在 DLL 代码段，
+//     CAF 异步释放引用，过早 FreeLibrary 会 exec 到已卸载代码段
+//     0xC0000005）——旧实例 2s 后 shutdown 自然退役，句柄留池。
+// ------------------------------------------------------------------
 namespace {
-/// 插件 DLL 句柄池（进程级常驻）。见 LoadedPlugin::lib 注释：
-/// actor 的 vtable/lambda 代码在插件 DLL 里，CAF 异步释放引用，
-/// FreeLibrary 过早会崩（0xC0000005 exec 到已卸载代码段）。
-/// 用 deque 保证元素地址稳定。进程退出时由 OS 回收。
+/// 插件 DLL 句柄池（进程级常驻，见文件头生命周期说明）。
 std::deque<DynamicLibrary>& plugin_lib_pool() {
     static std::deque<DynamicLibrary> pool;
     return pool;

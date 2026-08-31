@@ -30,10 +30,21 @@ add_library(caf_plugin_core SHARED
     cluster/ops_actor.cpp
     # ---- bridge（外部语言节点 sidecar）----
     bridge_actor.cpp
+    # ---- 应用入口（dll_main 导出，exe 瘦壳 LoadLibrary 后调用）----
+    __main__.cpp
 )
+
+# ---- 验证后门（--test-*）----
+# 2026-08-31：测试代码移回 app（exe 编译）。core 不再含测试代码：
+# 改测试只重编 exe，core.dll 与全部插件 DLL 均不重建（插件全链
+# 链接 caf_plugin_core，core 重编 = 全链重编，必须避免）。
+# core 的 dll_main 经 test_hook 函数指针调用 exe 侧的 run_test_backdoors，
+# 无动态加载、无 DLL 生命周期（2026-08-31 崩溃根因：test DLL 卸载后
+# delayed 线程执行已卸载代码段 → 0xC0000005）。
 
 target_include_directories(caf_plugin_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
@@ -50,3 +61,11 @@ if(WIN32)
     target_compile_options(caf_plugin_core PRIVATE /FS)
     target_link_libraries(caf_plugin_core PRIVATE kernel32)
 endif()
+
+# CAF 最小关机测试（2026-08-31）：判定关机崩溃归属（CAF vs 我们的流程）
+add_executable(caf_minimal_test caf_minimal_test.cpp)
+target_include_directories(caf_minimal_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(caf_minimal_test PRIVATE CAF::core)

@@ -3,6 +3,7 @@
 #include "services/logging_service.hpp"
 #include "plugin/plugin_manager.hpp"
 #include "checkpoint_manager.hpp"
+#include <caf/actor_registry.hpp>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -82,33 +83,59 @@ caf::behavior GracefulShutdown::make_behavior() {
     auto checkpoint_mgr = checkpoint_mgr_;
     auto get_stop_order = get_stop_order_;
 
-    // 统一终止集群节点 actor（master/client，register_cluster_atom 注册的）
-    auto stop_cluster = [=, this] {
-        for (auto& ctl : cluster_ctls_)
-            if (ctl)
-                self->send_exit(ctl, caf::exit_reason::user_shutdown);
-    };
-
-    // 完成关机：杀集群 → 杀组件 → 标记 stopped → 日志服务最后退 → quit。
-    // 插件必须在调用前已全部保存（无插件时 remaining 为空即视为完成）。
-    auto finish_shutdown = [=, this] {
-        stop_cluster();
-        self->send_exit(plugin_mgr, caf::exit_reason::user_shutdown);
-        self->send_exit(registry, caf::exit_reason::user_shutdown);
-        self->send_exit(checkpoint_mgr, caf::exit_reason::user_shutdown);
-        state_.state = SystemState::stopped;
-        // STOPPED 用 self->send（fw_log_from）：与随后 send_exit(logging_service)
-        // 同 sender → FIFO，保证这行日志先被处理、再退出日志服务。
-        shutdown_out(self, "[System] State: STOPPED");
-        // 日志服务最后退出：flush sinks 后 quit（其 exit_msg handler 负责），
-        // 最后一刻的日志（STOPPED）能收到。
-        if (logging_service_)
-            self->send_exit(logging_service_, caf::exit_reason::user_shutdown);
+    // 完成关机（阶段2）：标记 stopped → 日志服务最后退出 → quit。
+    // 前置：阶段1（杀集群 + 杀组件的 send_exit）已全部收到 down_msg
+    //（组件 mailbox 清理完成，不再与 actor_system 析构竞态）。
+    auto finish_quit = [=, this] {
         self->quit();
         // 通知点 X 时阻塞在 cv 上的 CTRL_CLOSE handler：链已走完、数据已
         // 落盘，它随即 ExitProcess(0) 主动退出（handler 立即返回会被 conhost
         // ~0ms 强杀成 0xC000013A，见 framework_bootstrap.cpp 注释）。
         caf_plugin_system::notify_shutdown_complete();
+    };
+
+    // 完成关机（阶段2 入口）：STOPPED 日志（FIFO 先落盘）→ 日志服务退出
+    // → 等 logging down_msg 再 quit。
+    auto finish_last = [=, this] {
+        state_.state = SystemState::stopped;
+        // STOPPED 用 self->send（fw_log_from）：与随后 send_exit(logging_service)
+        // 同 sender → FIFO，保证这行日志先被处理、再退出日志服务。
+        shutdown_out(self, "[System] State: STOPPED");
+        // 日志服务最后退出：flush sinks 后 quit（其 exit_msg handler 负责），
+        // 最后一刻的日志（STOPPED）能收到。等它的 down_msg 再 quit。
+        if (logging_service_) {
+            state_.stopping_components.push_back(logging_service_->address());
+            self->monitor(logging_service_);
+            self->send_exit(logging_service_, caf::exit_reason::user_shutdown);
+            return;
+        }
+        finish_quit();
+    };
+
+    // 完成关机（阶段1）：杀集群 → 杀组件（plugin_mgr/registry/checkpoint）。
+    // 全部 send_exit 后等各自 down_msg（组件 barrier）——8-31 实锤：此前
+    // send_exit 风暴后 shutdown_mgr 立刻 quit，组件 mailbox 清理（插件
+    // down_msg 触发的 unregister 等）与 actor_system 析构竞态 → message_data
+    // 双释放。插件必须在调用前已全部保存（无插件时 remaining 为空即视为完成）。
+    auto finish_shutdown = [=, this] {
+        for (auto& ctl : cluster_ctls_)
+            if (ctl) {
+                ++state_.cluster_ctls_pending;
+                self->monitor(ctl);
+                self->send_exit(ctl, caf::exit_reason::user_shutdown);
+            }
+        auto stop_component = [=, this](const caf::actor& a) {
+            if (a) {
+                state_.stopping_components.push_back(a->address());
+                self->monitor(a);
+                self->send_exit(a, caf::exit_reason::user_shutdown);
+            }
+        };
+        stop_component(plugin_mgr);
+        stop_component(registry);
+        stop_component(checkpoint_mgr);
+        if (state_.stopping_components.empty() && state_.cluster_ctls_pending == 0)
+            finish_last();
     };
 
     // 逐个停插件的公共流程：resolve -> drain -> save_state -> checkpoint -> shutdown
@@ -123,6 +150,15 @@ caf::behavior GracefulShutdown::make_behavior() {
                     self->send(self, plugin_saved_atom{}, name, false);
                     return;
                 }
+                // monitor() is the shutdown barrier. Do not advance to the
+                // next plugin (and eventually tear down PluginManager/CAF)
+                // until CAF has fully terminated this actor and emitted its
+                // down_msg. Merely sending shutdown_atom leaves mailbox
+                // cleanup racing with actor_system destruction.
+                state_.stopping_plugin = actor->address();
+                state_.stopping_plugin_name = name;
+                state_.stopping_plugin_saved = false;
+                self->monitor(actor);
                 self->send(actor, drain_atom{}, self);
                 trace_shutdown("stop_next: draining " + name);
                 self->request(actor, config_.plugin_stop_timeout, save_state_atom{})
@@ -134,18 +170,17 @@ caf::behavior GracefulShutdown::make_behavior() {
                                              save_state_atom{}, name, data)
                                     .then([=, this](bool) {
                                         trace_shutdown("stop_next: checkpointed " + name);
+                                        state_.stopping_plugin_saved = true;
                                         self->send(actor, shutdown_atom{});
-                                        self->send(self, plugin_saved_atom{}, name, true);
                                     });
                             } else {
+                                state_.stopping_plugin_saved = true;
                                 self->send(actor, shutdown_atom{});
-                                self->send(self, plugin_saved_atom{}, name, true);
                             }
                         },
                         [=, this](const caf::error&) {
                             trace_shutdown("stop_next: save FAILED for " + name);
                             self->send(actor, shutdown_atom{});
-                            self->send(self, plugin_saved_atom{}, name, false);
                         }
                     );
             },
@@ -220,6 +255,63 @@ caf::behavior GracefulShutdown::make_behavior() {
             }
         },
 
+        // A plugin is considered stopped only after CAF has completed actor
+        // termination and mailbox cleanup. This closes the exit race that
+        // manifested as message_data/type_id_list use-after-free on process
+        // shutdown whenever an entry plugin was actually loaded.
+        [=, this](const caf::down_msg& dm) {
+            // 1) 插件 barrier：等插件主 actor 完全退出
+            if (state_.stopping_plugin) {
+                if (state_.stopping_plugin != dm.source)
+                    return;
+                const auto name = state_.stopping_plugin_name;
+                const auto saved = state_.stopping_plugin_saved;
+                trace_shutdown("stop_next: exited " + name
+                               + " (" + caf::to_string(dm.reason) + ")");
+                state_.stopping_plugin = caf::actor_addr{};
+                state_.stopping_plugin_name.clear();
+                state_.stopping_plugin_saved = false;
+                self->send(self, plugin_saved_atom{}, name, saved);
+                return;
+            }
+            // 2) 组件 barrier：等 plugin_mgr/registry/checkpoint/logging 退出
+            auto& comps = state_.stopping_components;
+            auto it = std::find(comps.begin(), comps.end(), dm.source);
+            if (it != comps.end()) {
+                comps.erase(it);
+                trace_shutdown("component exited ("
+                               + caf::to_string(dm.reason) + ")");
+                if (comps.empty() && state_.cluster_ctls_pending == 0) {
+                    // 已打过 STOPPED（logging 已退）→ 直接 quit；否则首次
+                    // 全退 → 进 STOPPED 阶段。防 finish_last 重入死循环
+                    //（8-31 实测：logging down_msg 再触发 finish_last →
+                    // 重复 STOPPED/send_exit 已退 actor → 崩）。
+                    if (state_.state == SystemState::stopped)
+                        finish_quit();
+                    else
+                        finish_last();
+                }
+                return;
+            }
+            // 3) 集群 actor barrier：等 ops/master/client 退出
+            if (state_.cluster_ctls_pending > 0) {
+                for (auto& ctl : cluster_ctls_) {
+                    if (ctl && ctl->address() == dm.source) {
+                        --state_.cluster_ctls_pending;
+                        trace_shutdown("cluster actor exited ("
+                                       + caf::to_string(dm.reason) + ")");
+                        if (comps.empty() && state_.cluster_ctls_pending == 0) {
+                            if (state_.state == SystemState::stopped)
+                                finish_quit();
+                            else
+                                finish_last();
+                        }
+                        break;
+                    }
+                }
+            }
+        },
+
         // 插件 drain 完成后的回执 (drain_atom, actor_addr)。本实现对回执
         // 不做等待（drain 与 save_state 并行发出），但必须显式吞掉：
         // CAF 1.1 里意外消息会经 print_and_drop 产生 error 并让 actor quit，
@@ -233,7 +325,8 @@ caf::behavior GracefulShutdown::make_behavior() {
             finish_shutdown();
         },
 
-        // 集群节点 actor 注册（main 在 bootstrap_node 后调用）：关机统一终止
+        // 集群/运维控制面 actor 注册（__main.cpp 4 处：bridge/master/client/
+        // ops，见 graceful_shutdown.hpp cluster_ctls_ 注释）：关机统一终止
         [=, this](register_cluster_atom, const caf::actor& ctl) {
             if (ctl)
                 cluster_ctls_.push_back(ctl);
