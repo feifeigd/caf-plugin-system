@@ -93,6 +93,9 @@ struct framework_config : caf::actor_system_config {
     /// conf 格式：pomelo-routes = { "connector.entryHandler.entry" =
     /// "echo_service:hello" }
     pomelo_route_table pomelo_routes;
+    /// Pomelo 出站 PUSH 验证后门：启动后延迟推 game.event=hello-push
+    /// 给所有已握手连接（--test-pomelo-push）。
+    bool test_pomelo_push = false;
     /// 集群验证后门：master 延迟后跨节点调用指定节点的 external_echo
     ///（--test-bridge-call=<节点名>，验证集群→外部进程链路）。
     std::string test_bridge_call;
@@ -130,7 +133,8 @@ struct framework_config : caf::actor_system_config {
             || test_time_offset || test_lua_script || test_py_script
             || test_ts_script || !test_cross_call.empty()
             || !test_cross_call_ex.empty() || !test_remote_reload.empty()
-            || !test_bridge_call.empty() || !test_unload.empty();
+            || !test_bridge_call.empty() || !test_unload.empty()
+            || test_pomelo_push;
     }
 
     framework_config();

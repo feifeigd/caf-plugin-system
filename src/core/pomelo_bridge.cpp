@@ -27,7 +27,7 @@ namespace {
 // HANDSHAKE 载荷（服务器 → 客户端；客户端解析 code==200 后回 ACK）
 // 最小合法体：sys.heartbeat 告诉客户端心跳间隔，客户端自动互答。
 // ------------------------------------------------------------------
-const char* k_handshake_json =
+constexpr std::string_view k_handshake_json =
     "{\"code\":200,\"sys\":{\"heartbeat\":60}}";
 
 // 编码一帧写回客户端：Package(DATA, Message(...))
@@ -98,8 +98,46 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                std::uint16_t port,
                                const pomelo_route_table& routes,
                                const std::string& node_name) {
+    // broker 句柄间接层：impl 先 spawn，broker 后 spawn，运行时填充
+    auto broker_ref = std::make_shared<caf::actor>();
+
+    // ---- impl：出站 PUSH 服务（集群 → 客户端主动推送）----
+    // 注册为服务 "pomelo_push"：调用方发 plugin_envelope，function =
+    // 外部 PUSH route（客户端在听的频道名），payload = 推送内容。
+    // 转发给 broker 广播（PUSH 帧，无 id）。
+    auto impl = sys.spawn(
+        [broker_ref](caf::event_based_actor* self) {
+            return caf::behavior{
+                [self, broker_ref](const plugin_envelope& env) {
+                    if (env.function.empty()) {
+                        LOG_WARN("[Pomelo] push with empty route, ignored");
+                        return;
+                    }
+                    // byte 迭代器不能直接构造 string（无隐式转换）
+                    std::string body(
+                        reinterpret_cast<const char*>(
+                            env.payload.data()),
+                        env.payload.size());
+                    auto msg = PomeloCodec::encode_msg(
+                        0, PomeloCodec::kMsgPush, env.function,
+                        std::vector<std::byte>(env.payload.begin(),
+                                               env.payload.end()));
+                    auto frame = frame_string(PomeloCodec::kPkgData, msg);
+                    auto strong =
+                        caf::actor_cast<caf::actor>(*broker_ref);
+                    if (strong)
+                        caf::anon_send(strong, write_atom_v,
+                                       std::move(frame));
+                    LOG_INFO("[Pomelo] push route={} len={}",
+                             env.function, body.size());
+                }};
+        });
+
     auto bridge = sys.middleman().spawn_broker(
-        [registry, port, routes, node_name](caf::io::broker* self) {
+        [registry, port, routes, node_name,
+         broker_ref](caf::io::broker* self) {
+            // 运行时填充 broker 地址（impl 广播目标）
+            *broker_ref = caf::actor_cast<caf::actor>(self);
             auto doorman = self->add_tcp_doorman(port, nullptr, true);
             if (!doorman) {
                 LOG_ERROR("[Pomelo] add_tcp_doorman on port "
@@ -172,11 +210,10 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         // 客户端主动握手（官方语义：pomelo-jsclient
                         // connect 后先发 HANDSHAKE）→ 回 code:200 响应，
                         // 客户端随后发 HANDSHAKE_ACK 进入 DATA。
-                        const size_t hlen =
-                            std::strlen(k_handshake_json);
-                        std::vector<std::byte> body(hlen);
-                        std::memcpy(body.data(), k_handshake_json,
-                                    hlen);
+                        std::vector<std::byte> body(
+                            k_handshake_json.size());
+                        std::memcpy(body.data(), k_handshake_json.data(),
+                                    k_handshake_json.size());
                         write_frame(
                             h,
                             frame_string(PomeloCodec::kPkgHandshake,
@@ -591,19 +628,47 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     LOG_INFO("[Pomelo] connection closed: "
                              + std::to_string(msg.handle.id()));
                 },
-                [self, rx, write_frame](write_atom,
-                                        const std::string& data) {
-                    // 备用写通道：写最近存活连接（当前无外部调用者）
-                    if (!rx->empty()) {
-                        auto h = rx->rbegin()->first;
-                        write_frame(h, data);
+                [self, rx, ready, write_frame](write_atom,
+                                                const std::string& data) {
+                    // PUSH 广播：所有已握手（ready）连接都收到；TCP 裸写
+                    // Package 帧、WS 按 transport 自动包 WS 帧。
+                    size_t sent = 0;
+                    for (auto& kv : *ready) {
+                        if (kv.second) {
+                            write_frame(kv.first, data);
+                            ++sent;
+                        }
                     }
+                    LOG_INFO("[Pomelo] write_atom broadcast: " +
+                                 std::to_string(sent) + " conn(s)");
                 },
                 [self](caf::io::data_transferred_msg&) {
                     // ack_writes(true) 的写完成通知；无操作
                 },
                 [self](caf::exit_msg&) { self->quit(); }};
         });
+
+    // 注册出站 PUSH 服务：集群服务 resolve("pomelo_push") 后发
+    // plugin_envelope 即可向所有已握手客户端广播 PUSH 帧。
+    caf::scoped_actor self{sys};
+    self->send(registry, register_atom_v, std::string("pomelo_push"),
+               impl, std::string("pomelo"),
+               external_protocol_table{}); // 无外部协议号（PUSH 用字符串 route）
+    bool registered = false;
+    self->request(registry, std::chrono::seconds(2), list_services_atom_v)
+        .receive(
+            [&](std::vector<std::string>& names) {
+                registered =
+                    std::find(names.begin(), names.end(), "pomelo_push")
+                    != names.end();
+            },
+            [&](caf::error& e) {
+                LOG_ERROR("[Pomelo] list_services failed: "
+                          + caf::to_string(e));
+            });
+    if (!registered) {
+        LOG_ERROR("[Pomelo] pomelo_push registration not confirmed");
+    }
 
     return bridge;
 }

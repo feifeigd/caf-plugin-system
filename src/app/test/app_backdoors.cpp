@@ -1,5 +1,7 @@
 #include "app_backdoors.hpp"
 #include "app_tests.hpp"
+#include "common/message_tags.hpp"
+#include "common/plugin_envelope.hpp"
 #include "services/logging_service.hpp"
 #include "cluster/ops_actor.hpp"
 
@@ -205,6 +207,45 @@ void backdoor_unload_plugin(caf::actor_system& sys, const app_config& cfg,
             });
 }
 
+/// Pomelo 出站 PUSH 验证后门（--test-pomelo-push）：延迟 3s 后
+/// resolve("pomelo_push") 发 envelope（function=game.event 作为外部
+/// PUSH route，payload=hello-push），验证集群 → 客户端主动推送链路。
+void backdoor_pomelo_push(caf::actor_system& sys, const app_config& cfg,
+                          const BootstrapResult& fw) {
+    if (!cfg.test_pomelo_push)
+        return;
+    std::thread([&sys, registry = fw.registry]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        caf::scoped_actor self{sys};
+        self->request(registry, std::chrono::seconds(2),
+                      resolve_atom_v, std::string("pomelo_push"))
+            .receive(
+                [&](caf::actor& proxy) {
+                    if (!proxy) {
+                        std::cout << "[PomeloPush] resolve failed"
+                                  << std::endl;
+                        return;
+                    }
+                    plugin_envelope env;
+                    env.function = "game.event";
+                    env.format = payload_format::raw;
+                    const std::string body = "hello-push";
+                    // string → vector<std::byte> 需显式转换
+                    env.payload.resize(body.size());
+                    std::memcpy(env.payload.data(), body.data(),
+                                body.size());
+                    caf::anon_send(proxy, std::move(env));
+                    std::cout
+                        << "[PomeloPush] pushed game.event=hello-push"
+                        << std::endl;
+                },
+                [](caf::error& e) {
+                    std::cout << "[PomeloPush] resolve error: "
+                              << caf::to_string(e) << std::endl;
+                });
+    }).detach();
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -223,6 +264,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_ts_script(sys, cfg, fw);
     backdoor_time_offset(cfg);
     backdoor_unload_plugin(sys, cfg, fw);
+    backdoor_pomelo_push(sys, cfg, fw);
 }
 
 } // namespace caf_plugin_system

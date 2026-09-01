@@ -401,7 +401,9 @@ framework_config::framework_config() {
         .add(bridge_port, "bridge-port",
              "bridge sidecar TCP port for external-language nodes (0 = disabled)")
         .add(test_bridge_call, "test-bridge-call",
-             "master: cross-node call external_echo on this node after startup (bridge test)");
+             "master: cross-node call external_echo on this node after startup (bridge test)")
+        .add(test_pomelo_push, "test-pomelo-push",
+             "after startup, push game.event=hello-push to all pomelo connections (PUSH test)");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,
