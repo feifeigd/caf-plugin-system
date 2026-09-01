@@ -26,6 +26,7 @@ add_library(caf_plugin_core SHARED
     cluster/master.cpp
     cluster/client.cpp
     cluster/bootstrap.cpp
+    cluster/remote_lookup_worker.cpp
     cluster/remote_caller.cpp
     cluster/ops_actor.cpp
     # ---- bridge（外部语言节点 sidecar）----

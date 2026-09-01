@@ -6,6 +6,7 @@
 
 #include "common/cluster_types.hpp"
 #include "common/message_tags.hpp"
+#include "cluster/remote_lookup_worker.hpp"
 #include "services/logging_service.hpp"
 
 #include <caf/actor_cast.hpp>
@@ -156,7 +157,8 @@ public:
           node_name_(std::move(node_name)),
           plugin_mgr_(std::move(plugin_mgr)),
           master_registry_(std::move(master_registry)),
-          updates_dir_(std::move(updates_dir)) {}
+          updates_dir_(std::move(updates_dir)),
+          lookup_worker_(spawn_remote_lookup_worker(system(), address())) {}
 
     caf::behavior make_behavior() override {
         return {
@@ -330,7 +332,7 @@ private:
             ops_print("path mode: '" + path + "' must already exist on node '"
                       + node + "'");
         }
-        // resolve → connect → lookup → remote_reload（RemoteCaller 同款寻址）
+        // resolve → connect → 隔离式 lookup → remote_reload
         request(master_registry_, k_ops_timeout, node_resolve_atom_v, node,
                 std::string("ops"))
             .then(
@@ -345,23 +347,28 @@ private:
                                 const caf::node_id& nid,
                                 const caf::strong_actor_ptr&,
                                 const std::set<std::string>&) mutable {
-                                auto ptr = this->system().middleman()
-                                               .remote_lookup(route.actor_name, nid);
-                                if (!ptr) {
-                                    on_done(false, "lookup 'ops' at node '"
-                                                   + route.node_name + "' failed");
-                                    return;
-                                }
-                                auto target =
-                                    caf::actor_cast<caf::actor>(std::move(ptr));
-                                request(target, k_ops_timeout, remote_reload_atom_v,
-                                        std::move(req))
+                                request(lookup_worker_, k_ops_timeout,
+                                        route.actor_name, nid)
                                     .then(
-                                        [on_done](reload_result& r) {
-                                            on_done(r.ok, r.message);
+                                        [this, req = std::move(req), on_done](
+                                            caf::actor& target) mutable {
+                                            request(target, k_ops_timeout,
+                                                    remote_reload_atom_v,
+                                                    std::move(req))
+                                              .then(
+                                                [on_done](reload_result& r) {
+                                                    on_done(r.ok, r.message);
+                                                },
+                                                [on_done](caf::error& err) {
+                                                    on_done(false,
+                                                            caf::to_string(err));
+                                                });
                                         },
-                                        [on_done](caf::error& err) {
-                                            on_done(false, caf::to_string(err));
+                                        [route, on_done](caf::error& err) {
+                                            on_done(false, "lookup 'ops' at node '"
+                                                           + route.node_name
+                                                           + "' failed: "
+                                                           + caf::to_string(err));
                                         });
                             },
                             [route, on_done](caf::error& err) {
@@ -500,6 +507,7 @@ private:
     caf::actor plugin_mgr_;
     caf::actor master_registry_;
     std::string updates_dir_;
+    caf::actor lookup_worker_;
 };
 
 } // namespace

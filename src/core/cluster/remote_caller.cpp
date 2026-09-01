@@ -2,6 +2,7 @@
 
 #include "common/cluster_types.hpp"
 #include "common/message_tags.hpp"
+#include "cluster/remote_lookup_worker.hpp"
 
 #include <caf/all.hpp>
 #include <caf/io/middleman.hpp>
@@ -54,7 +55,8 @@ public:
     RemoteCallerActor(caf::actor_config& cfg, caf::actor master,
                       std::string local_node_name)
       : caf::event_based_actor(cfg), master_(std::move(master)),
-        local_node_name_(std::move(local_node_name)) {}
+        local_node_name_(std::move(local_node_name)),
+        lookup_worker_(spawn_remote_lookup_worker(system(), address())) {}
 
     caf::behavior make_behavior() override {
         return {
@@ -261,7 +263,7 @@ private:
               });
     }
 
-    /// 异步 connect + 同步 lookup（仅新节点首连一次，之后复用 target）。
+    /// 异步 connect + 隔离式 lookup（仅新节点首连一次，之后复用 target）。
     void do_connect(KeyState& ks, size_t idx) {
         auto& route = ks.routes[idx];
         auto& mm = this->system().middleman();
@@ -272,19 +274,20 @@ private:
                                const caf::strong_actor_ptr&,
                                const std::set<std::string>&) {
                   auto& r = ks.routes[idx];
-                  // remote_lookup 阻塞，但只在新节点首连时调用一次；
-                  // 之后 target 缓存复用，不再走这里。
-                  auto ptr = this->system().middleman().remote_lookup(
-                    r.info.actor_name, nid);
-                  if (!ptr) {
-                      LOG_INFO(std::string("[RemoteCaller] lookup '") + r.info.actor_name
-                                  + "' at " + r.info.node_name + " failed");
-                      r.healthy = false;
-                      try_route(ks);
-                      return;
-                  }
-                  r.target = caf::actor_cast<caf::actor>(std::move(ptr));
-                  do_call(ks, idx);
+                  request(lookup_worker_, k_call_timeout, r.info.actor_name, nid)
+                    .then(
+                      [this, &ks, idx](caf::actor& target) {
+                          ks.routes[idx].target = std::move(target);
+                          do_call(ks, idx);
+                      },
+                      [this, &ks, idx](caf::error& err) {
+                          LOG_INFO(std::string("[RemoteCaller] lookup '")
+                                      + ks.routes[idx].info.actor_name + "' at "
+                                      + ks.routes[idx].info.node_name + " failed: "
+                                      + caf::to_string(err));
+                          ks.routes[idx].healthy = false;
+                          try_route(ks);
+                      });
               },
               [this, &ks, idx](caf::error& err) {
                   LOG_INFO(std::string("[RemoteCaller] connect to ") + ks.routes[idx].info.node_name
@@ -313,6 +316,7 @@ private:
 
     caf::actor master_;
     std::string local_node_name_;
+    caf::actor lookup_worker_;
     std::unordered_map<std::string, KeyState> keys_;
 };
 

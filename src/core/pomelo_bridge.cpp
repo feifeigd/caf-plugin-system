@@ -49,8 +49,10 @@ constexpr HsFrame make_hs_frame() {
     f.data[1] = static_cast<char>((n >> 16) & 0xFF);
     f.data[2] = static_cast<char>((n >> 8) & 0xFF);
     f.data[3] = static_cast<char>(n & 0xFF);
-    for (size_t i = 0; i < n; ++i)
-        f.data[4 + i] = static_cast<char>(k_handshake_body[i]);
+    // C++20 起 std::copy 为 constexpr（P0202R2），可直接用于编译期
+    // 求值函数；C++17 时此处只能手写循环。
+    std::copy(k_handshake_body.begin(), k_handshake_body.end(),
+              f.data + 4);
     return f;
 }
 
