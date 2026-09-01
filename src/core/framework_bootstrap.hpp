@@ -50,6 +50,10 @@ struct framework_config : caf::actor_system_config {
     std::string plugins_dir = "./plugins";
     /// 启动完成后自动触发优雅关机（冒烟测试后门）
     bool test_auto_shutdown = false;
+    /// stdin EOF 时无条件触发关机（--exit-on-stdin-eof）：脚本/CI 场景
+    /// `prog < input` 跑完输入即优雅退出。默认 false = 仅"读过数据后
+    /// EOF"才触发（空管道不误关机，见 install_stdin_watchdog）。
+    bool exit_on_stdin_eof = false;
     /// 跨节点调用信任开关：为 true 时远端节点 sender 可绕过服务代理 ACL
     /// 白名单（集群内互信；默认 false = ACL 只管本地，跨节点一律拦截）
     bool allow_cross_node = false;
@@ -148,7 +152,8 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
 /// 阻塞直到关机完成（Ctrl+C / 插件请求 / 故障路径触发）。
 /// 注意：集群节点（master/client）也由 shutdown_mgr 统一终止（经
 /// register_cluster_atom 注册），main 只等 shutdown_mgr 退出即可。
-void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw);
+void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw,
+                       const framework_config& cfg);
 
 /// TODO(leakfix-probe): 清空 shutdown_manager_ref() 静态持有——shutdown_mgr
 /// actor 引用被进程级单例持有，DLL 常驻不析构 → 对象树级联泄漏。
@@ -158,8 +163,10 @@ void clear_shutdown_manager_ref();
 /// 父进程/终端消失 → 管道写端关闭 → EOF → 发 shutdown_atom 给 shutdown_mgr
 /// 触发统一关机（优雅关机链由 shutdown_mgr 全权负责）。
 /// 仅监视 FIFO stdin；控制台/重定向/devnull 不监视。1.5s 宽限防误触发；
-/// 只有"读过数据后 EOF"才触发（空管道不误报，后台启动不误关机）。
-void install_stdin_watchdog(caf::actor_system& sys);
+/// 默认只有"读过数据后 EOF"才触发（空管道不误报，后台启动不误关机）；
+/// cfg.exit_on_stdin_eof = true 时 EOF 无条件触发（脚本 `prog < input`）。
+void install_stdin_watchdog(caf::actor_system& sys,
+                            const framework_config& cfg);
 
 /// 控制台是否正在销毁（用户点窗口 X 触发 CTRL_CLOSE_EVENT 后为 true）。
 /// 关机链的 stdout 输出必须检查此标志：写正在销毁的控制台句柄会阻塞，

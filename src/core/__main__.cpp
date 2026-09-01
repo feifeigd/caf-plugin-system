@@ -166,7 +166,7 @@ extern "C" PLUGIN_API int caf_main(caf::actor_system& sys,
     //（plugin_mgr/registry/checkpoint）。所有触发（Ctrl+C / stdin EOF /
     // ops quit / 插件请求 / --test-quit）都发 shutdown_atom 给它，
     // main 只等它退出——进程必须自己自然退出，不许外部强杀。
-    wait_for_shutdown(sys, fw);
+    wait_for_shutdown(sys, fw, cfg);
 
     // TODO(leakfix): 清空核心 current_logger() 静态持有——logging_service actor
     // 引用被函数内 static 持有，DLL 常驻不析构 → CRT leak dump 报 126 块簇

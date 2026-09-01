@@ -88,7 +88,8 @@ std::mutex& trace_file_mutex() {
     return m;
 }
 
-void install_stdin_watchdog(caf::actor_system& sys) {
+void install_stdin_watchdog(caf::actor_system& sys,
+                            const framework_config& cfg) {
 #ifdef _WIN32
     // 交互控制台（含 ConPTY 伪终端）不装 watchdog：用户可直接 Ctrl+C，
     // console_handler 走优雅关机。只有非交互 stdin 才需要 EOF 哨兵。
@@ -96,31 +97,43 @@ void install_stdin_watchdog(caf::actor_system& sys) {
     DWORD mode = 0;
     if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
         return;
-    // 非交互：仅 FIFO（管道）装哨兵；文件重定向（REG）不装——EOF 是正常
-    // 结束不是父进程消失。
+    // 非交互：默认仅 FIFO（管道）装哨兵——文件重定向（REG）的 EOF 是正常
+    // 结束不是父进程消失；--exit-on-stdin-eof 显式打开时 REG 也装
+    //（脚本场景 `prog < input` 跑完输入即优雅退出）。
     struct _stat64 st;
-    if (_fstat64(_fileno(stdin), &st) != 0
-        || (st.st_mode & _S_IFMT) != _S_IFIFO)
+    if (_fstat64(_fileno(stdin), &st) != 0)
+        return;
+    const bool is_fifo = (st.st_mode & _S_IFMT) == _S_IFIFO;
+    const bool is_reg = (st.st_mode & _S_IFMT) == _S_IFREG;
+    if (!is_fifo && !(is_reg && cfg.exit_on_stdin_eof))
         return;
 #else
     struct stat st;
-    if (fstat(STDIN_FILENO, &st) != 0 || !S_ISFIFO(st.st_mode))
+    if (fstat(STDIN_FILENO, &st) != 0)
+        return;
+    const bool is_fifo = S_ISFIFO(st.st_mode);
+    const bool is_reg = S_ISREG(st.st_mode);
+    if (!is_fifo && !(is_reg && cfg.exit_on_stdin_eof))
         return;
 #endif
     // 哨兵状态走统一日志（logging_service > CAF log > cout）。
-    LOG_INFO("[Watchdog] stdin EOF watchdog armed (pipe stdin)");
+    LOG_INFO(cfg.exit_on_stdin_eof
+                 ? "[Watchdog] stdin EOF watchdog armed (pipe stdin, "
+                   "exit-on-stdin-eof)"
+                 : "[Watchdog] stdin EOF watchdog armed (pipe stdin)");
     // 线程不捕获 shutdown_mgr 强引用（否则 fread 阻塞期间引用计数恒 >0，
     // shutdown_mgr 永不析构 → registry_/plugin_mgr_ 级联吊住 → 全链泄漏）。
     // 触发时从 system registry 现取，与 ops_actor 同款弱持有模式。
-    std::thread([&sys] {
+    std::thread([&sys, &cfg] {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         char buf[64];
         size_t total = 0;
         while (fread(buf, 1, sizeof buf, stdin) > 0)
             total += sizeof buf;
         // 只有"读过数据后 EOF"才算父进程/终端消失；启动即 EOF 的空管道
-        // （如 WSL→PowerShell 继承的空 stdin）不触发，避免误关机。
-        if (total == 0)
+        // （如 WSL→PowerShell 继承的空 stdin）默认不触发，避免误关机；
+        // --exit-on-stdin-eof 显式打开时空 EOF 也触发（脚本 `prog < input`）。
+        if (total == 0 && !cfg.exit_on_stdin_eof)
             return;
         // 统一关机：EOF = 父进程消失 → shutdown_mgr 优雅关机链
         if (auto shutdown_mgr = sys.registry().get("shutdown_mgr"))
@@ -345,6 +358,8 @@ framework_config::framework_config() {
         .add(plugins_dir, "plugins-dir,p", "plugin scan directory (default ./plugins)")
         .add(test_auto_shutdown, "test-auto-shutdown",
              "auto trigger graceful shutdown after startup (smoke test)")
+        .add(exit_on_stdin_eof, "exit-on-stdin-eof",
+             "exit gracefully on stdin EOF even without prior data (script/CI)")
         .add(allow_cross_node, "allow-cross-node",
              "trust remote cluster nodes bypassing service ACL (default false)")
         .add(redis_uris, "redis-uris",
@@ -550,13 +565,14 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     return true;
 }
 
-void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
+void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw,
+                       const framework_config& cfg) {
     // 信号处理已在 bootstrap_system_components 注册（console_handler /
     // signal_handler），不重复注册（SetConsoleCtrlHandler 重复注册会让
     // handler 被调用两次 → 双 shutdown_atom）。
     // EXPERIMENT(2026-08-29): 修复 watchdog 强引用泄漏——恢复安装。
     // 线程不再捕获 shutdown_mgr（改为 registry 现取），修复后可放心启用。
-    install_stdin_watchdog(sys);
+    install_stdin_watchdog(sys, cfg);
     // WAIT(2026-09-01): 弃用轮询方案（400×25ms=10s 超时后无条件假报
     // "shutdown complete"，且超时会截断插件优雅保存）。也弃用
     // self->wait_for(shutdown_mgr)——其 attach_functor 把捕获 actor 的
