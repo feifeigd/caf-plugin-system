@@ -30,6 +30,8 @@
 
 #include <caf/actor_system_config.hpp>
 
+#include "pomelo_bridge.hpp"
+
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -82,6 +84,15 @@ struct framework_config : caf::actor_system_config {
     ///（0 = 禁用）。bridge 以正常集群节点身份注册，external_echo 服务
     /// 的 handler 在外部进程（行协议，见 src/core/bridge_actor.hpp）。
     std::uint16_t bridge_port = 0;
+    /// Pomelo 协议端点端口（0 = 禁用）：兼容 Pomelo 游戏客户端
+    ///（pomelo-protocol 0.1.6，完整握手链 + REQUEST/NOTIFY 翻译）。
+    /// 与行协议 bridge 并存（见 src/core/pomelo_bridge.hpp）。
+    std::uint16_t pomelo_port = 0;
+    /// Pomelo route 映射表：外部 route 字符串 → "svc:function"（内部
+    /// MFA）。外部只见 route 别名，内部函数名永不上线；未知 route 拒绝。
+    /// conf 格式：pomelo-routes = { "connector.entryHandler.entry" =
+    /// "echo_service:hello" }
+    pomelo_route_table pomelo_routes;
     /// 集群验证后门：master 延迟后跨节点调用指定节点的 external_echo
     ///（--test-bridge-call=<节点名>，验证集群→外部进程链路）。
     std::string test_bridge_call;

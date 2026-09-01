@@ -30,6 +30,8 @@ add_library(caf_plugin_core SHARED
     cluster/ops_actor.cpp
     # ---- bridge（外部语言节点 sidecar）----
     bridge_actor.cpp
+    # ---- Pomelo 协议端点（游戏客户端接入）----
+    pomelo_bridge.cpp
     # ---- 应用入口（dll_main 导出，exe 瘦壳 LoadLibrary 后调用）----
     __main__.cpp
 )

@@ -98,6 +98,18 @@ extern "C" PLUGIN_API int caf_main(caf::actor_system& sys,
         self->send(fw.shutdown_mgr, register_cluster_atom_v, bridge);
     }
 
+    // ---- Pomelo 协议端点（--caf-plugin-system.pomelo-port>0）----
+    // 兼容 Pomelo 游戏客户端：完整握手链 + REQUEST/NOTIFY 翻译。
+    // 与行协议 bridge 并存；注册给 shutdown_mgr 统一终止。
+    if (cfg.pomelo_port > 0) {
+        auto pomelo = spawn_pomelo_bridge(
+            sys, fw.registry, cfg.pomelo_port, cfg.pomelo_routes,
+            cfg.node_cfg.node_name.empty() ? "standalone"
+                                           : cfg.node_cfg.node_name);
+        caf::scoped_actor self{sys};
+        self->send(fw.shutdown_mgr, register_cluster_atom_v, pomelo);
+    }
+
     // ---- 集群节点引导（可选；--caf-plugin-system.node-kind 非空时）----
     // 单节点（纯插件）与集群节点（含插件）都经此路径，正交组合。
     cluster::BootstrapResult nb;

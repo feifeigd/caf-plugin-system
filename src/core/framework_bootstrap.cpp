@@ -360,6 +360,10 @@ framework_config::framework_config() {
              "auto trigger graceful shutdown after startup (smoke test)")
         .add(exit_on_stdin_eof, "exit-on-stdin-eof",
              "exit gracefully on stdin EOF even without prior data (script/CI)")
+        .add(pomelo_port, "pomelo-port",
+             "Pomelo protocol endpoint port (0 = disabled)")
+        .add(pomelo_routes, "pomelo-routes",
+             "Pomelo route table: route -> svc:function (internal MFA)")
         .add(allow_cross_node, "allow-cross-node",
              "trust remote cluster nodes bypassing service ACL (default false)")
         .add(redis_uris, "redis-uris",
