@@ -557,14 +557,19 @@ void wait_for_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     // EXPERIMENT(2026-08-29): 修复 watchdog 强引用泄漏——恢复安装。
     // 线程不再捕获 shutdown_mgr（改为 registry 现取），修复后可放心启用。
     install_stdin_watchdog(sys);
-    // LEAKFIX(2026-08-30): 不用 self->wait_for(shutdown_mgr)——其内部
-    // attach_functor 把捕获 actor 的 lambda（8B functor_attachable）挂到
-    // shutdown_mgr 的 attach 链，CAF 1.1 关机路径不完整释放 → 每次进程
-    // 恰好残留 1 块 8B（反汇编+对照实验定案：注释 wait_for 即消失）。
-    // 改为轮询 registry：shutdown_mgr 注销即关机完成，不留任何引用。
-    for (int i = 0; i < 400 && sys.registry().get("shutdown_mgr"); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    LOG_INFO("framework shutdown complete");
+    // WAIT(2026-09-01): 弃用轮询方案（400×25ms=10s 超时后无条件假报
+    // "shutdown complete"，且超时会截断插件优雅保存）。也弃用
+    // self->wait_for(shutdown_mgr)——其 attach_functor 把捕获 actor 的
+    // lambda（8B functor_attachable）挂到 shutdown_mgr 的 attach 链，
+    // CAF 1.1 关机路径不完整释放 → 每次进程恰好残留 1 块 8B。
+    // 改用 actor_system::await_all_actors_done()：CAF 官方 API，内部
+    // 条件变量等所有 actor 退出（含 shutdown_mgr），不 attach functor →
+    // 0 泄漏、无超时（优雅保存永不被截断）、真正关完才返回 → 日志如实。
+    sys.await_all_actors_done();
+    // 注：此时所有 actor（含 logging_service）已退出，LOG_* 会静默丢失
+    // ——直接旁路写 stdout，保证收尾日志可见（State: STOPPED 后最后一行）。
+    std::fputs("framework shutdown complete\n", stdout);
+    std::fflush(stdout);
 }
 
 } // namespace caf_plugin_system
