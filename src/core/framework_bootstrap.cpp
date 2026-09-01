@@ -403,7 +403,9 @@ framework_config::framework_config() {
         .add(test_bridge_call, "test-bridge-call",
              "master: cross-node call external_echo on this node after startup (bridge test)")
         .add(test_pomelo_push, "test-pomelo-push",
-             "after startup, push game.event=hello-push to all pomelo connections (PUSH test)");
+             "after startup, push game.event=hello-push to all pomelo connections (PUSH test)")
+        .add(test_timeout, "test-timeout",
+             "request to a non-responding actor must return request_timeout instead of hanging (no-infinite-wait test)");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,
@@ -545,7 +547,8 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     for (const auto& name : load_order) {
         auto it = info_map.find(name);
         if (it == info_map.end()) continue;
-        self->request(out.plugin_mgr, caf::infinite, load_atom{}, name, it->second.path.string())
+        self->request(out.plugin_mgr, std::chrono::seconds(10), load_atom{},
+                      name, it->second.path.string())
             .receive([](bool ok) { LOG_INFO("Load result: " + std::string(ok ? "OK" : "FAILED")); },
                      [](const caf::error& e) { LOG_ERROR("Load err: " + caf::to_string(e)); });
     }
@@ -554,7 +557,8 @@ bool bootstrap_plugins(caf::actor_system& sys, const framework_config& cfg,
     bool healthy = true;
     for (const auto& name : load_order) {
         caf::actor plugin_actor;
-        self->request(out.plugin_mgr, caf::infinite, resolve_plugin_atom{}, name)
+        self->request(out.plugin_mgr, std::chrono::seconds(5),
+                      resolve_plugin_atom{}, name)
             .receive([&plugin_actor](const caf::actor& a) { plugin_actor = a; },
                      [](caf::error&) {});
         if (!plugin_actor) { healthy = false; break; }

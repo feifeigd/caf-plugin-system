@@ -828,7 +828,8 @@ public:
 
                 caf::scoped_actor blocking{self->system()};
                 caf::actor proxy;
-                blocking->request(registry, caf::infinite, resolve_atom_v, service_name)
+                blocking->request(registry, std::chrono::seconds(5),
+                                  resolve_atom_v, service_name)
                     .receive([&](caf::actor a) { proxy = std::move(a); },
                              [](caf::error&) {});
                 bool paused = false;
@@ -966,4 +967,3 @@ extern "C" PLUGIN_API void destroy_plugin(PluginEntry* p) {
     // 先于 down_msg），python_ready 已 false，无需兜底。
     delete p;
 }
-

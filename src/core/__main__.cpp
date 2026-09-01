@@ -122,7 +122,8 @@ extern "C" PLUGIN_API int caf_main(caf::actor_system& sys,
         //（node_resolve 路由依据）。
         auto node_cfg = cfg.node_cfg;
         caf::scoped_actor self{sys};
-        self->request(fw.registry, caf::infinite, exported_actors_atom_v)
+        self->request(fw.registry, std::chrono::seconds(5),
+                      exported_actors_atom_v)
             .receive([&](std::vector<std::string>& names) {
                 node_cfg.exported_actors = std::move(names);
                 for (auto& n : names)

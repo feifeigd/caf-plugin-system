@@ -610,7 +610,8 @@ public:
 
                 // 2. quiesce 代理：静默 + 缓冲，等 ack（失败则销毁新实例回滚）
                 caf::actor proxy;
-                blocking->request(registry, caf::infinite, resolve_atom_v, service_name)
+                blocking->request(registry, std::chrono::seconds(5),
+                                  resolve_atom_v, service_name)
                     .receive([&](caf::actor a) { proxy = std::move(a); },
                              [](caf::error&) {});
                 bool paused = false;

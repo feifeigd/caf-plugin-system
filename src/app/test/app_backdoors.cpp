@@ -250,6 +250,58 @@ void backdoor_pomelo_push(caf::actor_system& sys, const app_config& cfg,
     }).detach();
 }
 
+/// 超时防护验证后门（--test-timeout）：spawn 一个不回任何消息的哑
+/// actor，发带 2s 超时的 request，断言收到 caf::sec::request_timeout
+/// 错误（而非无限挂起）——验证"消除无穷等待"的超时机制真实生效。
+void backdoor_timeout_check(caf::actor_system& sys, const app_config& cfg,
+                            const BootstrapResult& fw) {
+    if (!cfg.test_timeout)
+        return;
+    std::cout << "[TimeoutTest] spawning slow actor (3s reply)..."
+              << std::endl;
+    auto dummy = sys.spawn([]() -> caf::behavior {
+        // 慢响应 actor：收到请求后阻塞 3s 才回（超过 request 的 2s
+        // 超时）→ 发送方必在 2s 处收到 request_timeout。
+        // 注：不能写"匹配但 void 的 handler"（CAF 1.1 自动回空消息）
+        // 也不能写"不匹配的 handler"（CAF 回 unexpected_message）——
+        // 两者都不触发超时。sleep 阻塞调度线程仅限测试专用。
+        return [](resolve_atom, const std::string&) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            return caf::message{};
+        };
+    });
+    caf::scoped_actor self{sys};
+    const auto t0 = std::chrono::steady_clock::now();
+    self->request(dummy, std::chrono::seconds(2), resolve_atom_v,
+                  std::string("ping"))
+        .receive(
+            [](caf::message&) {
+                std::cout << "[TimeoutTest] FAIL: unexpected reply"
+                          << std::endl;
+            },
+            [&](caf::error& e) {
+                const auto ms = std::chrono::duration_cast<
+                                    std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now()
+                                    - t0)
+                                    .count();
+                const bool is_timeout =
+                    e == caf::sec::request_timeout;
+                std::cout << "[TimeoutTest] "
+                          << (is_timeout ? "PASS" : "FAIL")
+                          << ": error=" << caf::to_string(e) << " ("
+                          << e.category()
+                          << ") after " << ms << "ms" << std::endl;
+                if (!is_timeout) {
+                    std::cout << "[TimeoutTest] expected "
+                                 "caf::sec::request_timeout"
+                              << std::endl;
+                }
+            });
+    // 测试完成：触发优雅退出（shutdown_atom → 统一关机链）
+    caf::anon_send(fw.shutdown_mgr, shutdown_atom{});
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -269,6 +321,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_time_offset(cfg);
     backdoor_unload_plugin(sys, cfg, fw);
     backdoor_pomelo_push(sys, cfg, fw);
+    backdoor_timeout_check(sys, cfg, fw);
 }
 
 } // namespace caf_plugin_system

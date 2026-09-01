@@ -24,6 +24,7 @@
 #include <caf/actor_registry.hpp>
 #include <caf/stateful_actor.hpp>
 
+#include <chrono>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -108,7 +109,7 @@ public:
                                     std::string("ERROR: service_registry unavailable"));
                                 return;
                             }
-                            self->request(reg, caf::infinite,
+                            self->request(reg, std::chrono::seconds(5),
                                           list_services_atom_v)
                                 .then(
                                     [rp](std::vector<std::string>& svcs) mutable {

@@ -727,7 +727,8 @@ public:
 
                 caf::scoped_actor blocking{self->system()};
                 caf::actor proxy;
-                blocking->request(registry, caf::infinite, resolve_atom_v, service_name)
+                blocking->request(registry, std::chrono::seconds(5),
+                                  resolve_atom_v, service_name)
                     .receive([&](caf::actor a) { proxy = std::move(a); },
                              [](caf::error&) {});
                 bool paused = false;

@@ -293,7 +293,7 @@ private:
             return;
         }
         ops_print("reloading '" + plugin + "' from " + path);
-        request(plugin_mgr_, caf::infinite, reload_atom_v, plugin, path)
+        request(plugin_mgr_, k_ops_timeout, reload_atom_v, plugin, path)
             .then(
                 [plugin](bool ok) {
                     ops_print("reload '" + plugin + "': "
@@ -488,7 +488,7 @@ private:
                   + (sender ? caf::to_string(sender->node())
                             : std::string("(unknown sender)"))
                   + " -> " + dll_path);
-        request(plugin_mgr_, caf::infinite, reload_atom_v, req.plugin_name,
+        request(plugin_mgr_, k_ops_timeout, reload_atom_v, req.plugin_name,
                 dll_path)
             .then(
                 [rp, plugin = req.plugin_name](bool ok) mutable {

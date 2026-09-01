@@ -26,6 +26,8 @@
 //     0xC0000005）——旧实例 2s 后 shutdown 自然退役，句柄留池。
 // ------------------------------------------------------------------
 namespace {
+constexpr auto k_registry_timeout = std::chrono::seconds(5);
+
 /// 插件 DLL 句柄池（进程级常驻，见文件头生命周期说明）。
 std::deque<DynamicLibrary>& plugin_lib_pool() {
     static std::deque<DynamicLibrary> pool;
@@ -106,7 +108,7 @@ caf::behavior PluginManager::make_behavior() {
             for (const auto& dep : manifest.dependencies) {
                 LOG_INFO("Resolving dependency: " + dep + " for " + name);
                 caf::actor dep_actor;
-                blocking->request(registry_, caf::infinite, resolve_atom{}, dep)
+                blocking->request(registry_, k_registry_timeout, resolve_atom{}, dep)
                     .receive([&dep_actor](const caf::actor& a) { dep_actor = a; },
                              [](caf::error&) {});
                 if (!dep_actor) {
@@ -153,7 +155,7 @@ caf::behavior PluginManager::make_behavior() {
                         // ServiceRegistry 而非 plugins_）：解析其 actor 地址
                         // 作为信任方；仍找不到才是清单写错。
                         caf::actor svc_actor;
-                        blocking->request(registry_, caf::infinite,
+                        blocking->request(registry_, k_registry_timeout,
                                           resolve_atom{}, pname)
                             .receive([&svc_actor](const caf::actor& a) { svc_actor = a; },
                                      [](caf::error&) {});
@@ -248,7 +250,7 @@ caf::behavior PluginManager::make_behavior() {
             caf::scoped_actor blocking{self->system()};
             for (const auto& dep : manifest.dependencies) {
                 caf::actor dep_actor;
-                blocking->request(registry_, caf::infinite, resolve_atom{}, dep)
+                blocking->request(registry_, k_registry_timeout, resolve_atom{}, dep)
                     .receive([&dep_actor](const caf::actor& a) { dep_actor = a; },
                              [](caf::error&) {});
                 if (!dep_actor) {
@@ -264,7 +266,7 @@ caf::behavior PluginManager::make_behavior() {
             std::vector<caf::actor> proxies;
             for (const auto& svc : it->second.manifest.provides) {
                 caf::actor proxy;
-                blocking->request(registry_, caf::infinite, resolve_atom{}, svc)
+                blocking->request(registry_, k_registry_timeout, resolve_atom{}, svc)
                     .receive([&proxy](const caf::actor& a) { proxy = a; },
                              [](caf::error&) {});
                 bool paused = false;
@@ -311,7 +313,7 @@ caf::behavior PluginManager::make_behavior() {
                     } else {
                         // 核心内置服务回退：从 ServiceRegistry 解析（见上）
                         caf::actor svc_actor;
-                        blocking->request(registry_, caf::infinite,
+                        blocking->request(registry_, k_registry_timeout,
                                           resolve_atom{}, pname)
                             .receive([&svc_actor](const caf::actor& a) { svc_actor = a; },
                                      [](caf::error&) {});
@@ -399,7 +401,7 @@ caf::behavior PluginManager::make_behavior() {
 
             for (const auto& svc : it->second.manifest.provides) {
                 caf::actor proxy;
-                blocking->request(registry_, caf::infinite, resolve_atom{}, svc)
+                blocking->request(registry_, k_registry_timeout, resolve_atom{}, svc)
                     .receive([&proxy](const caf::actor& a) { proxy = a; },
                              [](caf::error&) {});
                 if (proxy) {
