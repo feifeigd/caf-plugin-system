@@ -62,11 +62,14 @@ bool split_svc_function(const std::string& target, std::string& svc,
 } // namespace
 
 // ------------------------------------------------------------------
-// spawn_pomelo_bridge —— broker 事件驱动（照 bridge_actor 模式）
+// spawn_pomelo_bridge —— broker 事件驱动（多连接版，2026-09-01）
 //
-// v1 单连接语义（与行协议 bridge 相同）：写"最近连接"。
+// 多连接语义：每个 TCP 连接独立握手（各自 HANDSHAKE→ACK），REQUEST
+// 的响应写回【发起请求的那个连接】（按 connection_handle 路由），
+// 一个连接的协议错误/关闭不影响其他连接。
+//
 // 连接流程：accept → 发 HANDSHAKE → 等 ACK → DATA 就绪。
-// REQUEST：route 查表 → resolve svc → envelope 调用 → RESPONSE 回。
+// REQUEST：route 查表 → resolve svc → envelope 调用 → RESPONSE 回原连接。
 // NOTIFY：envelope 单向（fire-and-forget，无响应帧）。
 // HEARTBEAT：原样互答。
 // ------------------------------------------------------------------
@@ -88,18 +91,30 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                      + std::to_string(port) + " (routes="
                      + std::to_string(routes.size()) + ")");
 
-            // 每连接读缓冲；bad = 协议错误连接（忽略后续数据，等对端关）
+            // 每连接读缓冲（rx）；bad = 协议错误连接（忽略后续数据）
             auto rx = std::make_shared<std::map<
                 caf::io::connection_handle, std::vector<std::byte>>>();
             auto bad = std::make_shared<std::set<caf::io::connection_handle>>();
-            // 当前连接（v1 单连接语义：写最近连接）
-            auto current = std::make_shared<caf::io::connection_handle>();
-            // 连接握手状态：false = 等 HANDSHAKE_ACK，true = DATA 就绪
-            auto ready = std::make_shared<bool>(false);
+            // 每连接握手状态：false = 等 HANDSHAKE_ACK，true = DATA 就绪
+            auto ready = std::make_shared<std::map<
+                caf::io::connection_handle, bool>>();
 
-            auto send_handshake = [self, current] {
-                if (current->invalid())
+            // 写一帧到指定连接；连接已关/已坏则不写（响应回调到达时
+            // 连接可能已断开——多连接下必须按目标 handle 判定存活）
+            auto write_frame = [self, rx, bad](
+                                   caf::io::connection_handle h,
+                                   const std::string& frame) {
+                if (h.invalid() || !rx->count(h) || bad->count(h))
                     return;
+                self->write(h, caf::make_span(
+                                   reinterpret_cast<const std::byte*>(
+                                       frame.data()),
+                                   frame.size()));
+                self->flush(h);
+            };
+
+            auto send_handshake = [self, write_frame](
+                                      caf::io::connection_handle h) {
                 // char* 迭代器不能直接构造 vector<std::byte>（隐式转换
                 // 不存在）——先分配再 memcpy。
                 const size_t hlen = std::strlen(k_handshake_json);
@@ -107,26 +122,24 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                 std::memcpy(body.data(), k_handshake_json, hlen);
                 auto pkg = PomeloCodec::encode_pkg(
                     PomeloCodec::kPkgHandshake, body);
-                self->write(*current,
-                            caf::make_span(pkg.data(), pkg.size()));
-                self->flush(*current);
+                auto frame = frame_string(PomeloCodec::kPkgHandshake, body);
+                write_frame(h, frame);
             };
 
             return caf::behavior{
-                [self, rx, bad, current, ready,
+                [self, rx, bad, ready,
                  send_handshake](caf::io::new_connection_msg& msg) {
                     self->configure_read(
                         msg.handle, caf::io::receive_policy::at_least(1));
-                    *current = msg.handle;
                     (*rx)[msg.handle].clear();
                     bad->erase(msg.handle);
-                    *ready = false;
+                    (*ready)[msg.handle] = false;
                     LOG_INFO("[Pomelo] new connection: "
                              + std::to_string(msg.handle.id()));
-                    send_handshake();
+                    send_handshake(msg.handle);
                 },
-                [self, rx, bad, current, ready, registry, routes,
-                 node_name](caf::io::new_data_msg& msg) {
+                [self, rx, bad, ready, registry, routes, node_name,
+                 write_frame](caf::io::new_data_msg& msg) {
                     if (bad->count(msg.handle))
                         return;
                     auto& buf = (*rx)[msg.handle];
@@ -134,19 +147,12 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     LOG_INFO("[Pomelo] rx " + std::to_string(msg.buf.size())
                              + "B from " + std::to_string(msg.handle.id()));
 
-                    auto respond_err = [self, current](
+                    // 本连接的响应写回（REQUEST/未知 route 错误响应用）
+                    auto respond_err = [self, rx, bad, write_frame](
+                                           caf::io::connection_handle h,
                                            std::uint32_t id,
                                            const std::string& text) {
-                        if (current->invalid())
-                            return;
-                        auto frame = response_frame(id, text);
-                        self->write(
-                            *current,
-                            caf::make_span(
-                                reinterpret_cast<const std::byte*>(
-                                    frame.data()),
-                                frame.size()));
-                        self->flush(*current);
+                        write_frame(h, response_frame(id, text));
                     };
 
                     while (true) {
@@ -157,6 +163,7 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         if (consumed < 0) {
                             bad->insert(msg.handle);
                             rx->erase(msg.handle);
+                            ready->erase(msg.handle);
                             LOG_WARN("[Pomelo] protocol error, closing conn "
                                      + std::to_string(msg.handle.id()));
                             break;
@@ -164,21 +171,17 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         buf.erase(buf.begin(), buf.begin() + consumed);
 
                         if (pkg.type == PomeloCodec::kPkgHandshakeAck) {
-                            *ready = true;
-                            LOG_INFO("[Pomelo] handshake ack, DATA ready");
+                            (*ready)[msg.handle] = true;
+                            LOG_INFO("[Pomelo] conn "
+                                     + std::to_string(msg.handle.id())
+                                     + " handshake ack, DATA ready");
                             continue;
                         }
                         if (pkg.type == PomeloCodec::kPkgHeartbeat) {
-                            // 心跳互答（空 body）
-                            auto frame = frame_string(
-                                PomeloCodec::kPkgHeartbeat, {});
-                            self->write(
-                                *current,
-                                caf::make_span(
-                                    reinterpret_cast<const std::byte*>(
-                                        frame.data()),
-                                    frame.size()));
-                            self->flush(*current);
+                            // 心跳互答（空 body）回【本连接】
+                            write_frame(
+                                msg.handle,
+                                frame_string(PomeloCodec::kPkgHeartbeat, {}));
                             continue;
                         }
                         if (pkg.type != PomeloCodec::kPkgData) {
@@ -193,26 +196,28 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                             || !msg2.valid) {
                             bad->insert(msg.handle);
                             rx->erase(msg.handle);
+                            ready->erase(msg.handle);
                             LOG_WARN("[Pomelo] bad message frame, closing");
                             break;
                         }
 
                         if (msg2.type == PomeloCodec::kMsgRequest) {
-                            // REQUEST：route 查表 → 内部 envelope 调用
+                            // REQUEST：route 查表 → 内部 envelope 调用，
+                            // 响应写回【发起连接 msg.handle】
                             auto it = routes.find(msg2.route);
                             if (it == routes.end()) {
                                 LOG_WARN("[Pomelo] unknown route: "
                                          + msg2.route);
-                                respond_err(msg2.id,
+                                respond_err(msg.handle, msg2.id,
                                             "unknown route: " + msg2.route);
                                 continue;
                             }
                             std::string svc, function;
                             if (!split_svc_function(it->second, svc,
                                                     function)) {
-                                respond_err(
-                                    msg2.id,
-                                    "bad route target: " + it->second);
+                                respond_err(msg.handle, msg2.id,
+                                            "bad route target: "
+                                                + it->second);
                                 continue;
                             }
                             std::string body(
@@ -224,21 +229,29 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                             const std::string r = msg2.route;
                             const std::string s = svc;
                             const std::string f = function;
-                            LOG_INFO("[Pomelo] REQUEST id="
+                            LOG_INFO("[Pomelo] conn "
+                                     + std::to_string(msg.handle.id())
+                                     + " REQUEST id="
                                      + std::to_string(msg2.id) + " route="
                                      + r + " svc=" + s + " function=" + f
                                      + " len="
                                      + std::to_string(body.size()));
+                            const caf::io::connection_handle src =
+                                msg.handle;
                             self->request(registry, std::chrono::seconds(2),
                                           resolve_atom_v, svc)
                                 .then(
-                                    [self, registry, svc, function, body,
-                                     msg_id = msg2.id, respond_err](
+                                    [self, rx, write_frame, src, svc,
+                                     function, body,
+                                     msg_id = msg2.id](
                                         caf::actor& proxy) {
                                         if (!proxy) {
-                                            respond_err(
-                                                msg_id,
-                                                "service not found: " + svc);
+                                            write_frame(
+                                                src,
+                                                response_frame(
+                                                    msg_id,
+                                                    "service not found: "
+                                                        + svc));
                                             return;
                                         }
                                         plugin_envelope env;
@@ -254,22 +267,31 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                             proxy, std::chrono::seconds(5),
                                             std::move(env))
                                             .then(
-                                                [msg_id, respond_err](
-                                                    std::string& r) {
-                                                    respond_err(msg_id,
-                                                                std::move(r));
+                                                [rx, write_frame, src,
+                                                 msg_id](std::string& r2) {
+                                                    write_frame(
+                                                        src,
+                                                        response_frame(
+                                                            msg_id,
+                                                            std::move(r2)));
                                                 },
-                                                [msg_id, respond_err](
-                                                    caf::error& e) {
-                                                    respond_err(
-                                                        msg_id,
-                                                        caf::to_string(e));
+                                                [rx, write_frame, src,
+                                                 msg_id](caf::error& e) {
+                                                    write_frame(
+                                                        src,
+                                                        response_frame(
+                                                            msg_id,
+                                                            caf::to_string(
+                                                                e)));
                                                 });
                                     },
-                                    [msg_id = msg2.id, respond_err](
-                                        caf::error& e) {
-                                        respond_err(msg_id,
-                                                    caf::to_string(e));
+                                    [rx, write_frame, src,
+                                     msg_id = msg2.id](caf::error& e) {
+                                        write_frame(
+                                            src,
+                                            response_frame(msg_id,
+                                                           caf::to_string(
+                                                               e)));
                                     });
                         } else if (msg2.type == PomeloCodec::kMsgNotify) {
                             // NOTIFY：单向 envelope（fire-and-forget）
@@ -293,8 +315,10 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                             const std::string r = msg2.route;
                             const std::string s = svc;
                             const std::string f = function;
-                            LOG_INFO("[Pomelo] NOTIFY route=" + r + " svc="
-                                     + s + " function=" + f + " len="
+                            LOG_INFO("[Pomelo] conn "
+                                     + std::to_string(msg.handle.id())
+                                     + " NOTIFY route=" + r + " svc=" + s
+                                     + " function=" + f + " len="
                                      + std::to_string(body.size()));
                             self->request(registry, std::chrono::seconds(2),
                                           resolve_atom_v, svc)
@@ -325,21 +349,20 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         }
                     }
                 },
-                [self, rx, bad, current](caf::io::connection_closed_msg& msg) {
+                [self, rx, bad, ready](caf::io::connection_closed_msg& msg) {
                     rx->erase(msg.handle);
                     bad->erase(msg.handle);
-                    if (!current->invalid() && *current == msg.handle)
-                        *current = caf::io::connection_handle{};
+                    ready->erase(msg.handle);
+                    LOG_INFO("[Pomelo] connection closed: "
+                             + std::to_string(msg.handle.id()));
                 },
-                [self, current](write_atom, const std::string& data) {
-                    // 备用写通道（v1 单连接语义）
-                    if (!current->invalid()) {
-                        self->write(*current,
-                                    caf::make_span(
-                                        reinterpret_cast<const std::byte*>(
-                                            data.data()),
-                                        data.size()));
-                        self->flush(*current);
+                [self, rx, write_frame](write_atom,
+                                        const std::string& data) {
+                    // 备用写通道：写最近存活连接（当前无外部调用者，
+                    // 外部交互全走 REQUEST/NOTIFY 响应路径）
+                    if (!rx->empty()) {
+                        auto h = rx->rbegin()->first; // map 有序：最大 id
+                        write_frame(h, data);
                     }
                 },
                 [self](caf::io::data_transferred_msg&) {
