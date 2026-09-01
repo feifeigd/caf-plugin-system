@@ -240,9 +240,10 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
     auto bridge = sys.spawn(
         [registry, broker_ref, impl](caf::stateful_actor<BridgeState>* self) {
             return caf::behavior{
-                // 外部进程发来的
+                // 外部进程发来的（行协议 CALL → 协议号翻译 → 内部信封调用）
                 [self, registry, broker_ref](ext_call_atom, int id,
                                              const std::string& svc,
+                                             std::uint16_t proto,
                                              const std::string& payload) {
                     auto respond = [broker_ref, id](bool ok,
                                                     std::string body) {
@@ -253,27 +254,55 @@ caf::actor spawn_bridge_actor(caf::actor_system& sys, caf::actor registry,
                                                        body.size())
                                                + body + "\n");
                     };
+                    // 外部协议号是服务契约（不暴露内部函数名）：resolve 后
+                    // 查服务协议表，proto → function，再以 MFA 信封调用。
                     self->request(registry, std::chrono::seconds(2),
                                   resolve_atom_v, svc)
                         .then(
-                            [self, svc, payload,
+                            [self, registry, svc, proto, payload,
                              respond](caf::actor& proxy) {
                                 if (!proxy) {
                                     respond(false,
                                             "service not found: " + svc);
                                     return;
                                 }
-                                plugin_envelope env;
-                                env.sub_proto = k_bridge_sub_proto;
-                                // 外部桥接的 payload 是长度前缀的任意字节，不可
-                                // 假定其为 UTF-8 JSON。
-                                env.format = payload_format::raw;
-                                env.payload = string_to_bytes(payload);
-                                self->request(proxy, std::chrono::seconds(5),
-                                              std::move(env))
+                                self->request(registry, std::chrono::seconds(2),
+                                              protocols_atom_v, svc)
                                     .then(
-                                        [respond](std::string& r) {
-                                            respond(true, std::move(r));
+                                        [self, proxy, svc, proto, payload,
+                                         respond](
+                                            const external_protocol_table&
+                                                table) {
+                                            auto it = table.find(proto);
+                                            if (it == table.end()) {
+                                                respond(false,
+                                                        "unknown protocol "
+                                                            + std::to_string(
+                                                                  proto)
+                                                            + " for " + svc);
+                                                return;
+                                            }
+                                            plugin_envelope env;
+                                            env.function = it->second;
+                                            // 外部桥接的 payload 是长度前缀的
+                                            // 任意字节，不可假定其为 UTF-8 JSON。
+                                            env.format = payload_format::raw;
+                                            env.payload =
+                                                string_to_bytes(payload);
+                                            self->request(
+                                                proxy, std::chrono::seconds(5),
+                                                std::move(env))
+                                                .then(
+                                                    [respond](std::string& r) {
+                                                        respond(
+                                                            true,
+                                                            std::move(r));
+                                                    },
+                                                    [respond](caf::error& e) {
+                                                        respond(
+                                                            false,
+                                                            caf::to_string(e));
+                                                    });
                                         },
                                         [respond](caf::error& e) {
                                             respond(false,

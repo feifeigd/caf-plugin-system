@@ -7,7 +7,7 @@
 //
 // 脚本约定（.ts 侧，与 .lua/.py 对齐）：
 //   const plugin = { name, version, provides, deps }
-//   function on_init(manager) / on_call(sub_proto, payload) / on_string(cmd)
+//   function on_init(manager) / on_call(fn, payload) / on_string(cmd)
 //   function on_save() / on_restore(state_str) / on_shutdown()
 //
 // 桥接 API（脚本全局可用）：log / call / call_string / config / self_name / now。
@@ -54,14 +54,16 @@ namespace {
 PLUGIN_CONFIG(TS_FIELDS)
 #undef TS_FIELDS
 
-// 保留的宿主管理子协议号（走 plugin_envelope，发给 ts_host_service）
-constexpr uint16_t ts_reload_sub_proto = 1;
+// 宿主管理方法名（走 plugin_envelope，发给 ts_host_service）
+//   "reload"：payload = 脚本服务名 → 重载
+constexpr std::string_view k_reload_function = "reload";
 
 struct ScriptManifest {
     std::string name;
     std::string version;
     std::string provides;
     std::vector<std::string> deps;
+    external_protocol_table protocols;  // 外部协议号→function 契约表
 };
 
 enum class ScriptOp { Init, Call, String, Save, Restore, Shutdown };
@@ -111,7 +113,7 @@ thread_local ScriptState* g_current_script = nullptr;
 std::pair<bool, std::string> call_service(caf::actor_system& sys,
                                           caf::actor registry,
                                           const std::string& service,
-                                          uint16_t sub_proto,
+                                          const std::string& function,
                                           const std::string& payload) {
     caf::scoped_actor self{sys};
     caf::actor proxy;
@@ -122,7 +124,7 @@ std::pair<bool, std::string> call_service(caf::actor_system& sys,
     if (!proxy)
         return {false, "service not found: " + service};
 
-    auto env = plugin_wire::encode_text(sub_proto, payload);
+    auto env = plugin_wire::encode_text(function, payload);
     if (!env)
         return {false, "unsupported payload format"};
 
@@ -189,20 +191,21 @@ static JSValue js_call(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     if (argc < 3)
         return JS_UNDEFINED;
     const char* service = JS_ToCString(ctx, argv[0]);
-    int sub_proto = 0;
-    JS_ToInt32(ctx, &sub_proto, argv[1]);
+    const char* function = JS_ToCString(ctx, argv[1]);
     const char* payload = JS_ToCString(ctx, argv[2]);
 
     bool ok = false;
     std::string reply;
-    if (g_current_script && g_current_script->sys && service && payload)
+    if (g_current_script && g_current_script->sys && service && function
+        && payload)
         std::tie(ok, reply) = call_service(*g_current_script->sys,
                                            g_current_script->registry, service,
-                                           static_cast<uint16_t>(sub_proto), payload);
+                                           function, payload);
     else
         reply = "no script context";
 
     if (service) JS_FreeCString(ctx, service);
+    if (function) JS_FreeCString(ctx, function);
     if (payload) JS_FreeCString(ctx, payload);
 
     JSValue obj = JS_NewObject(ctx);
@@ -314,6 +317,39 @@ void read_manifest(ScriptState& st) {
             }
         }
         JS_FreeValue(ctx, deps);
+
+        // 外部协议表：protocols = {1: "echo"} —— 外部协议号 → function
+        JSValue protos = JS_GetPropertyStr(ctx, plugin, "protocols");
+        if (JS_IsObject(protos)) {
+            JSPropertyEnum* tab = nullptr;
+            uint32_t n = 0;
+            if (JS_GetOwnPropertyNames(ctx, &tab, &n, protos,
+                                       JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)
+                == 0) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    JSValue k = JS_AtomToString(ctx, tab[i].atom);
+                    JSValue v = JS_GetProperty(ctx, protos, tab[i].atom);
+                    if (JS_IsString(k) && JS_IsString(v)) {
+                        const char* ks = JS_ToCString(ctx, k);
+                        const char* vs = JS_ToCString(ctx, v);
+                        if (ks && vs) {
+                            char* endp = nullptr;
+                            auto num = std::strtoul(ks, &endp, 10);
+                            if (endp != ks && *endp == '\0' && num <= 0xFFFF)
+                                st.manifest.protocols.emplace(
+                                    static_cast<std::uint16_t>(num),
+                                    std::string(vs));
+                        }
+                        if (ks) JS_FreeCString(ctx, ks);
+                        if (vs) JS_FreeCString(ctx, vs);
+                    }
+                    JS_FreeValue(ctx, k);
+                    JS_FreeValue(ctx, v);
+                }
+                js_free(ctx, tab);
+            }
+        }
+        JS_FreeValue(ctx, protos);
     }
     JS_FreeValue(ctx, plugin);
     JS_FreeValue(ctx, global);
@@ -378,7 +414,7 @@ void run_job(ScriptState& st, ScriptJob& job) {
                     job.done_str("unsupported payload format");
                 break;
             }
-            JSValue av[2] = { JS_NewInt32(ctx, static_cast<int>(job.env.sub_proto)),
+            JSValue av[2] = { JS_NewString(ctx, job.env.function.c_str()),
                               JS_NewString(ctx, payload->c_str()) };
             std::string out = call_str("on_call", 2, av);
             JS_FreeValue(ctx, av[0]);
@@ -663,7 +699,7 @@ public:
                 }
                 auto child = spawn_script_actor(self->system(), st);
                 self->send(registry, register_atom{}, st->self_name, child,
-                           "TsHostPlugin");
+                           "TsHostPlugin", st->manifest.protocols);
                 (*instances)[st->self_name] = {child, path};
                 self->send(child, init_atom{}, caf::actor{self}, std::string{});
                 LOG_INFO_SELF(self, "script loaded: {} (service={}, deps={})",
@@ -732,7 +768,7 @@ public:
                     return names;
                 },
                 [=](plugin_envelope env) {
-                    if (env.sub_proto != ts_reload_sub_proto)
+                    if (env.function != k_reload_function)
                         return;
                     if (auto service_name = plugin_wire::decode_text(env))
                         reload_script(self, *service_name);

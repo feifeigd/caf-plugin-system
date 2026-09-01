@@ -9,6 +9,7 @@ var plugin = {
   version: "1.0",
   provides: "echo_service",
   deps: [],
+  protocols: { 1: "echo" },   // 外部协议号 1 → 内部 function "echo"
 };
 
 let counter = 0;
@@ -17,12 +18,12 @@ function on_init(manager: string): void {
   log("INFO", "echo script initialized, manager=" + manager);
 }
 
-function on_call(sub_proto: number, payload: string): string {
+function on_call(fn: string, payload: string): string {
   counter++;
-  if (sub_proto === 1) {
+  if (fn === "echo") {
     return "echo:" + counter + ":" + payload;
   }
-  return "unknown sub_proto=" + sub_proto;
+  return "unknown function=" + fn;
 }
 
 function on_string(cmd: string): string {

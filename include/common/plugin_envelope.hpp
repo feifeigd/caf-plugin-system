@@ -113,16 +113,16 @@ encode_text(std::string_view function, std::string_view text,
     env.function = std::string(function);
     env.format = format;
     env.version = version;
-    env.args.assign(reinterpret_cast<const std::byte*>(text.data()),
-                    reinterpret_cast<const std::byte*>(text.data()) + text.size());
+    env.payload.assign(reinterpret_cast<const std::byte*>(text.data()),
+                       reinterpret_cast<const std::byte*>(text.data()) + text.size());
     return env;
 }
 
 inline std::optional<std::string> decode_text(const plugin_envelope& env) {
     if (!is_text_format(env.format))
         return std::nullopt;
-    return std::string(reinterpret_cast<const char*>(env.args.data()),
-                       env.args.size());
+    return std::string(reinterpret_cast<const char*>(env.payload.data()),
+                       env.payload.size());
 }
 
 } // namespace plugin_wire

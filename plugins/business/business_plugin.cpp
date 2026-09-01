@@ -30,11 +30,10 @@ extern "C" PLUGIN_API void register_meta_objects() {
     caf::detail::set_global_meta_objects(1000, caf::make_span(xs));
 }
 
-// 信封子协议号：插件自行编号即可，别的插件用同样的号也不冲突——
-// 信封的命名空间是"插件 × 子协议号"（见 common/plugin_envelope.hpp 利弊说明）
-constexpr std::uint16_t biz_env_hello = 1;
-// 子协议号 2 由热更新的 v2 新增：走信封加协议不需要新 type_id/元对象注册
-constexpr std::uint16_t biz_env_v2_ping = 2;
+// 信封方法名（MFA 的 F）：插件内部函数字符串，不占号段、可读性好
+inline constexpr const char* k_biz_fn_hello = "hello";
+// 方法 "v2_ping" 由热更新的 v2 新增：走信封加方法不需要新 type_id/元对象注册
+inline constexpr const char* k_biz_fn_v2_ping = "v2_ping";
 
 // BIZ_HOT_V2 由 CMake 的 business_plugin_v2 目标定义：同一份源码编出
 // 热更新演示用的 v2（旁路加载到新路径，行为差异即"新代码已生效"的证据）
@@ -73,39 +72,36 @@ public:
                 [=](biz_ping_atom) {
                     LOG_INFO_SELF(self, "Private meta round-trip OK");
                 },
-                // 信封 handler：失去类型匹配，统一入口 + 手工 switch 二级分发，
+                // 信封 handler：失去类型匹配，统一入口 + 手工分支二级分发，
                 // 这正是 plugin_envelope.hpp 头注释里"弊"的具体样子
                 [=](const plugin_envelope& env) {
-                    switch (env.sub_proto) {
-                        case biz_env_hello: {
-                            auto text = plugin_wire::decode_text(env);
-                            if (!text) {
-                                LOG_WARN_SELF(self, "Unsupported envelope format: {}",
-                                              static_cast<int>(env.format));
-                                if (self->current_message_id().is_request())
-                                    self->make_response_promise<std::string>()
-                                        .deliver("unsupported payload format");
-                                break;
-                            }
-                            LOG_INFO_SELF(self, "Envelope round-trip OK: {}", *text);
-                            // 响应式：request 调用方（如跨节点 RemoteCaller）
-                            // 拿回执；纯 send 调用无副作用（void handler）
-                            if (self->current_message_id().is_request()) {
-                                auto rp = self->make_response_promise<std::string>();
-                                rp.deliver("cross-ok:" + *text);
-                            }
-                            break;
+                    if (env.function == k_biz_fn_hello) {
+                        auto text = plugin_wire::decode_text(env);
+                        if (!text) {
+                            LOG_WARN_SELF(self, "Unsupported envelope format: {}",
+                                          static_cast<int>(env.format));
+                            if (self->current_message_id().is_request())
+                                self->make_response_promise<std::string>()
+                                    .deliver("unsupported payload format");
+                            return;
                         }
+                        LOG_INFO_SELF(self, "Envelope round-trip OK: {}", *text);
+                        // 响应式：request 调用方（如跨节点 RemoteCaller）
+                        // 拿回执；纯 send 调用无副作用（void handler）
+                        if (self->current_message_id().is_request()) {
+                            auto rp = self->make_response_promise<std::string>();
+                            rp.deliver("cross-ok:" + *text);
+                        }
+                    }
 #ifdef BIZ_HOT_V2
-                        case biz_env_v2_ping:
-                            // 热更新新增的子协议号：走信封不需要新 type_id/元对象注册
-                            LOG_INFO_SELF(self, "v2 envelope pong (hot-added sub_proto=2)");
-                            break;
+                    else if (env.function == k_biz_fn_v2_ping) {
+                        // 热更新新增的方法：走信封不需要新 type_id/元对象注册
+                        LOG_INFO_SELF(self, "v2 envelope pong (hot-added function=v2_ping)");
+                    }
 #endif
-                        default:
-                            LOG_INFO_SELF(self, "Unknown envelope sub_proto={}",
-                                     static_cast<int>(env.sub_proto));
-                            break;
+                    else {
+                        LOG_INFO_SELF(self, "Unknown envelope function={}",
+                                      env.function);
                     }
                 },
                 [=](const std::string& cmd) -> std::string {
@@ -138,7 +134,7 @@ public:
                     // 方式二·公共信封：不占号段、不用自注册，但载荷要自己编码
                     {
                         if (auto env = plugin_wire::encode_text(
-                                biz_env_hello, "hello-envelope"))
+                                k_biz_fn_hello, "hello-envelope"))
                             self->send(self, std::move(*env));
                     }
                 },

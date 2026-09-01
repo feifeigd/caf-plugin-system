@@ -7,6 +7,7 @@ plugin = {
     "version": "1.0",
     "provides": "echo_service",
     "deps": [],   # 可选依赖的服务名列表（bridge.call 可直接调用）
+    "protocols": {1: "echo"},   # 外部协议号 1 → 内部 function "echo"
 }
 
 counter = 0
@@ -16,12 +17,12 @@ def on_init(manager):
     log("INFO", "echo script initialized, manager=" + str(manager))
 
 
-def on_call(sub_proto, payload):
+def on_call(function, payload):
     global counter
     counter = counter + 1
-    if sub_proto == 1:
+    if function == "echo":
         return "echo:" + str(counter) + ":" + payload
-    return "unknown sub_proto=" + str(sub_proto)
+    return "unknown function=" + str(function)
 
 
 def on_string(cmd):

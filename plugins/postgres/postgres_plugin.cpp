@@ -544,23 +544,19 @@ public:
                     enqueue_tx(tx, std::move(job));
                 },
                 // 跨节点信封入口（RemoteCaller 直接把 plugin_envelope 发给
-                // 目标服务，见 remote_caller.cpp do_call）。子协议号插件自管：
-                //   1 = hello：回显 pg:hello:<payload>（跨节点链路自检）
+                // 目标服务，见 remote_caller.cpp do_call）。方法名插件自管：
+                //   "hello"：回显 pg:hello:<payload>（跨节点链路自检）
                 [=](plugin_envelope env) -> caf::result<std::string> {
-                    switch (env.sub_proto) {
-                    case 1: {
+                    if (env.function == "hello") {
                         auto in = plugin_wire::decode_text(env);
                         if (!in)
                             return caf::make_error(caf::sec::invalid_argument,
                                                    "pg_service: unsupported payload format");
                         return std::string("pg:hello:") + *in;
                     }
-                    default:
-                        return caf::make_error(
-                            caf::sec::invalid_argument,
-                            "pg_service: unknown sub_proto: "
-                                + std::to_string(env.sub_proto));
-                    }
+                    return caf::make_error(
+                        caf::sec::invalid_argument,
+                        "pg_service: unknown function: " + env.function);
                 },
             };
 

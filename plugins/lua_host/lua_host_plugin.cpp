@@ -8,7 +8,7 @@
 // 脚本约定（可选定义）：
 //   plugin = { name=..., version=..., provides="服务名", deps={...} }
 //   function on_init(manager) ... end          -- 初始化（可 bridge.call 依赖服务）
-//   function on_call(sub_proto, payload) return "..." end  -- envelope 业务入口
+//   function on_call(fn, payload) return "..." end  -- envelope 业务入口（fn=方法名）
 //   function on_string(cmd) return "..." end               -- 字符串命令入口
 //   function on_save() return "状态串" end
 //   function on_restore(state_str) ... end
@@ -16,7 +16,7 @@
 //
 // 桥接 API（脚本全局可用）：
 //   log(level, msg)
-//   call(service, sub_proto, payload) -> ok, reply   -- 同步阻塞调用服务
+//   call(service, fn, payload) -> ok, reply   -- 同步阻塞调用服务（MFA 语义）
 //   call_string(service, cmd) -> ok, reply
 //   config(key) -> value
 //   self_name() -> 服务名
@@ -66,8 +66,9 @@ namespace {
 PLUGIN_CONFIG(LUA_FIELDS)
 #undef LUA_FIELDS
 
-// 保留的宿主管理子协议号（走 plugin_envelope，发给 lua_host_service）
-constexpr uint16_t lua_reload_sub_proto = 1;   // payload = 脚本服务名 → 重载
+// 宿主管理方法名（走 plugin_envelope，发给 lua_host_service）
+//   "reload"：payload = 脚本服务名 → 重载
+constexpr std::string_view k_reload_function = "reload";
 
 // 脚本清单（从 Lua `plugin` 表读取）
 struct ScriptManifest {
@@ -75,6 +76,7 @@ struct ScriptManifest {
     std::string version;
     std::string provides;
     std::vector<std::string> deps;
+    external_protocol_table protocols;  // 外部协议号→function 契约表
 };
 
 // ---- Job 与队列（复用 templates/job_queue.hpp 的阻塞 worker 模型）----
@@ -125,7 +127,7 @@ struct ScriptState {
 std::pair<bool, std::string> call_service(caf::actor_system& sys,
                                           caf::actor registry,
                                           const std::string& service,
-                                          uint16_t sub_proto,
+                                          const std::string& function,
                                           const std::string& payload) {
     caf::scoped_actor self{sys};
     caf::actor proxy;
@@ -136,7 +138,7 @@ std::pair<bool, std::string> call_service(caf::actor_system& sys,
     if (!proxy)
         return {false, "service not found: " + service};
 
-    auto env = plugin_wire::encode_text(sub_proto, payload);
+    auto env = plugin_wire::encode_text(function, payload);
     if (!env)
         return {false, "unsupported payload format"};
 
@@ -210,12 +212,12 @@ void bind_bridge(sol::state& L, ScriptState* st) {
                            "[lua] " + msg);
     });
     L.set_function("call",
-                   [st](const std::string& service, uint16_t sub_proto,
+                   [st](const std::string& service, const std::string& function,
                         const std::string& payload) {
                        if (!st->sys)
                            return std::make_pair(false, std::string("no system"));
                        return call_service(*st->sys, st->registry, service,
-                                           sub_proto, payload);
+                                           function, payload);
                    });
     L.set_function("call_string",
                    [st](const std::string& service, const std::string& cmd) {
@@ -253,6 +255,14 @@ void read_manifest(sol::state& L, ScriptManifest& m,
             if (kv.second.is<std::string>())
                 m.deps.push_back(kv.second.as<std::string>());
     }
+    // 外部协议表：protocols = {1 = "echo"} —— 外部协议号 → function
+    if (auto protos = (*pt)["protocols"].get<sol::optional<sol::table>>()) {
+        for (const auto& kv : *protos)
+            if (kv.first.is<int>() && kv.second.is<std::string>())
+                m.protocols.emplace(
+                    static_cast<std::uint16_t>(kv.first.as<int>()),
+                    kv.second.as<std::string>());
+    }
 }
 
 /// 执行单个 job 的 Lua 逻辑（在 worker 线程调用）。
@@ -278,7 +288,7 @@ void run_job(ScriptState& st, ScriptJob& job) {
             std::string out;
             auto f = lua_fn(L, "on_call");
             if (f.valid()) {
-                auto r = f(static_cast<uint16_t>(job.env.sub_proto), *payload);
+                auto r = f(job.env.function, *payload);
                 if (!r.valid()) { sol::error e = r; throw std::runtime_error(e.what()); }
                 out = first_string(r);
             }
@@ -558,7 +568,7 @@ public:
                 }
                 auto child = spawn_script_actor(self->system(), st);
                 self->send(registry, register_atom{}, st->self_name, child,
-                           "LuaHostPlugin");
+                           "LuaHostPlugin", st->manifest.protocols);
                 (*instances)[st->self_name] = {child, path};
                 // 触发子脚本 on_init（框架只对 PluginManager 加载的插件发
                 // init_atom，子脚本是宿主直接 spawn 的，须宿主补发）
@@ -647,9 +657,9 @@ public:
                         names.push_back(service_name);
                     return names;
                 },
-                // 管理信封：sub_proto=1 → 重载脚本（payload = 服务名）
+                // 管理信封：function="reload" → 重载脚本（payload = 服务名）
                 [=](plugin_envelope env) {
-                    if (env.sub_proto != lua_reload_sub_proto)
+                    if (env.function != k_reload_function)
                         return;
                     if (auto service_name = plugin_wire::decode_text(env))
                         reload_script(self, *service_name);

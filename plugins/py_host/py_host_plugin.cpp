@@ -11,15 +11,16 @@
 // 脚本可互相重叠）。子解释器（PEP 684 每解释器 GIL，真并行）留后续。
 //
 // 脚本约定（.py 侧，与 .lua 对齐）：
-//   plugin = {"name":..., "version":..., "provides":..., "deps":[...]}
+//   plugin = {"name":..., "version":..., "provides":..., "deps":[...],
+//             "protocols": {外部协议号: function名}}   # protocols 可选
 //   def on_init(manager): ...
-//   def on_call(sub_proto, payload): return "..."    # envelope 业务入口
+//   def on_call(function, payload): return "..."      # envelope 业务入口
 //   def on_string(cmd): return "..."
 //   def on_save(): return "状态串"
 //   def on_restore(state_str): ...
 //   def on_shutdown(): ...
-//
 // 桥接 API（脚本全局可用）：log / call / call_string / config / self_name / now。
+//   call(service, function, payload) -> (ok, reply)   # MFA 语义同步调用
 //
 // 关键决策：
 //   - 零新 type_id / 免 register_meta_objects：全程 plugin_envelope(228) +
@@ -87,8 +88,9 @@ namespace {
 PLUGIN_CONFIG(PY_FIELDS)
 #undef PY_FIELDS
 
-// 保留的宿主管理子协议号（走 plugin_envelope，发给 py_host_service）
-constexpr uint16_t py_reload_sub_proto = 1;   // payload = 脚本服务名 → 重载
+// 宿主管理方法名（走 plugin_envelope，发给 py_host_service）
+//   "reload"：payload = 脚本服务名 → 重载
+constexpr std::string_view k_reload_function = "reload";
 
 // 脚本清单（从 Python `plugin` dict 读取）
 struct ScriptManifest {
@@ -96,6 +98,7 @@ struct ScriptManifest {
     std::string version;
     std::string provides;
     std::vector<std::string> deps;
+    external_protocol_table protocols;  // 外部协议号→function 契约表
 };
 
 // ---- Job 与队列（复用 templates/job_queue.hpp 的阻塞 worker 模型）----
@@ -147,7 +150,7 @@ thread_local ScriptState* g_current_script = nullptr;
 std::pair<bool, std::string> call_service(caf::actor_system& sys,
                                           caf::actor registry,
                                           const std::string& service,
-                                          uint16_t sub_proto,
+                                          const std::string& function,
                                           const std::string& payload) {
     caf::scoped_actor self{sys};
     caf::actor proxy;
@@ -158,7 +161,7 @@ std::pair<bool, std::string> call_service(caf::actor_system& sys,
     if (!proxy)
         return {false, "service not found: " + service};
 
-    auto env = plugin_wire::encode_text(sub_proto, payload);
+    auto env = plugin_wire::encode_text(function, payload);
     if (!env)
         return {false, "unsupported payload format"};
 
@@ -222,9 +225,9 @@ static PyObject* py_log(PyObject*, PyObject* args) {
 
 static PyObject* py_call(PyObject*, PyObject* args) {
     const char* service = nullptr;
-    int sub_proto = 0;
+    const char* function = nullptr;
     const char* payload = nullptr;
-    if (!PyArg_ParseTuple(args, "sis", &service, &sub_proto, &payload))
+    if (!PyArg_ParseTuple(args, "sss", &service, &function, &payload))
         return nullptr;
     if (!g_current_script || !g_current_script->sys) {
         PyErr_SetString(PyExc_RuntimeError, "no script context");
@@ -234,7 +237,7 @@ static PyObject* py_call(PyObject*, PyObject* args) {
     std::string reply;
     Py_BEGIN_ALLOW_THREADS
     auto r = call_service(*g_current_script->sys, g_current_script->registry,
-                          service, static_cast<uint16_t>(sub_proto), payload);
+                          service, function, payload);
     ok = r.first;
     reply = std::move(r.second);
     Py_END_ALLOW_THREADS
@@ -289,7 +292,7 @@ static PyObject* py_now(PyObject*, PyObject*) {
 static PyMethodDef bridge_methods[] = {
     {"log", py_log, METH_VARARGS, "log(level, msg)"},
     {"call", py_call, METH_VARARGS,
-     "call(service, sub_proto, payload) -> (ok, reply)"},
+     "call(service, function, payload) -> (ok, reply)"},
     {"call_string", py_call_string, METH_VARARGS,
      "call_string(service, cmd) -> (ok, reply)"},
     {"config", py_config, METH_VARARGS, "config(key) -> value"},
@@ -323,10 +326,39 @@ void read_manifest(ScriptState& st) {
         st.manifest.provides = PyUnicode_AsUTF8(provides);
     PyObject* deps = PyDict_GetItemString(plugin, "deps");
     if (deps && PyList_Check(deps)) {
-        for (Py_ssize_t i = 0; i < PyList_Size(deps); ++i) {
+        Py_ssize_t n = PyList_Size(deps);
+        for (Py_ssize_t i = 0; i < n; ++i) {
             PyObject* d = PyList_GetItem(deps, i);
             if (d && PyUnicode_Check(d))
                 st.manifest.deps.push_back(PyUnicode_AsUTF8(d));
+        }
+    }
+    // 外部协议表："protocols": {"1": "echo"} 或 {1: "echo"} —— 外部客户端
+    // 用协议号调用（bridge 翻译成 function），函数名不上线。
+    PyObject* protocols = PyDict_GetItemString(plugin, "protocols");
+    if (protocols && PyDict_Check(protocols)) {
+        PyObject *key = nullptr, *val = nullptr;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(protocols, &pos, &key, &val)) {
+            if (!key || !val || !PyUnicode_Check(val))
+                continue;
+            if (PyLong_Check(key)) {
+                long k = PyLong_AsLong(key);
+                if (k < 0 || k > 0xFFFF)
+                    continue;
+                st.manifest.protocols.emplace(
+                    static_cast<std::uint16_t>(k), PyUnicode_AsUTF8(val));
+                continue;
+            }
+            if (!PyUnicode_Check(key))
+                continue;
+            const char* ks = PyUnicode_AsUTF8(key);
+            char* endp = nullptr;
+            auto num = std::strtoul(ks, &endp, 10);
+            if (endp == ks || *endp != '\0' || num > 0xFFFF)
+                continue;
+            st.manifest.protocols.emplace(static_cast<std::uint16_t>(num),
+                                          PyUnicode_AsUTF8(val));
         }
     }
 }
@@ -359,8 +391,7 @@ void run_job(ScriptState& st, ScriptJob& job) {
             PyObject* f = PyDict_GetItemString(st.module_dict, "on_call");
             if (f && PyCallable_Check(f)) {
                 PyObject* r = PyObject_CallFunction(
-                    f, "is", static_cast<int>(job.env.sub_proto),
-                    payload->c_str());
+                    f, "ss", job.env.function.c_str(), payload->c_str());
                 if (r) {
                     if (PyUnicode_Check(r))
                         out = PyUnicode_AsUTF8(r);
@@ -768,7 +799,7 @@ public:
                 }
                 auto child = spawn_script_actor(self->system(), st);
                 self->send(registry, register_atom{}, st->self_name, child,
-                           "PythonHostPlugin");
+                           "PythonHostPlugin", st->manifest.protocols);
                 (*instances)[st->self_name] = {child, path};
                 self->send(child, init_atom{}, caf::actor{self}, std::string{});
                 LOG_INFO_SELF(self, "script loaded: {} (service={}, deps={})",
@@ -838,7 +869,7 @@ public:
                     return names;
                 },
                 [=](plugin_envelope env) {
-                    if (env.sub_proto != py_reload_sub_proto)
+                    if (env.function != k_reload_function)
                         return;
                     if (auto service_name = plugin_wire::decode_text(env))
                         reload_script(self, *service_name);
@@ -921,6 +952,7 @@ public:
     }
 };
 
+
 extern "C" PLUGIN_API PluginEntry* create_plugin() {
     return new PythonHostPlugin();
 }
@@ -934,3 +966,4 @@ extern "C" PLUGIN_API void destroy_plugin(PluginEntry* p) {
     // 先于 down_msg），python_ready 已 false，无需兜底。
     delete p;
 }
+

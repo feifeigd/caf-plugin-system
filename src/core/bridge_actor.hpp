@@ -13,8 +13,8 @@
 //   bridge → 外部:  REQ <rid> <len>\n<payload>\n         集群→外部请求
 //   外部 → bridge:  RESULT <rid> OK|ERR <len>\n<payload>\n REQ 的响应
 //
-// payload 语义：CALL 的 payload 被包成 plugin_envelope{sub_proto=1,
-// payload} 发给目标服务（与跨节点信封同语义）；REQ 的 payload 是
+// payload 语义：CALL 的协议号经服务契约表翻译成 function，payload 被
+// 包成 plugin_envelope{function, payload} 发给目标服务（与跨节点信封同语义）；REQ 的 payload 是
 // external_echo 服务收到的信封载荷原样，外部回 RESULT 后由 bridge
 // 作为该调用的响应（std::string）返回给集群内调用方。
 //

@@ -8,8 +8,8 @@
 //   - 四个插件提供不同服务名（redis_service / mysql_service /
 //     pg_service / mongo_service），消息类型统一，调用方代码一次写通；
 //   - db_result 的 cell 全字符串化（JDBC 风格）：避免类型注册地狱，
-//     且天然可序列化 → 跨节点调用可直接塞 plugin_envelope（sub_proto
-//     由各插件自管编码）。
+//     且天然可序列化 → 跨节点调用可直接塞 plugin_envelope（function
+//     由各插件自管命名）。
 //
 // 事务：tx_handle = uint64（CAF 内置类型，无需注册）。v1 语义：
 //   - MySQL/PG：begin 时从连接池借一条连接并标记占用（按调用方

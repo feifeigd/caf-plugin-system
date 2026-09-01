@@ -196,7 +196,7 @@ caf::behavior PluginManager::make_behavior() {
         //     且 LoadLibrary 对同路径返回缓存的旧模块，拿不到新代码；
         //   - 不能调用新 DLL 的 register_meta_objects：号段在启动时已注册，
         //     重复注册同一段 CAF 直接 abort。因此热更新不能引入未注册的
-        //     新 type_id——新协议请走信封 sub_proto（无需新 ID）；
+        //     新 type_id——新方法请走信封 function（无需新 ID）；
         //   - 旧 DLL 常驻句柄池不卸载（actor vtable 在 DLL 代码段，
         //     CAF 异步释放引用，FreeLibrary 过早会崩）。
         [=, this](reload_atom, const std::string& name, const std::string& path)

@@ -23,8 +23,8 @@ namespace caf_plugin_system {
 
 namespace {
 
-/// business 插件信封子协议：hello（跨节点验证载荷，见 business_plugin.cpp）。
-constexpr std::uint16_t k_env_hello = 1;
+/// business 插件信封方法名：hello（跨节点验证载荷，见 business_plugin.cpp）。
+inline constexpr const char* k_env_hello = "hello";
 
 } // namespace
 
@@ -109,7 +109,7 @@ void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
                      });
         // v2 热更新新增的私有子协议号：走公共信封，无需新 type_id
         plugin_envelope env;
-        env.sub_proto = 2;
+        env.function = "v2_ping";
         self->send(biz, env);
     }
 }
@@ -138,9 +138,9 @@ void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
         return;
     }
 
-    // 信封调用：sub_proto=1 → 脚本 on_call(sub_proto, payload)
+    // 信封调用：function="echo" → 脚本 on_call(fn, payload)
     plugin_envelope env;
-    env.sub_proto = 1;
+    env.function = "echo";
     const char* text = "ping";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                       reinterpret_cast<const std::byte*>(text)
@@ -164,7 +164,7 @@ void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
                                << caf::to_string(e) << std::endl;
                  });
 
-    // 热更验证：发管理信封（sub_proto=1）给 lua_host_service 触发 echo.lua
+    // 热更验证：发管理信封（function="reload"）给 lua_host_service 触发 echo.lua
     // 重载，再调 echo_service——若状态交接正确，counter 应从 2 续到 3
     //（"echo:3:ping"）；若状态丢失则重置回 1（"echo:1:ping"）。echo_proxy 经
     // resume 切到新实例，同一句柄继续可用（quiesce 期调用会进缓冲后冲刷）。
@@ -174,7 +174,7 @@ void run_lua_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
                  [](caf::error&) {});
     if (host_proxy) {
         plugin_envelope reload_env;
-        reload_env.sub_proto = 1;
+        reload_env.function = "reload";
         const char* svc = "echo_service";
         reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
                                  reinterpret_cast<const std::byte*>(svc)
@@ -218,7 +218,7 @@ void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
     }
 
     plugin_envelope env;
-    env.sub_proto = 1;
+    env.function = "echo";
     const char* text = "ping";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                       reinterpret_cast<const std::byte*>(text)
@@ -241,7 +241,7 @@ void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
                                << caf::to_string(e) << std::endl;
                  });
 
-    // 热更：发管理信封（sub_proto=1）给 py_host_service 触发 echo.py 重载，
+    // 热更：发管理信封（function="reload"）给 py_host_service 触发 echo.py 重载，
     // 再调 echo_service——状态交接正确则 counter 从 2 续到 3（"echo:3:ping"）。
     caf::actor host_proxy;
     self->request(fw.registry, caf::infinite, resolve_atom{}, "py_host_service")
@@ -249,7 +249,7 @@ void run_py_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
                  [](caf::error&) {});
     if (host_proxy) {
         plugin_envelope reload_env;
-        reload_env.sub_proto = 1;
+        reload_env.function = "reload";
         const char* svc = "echo_service";
         reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
                                  reinterpret_cast<const std::byte*>(svc)
@@ -293,7 +293,7 @@ void run_ts_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
     }
 
     plugin_envelope env;
-    env.sub_proto = 1;
+    env.function = "echo";
     const char* text = "ping";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                       reinterpret_cast<const std::byte*>(text)
@@ -322,7 +322,7 @@ void run_ts_script_test(caf::actor_system& sys, const BootstrapResult& fw) {
                  [](caf::error&) {});
     if (host_proxy) {
         plugin_envelope reload_env;
-        reload_env.sub_proto = 1;
+        reload_env.function = "reload";
         const char* svc = "echo_service";
         reload_env.payload.assign(reinterpret_cast<const std::byte*>(svc),
                                  reinterpret_cast<const std::byte*>(svc)
@@ -354,7 +354,7 @@ void run_cross_call_test(caf::actor_system& sys, caf::actor master,
                          const std::string& actor_name) {
     auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
     plugin_envelope env;
-    env.sub_proto = k_env_hello;
+    env.function = k_env_hello;
     const char* text = "cross";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                        reinterpret_cast<const std::byte*>(text)
@@ -405,7 +405,7 @@ void run_cross_call_ex_test(caf::actor_system& sys, caf::actor master,
                             const std::string& actor_name) {
     auto caller = cluster::spawn_remote_caller(sys, master, local_node_name);
     plugin_envelope env;
-    env.sub_proto = k_env_hello;
+    env.function = k_env_hello;
     const char* text = "cross";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                        reinterpret_cast<const std::byte*>(text)
@@ -445,7 +445,7 @@ void run_bridge_call_test(caf::actor_system& sys, caf::actor master,
     if (shutdown_mgr)
         caf::anon_send(shutdown_mgr, register_cluster_atom_v, caller);
     plugin_envelope env;
-    env.sub_proto = k_env_hello;
+    env.function = k_env_hello;
     const char* text = "bridge-ping";
     env.payload.assign(reinterpret_cast<const std::byte*>(text),
                        reinterpret_cast<const std::byte*>(text)
