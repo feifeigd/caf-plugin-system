@@ -43,10 +43,11 @@ find_package(CAF REQUIRED COMPONENTS core)
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 
-# 启用 CAF 框架日志（所有级别）
-add_compile_definitions(CAF_LOG_LEVEL=CAF_LOG_LEVEL_DEBUG)
-find_package(spdlog CONFIG REQUIRED)
-find_package(fmt CONFIG REQUIRED)
+# CAF 内部 Debug 日志只在 Debug 配置编译。Release/RelWithDebInfo 不定义
+# CAF_LOG_LEVEL，避免把框架调度级日志字符串与分支带进生产二进制。
+add_compile_definitions(
+    $<$<CONFIG:Debug>:CAF_LOG_LEVEL=CAF_LOG_LEVEL_DEBUG>
+)
 
 # Core library + Main executable
 add_subdirectory(src)
