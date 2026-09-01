@@ -208,41 +208,45 @@ void backdoor_unload_plugin(caf::actor_system& sys, const app_config& cfg,
 }
 
 /// Pomelo 出站 PUSH 验证后门（--test-pomelo-push）：延迟 3s 后
-/// resolve("pomelo_push") 发 envelope（function=game.event 作为外部
-/// PUSH route，payload=hello-push），验证集群 → 客户端主动推送链路。
+/// resolve("pomelo_push") 推两次——先定向 uid=player-1
+///（game.event=private-msg），再广播（game.event=broadcast-msg）。
+/// 验证定向投递 + 广播两条链路。
 void backdoor_pomelo_push(caf::actor_system& sys, const app_config& cfg,
                           const BootstrapResult& fw) {
     if (!cfg.test_pomelo_push)
         return;
     std::thread([&sys, registry = fw.registry]() {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        caf::scoped_actor self{sys};
-        self->request(registry, std::chrono::seconds(2),
-                      resolve_atom_v, std::string("pomelo_push"))
-            .receive(
-                [&](caf::actor& proxy) {
-                    if (!proxy) {
-                        std::cout << "[PomeloPush] resolve failed"
+        auto push_once = [&](const std::string& payload) {
+            caf::scoped_actor self{sys};
+            self->request(registry, std::chrono::seconds(2),
+                          resolve_atom_v, std::string("pomelo_push"))
+                .receive(
+                    [&](caf::actor& proxy) {
+                        if (!proxy) {
+                            std::cout << "[PomeloPush] resolve failed"
+                                      << std::endl;
+                            return;
+                        }
+                        plugin_envelope env;
+                        env.function = "game.event";
+                        env.format = payload_format::raw;
+                        // string → vector<std::byte> 需显式转换
+                        env.payload.resize(payload.size());
+                        std::memcpy(env.payload.data(),
+                                    payload.data(), payload.size());
+                        caf::anon_send(proxy, std::move(env));
+                        std::cout << "[PomeloPush] pushed: " << payload
                                   << std::endl;
-                        return;
-                    }
-                    plugin_envelope env;
-                    env.function = "game.event";
-                    env.format = payload_format::raw;
-                    const std::string body = "hello-push";
-                    // string → vector<std::byte> 需显式转换
-                    env.payload.resize(body.size());
-                    std::memcpy(env.payload.data(), body.data(),
-                                body.size());
-                    caf::anon_send(proxy, std::move(env));
-                    std::cout
-                        << "[PomeloPush] pushed game.event=hello-push"
-                        << std::endl;
-                },
-                [](caf::error& e) {
-                    std::cout << "[PomeloPush] resolve error: "
-                              << caf::to_string(e) << std::endl;
-                });
+                    },
+                    [](caf::error& e) {
+                        std::cout << "[PomeloPush] resolve error: "
+                                  << caf::to_string(e) << std::endl;
+                    });
+        };
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        push_once("{\"uid\":\"player-1\",\"body\":\"private-msg\"}");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        push_once("broadcast-msg");
     }).detach();
 }
 

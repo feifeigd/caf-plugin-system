@@ -150,12 +150,13 @@ std::string WsCodec::handshake_response(const std::string& key) {
     return resp;
 }
 
-long WsCodec::parse_frame(const std::vector<std::byte>& buf,
-                          ParsedFrame& out) {
+long WsCodec::parse_frame(const std::string& buf, ParsedFrame& out) {
     if (buf.size() < 2)
         return 0;
-    const std::uint8_t b0 = static_cast<std::uint8_t>(buf[0]);
-    const std::uint8_t b1 = static_cast<std::uint8_t>(buf[1]);
+    const std::uint8_t b0 =
+        static_cast<std::uint8_t>(static_cast<unsigned char>(buf[0]));
+    const std::uint8_t b1 =
+        static_cast<std::uint8_t>(static_cast<unsigned char>(buf[1]));
     out.fin = (b0 & 0x80) != 0;
     out.opcode = b0 & 0x0F;
     const bool masked = (b1 & 0x80) != 0;
@@ -164,8 +165,8 @@ long WsCodec::parse_frame(const std::vector<std::byte>& buf,
     if (len == 126) {
         if (buf.size() < 4)
             return 0;
-        len = (std::uint64_t(static_cast<std::uint8_t>(buf[2])) << 8)
-            | std::uint64_t(static_cast<std::uint8_t>(buf[3]));
+        len = (std::uint64_t(static_cast<unsigned char>(buf[2])) << 8)
+            | std::uint64_t(static_cast<unsigned char>(buf[3]));
         off = 4;
     } else if (len == 127) {
         if (buf.size() < 10)
@@ -173,7 +174,8 @@ long WsCodec::parse_frame(const std::vector<std::byte>& buf,
         len = 0;
         for (int i = 0; i < 8; ++i)
             len = (len << 8)
-                | std::uint64_t(static_cast<std::uint8_t>(buf[2 + i]));
+                | std::uint64_t(
+                      static_cast<unsigned char>(buf[2 + i]));
         off = 10;
     }
     if (len > 64u * 1024u * 1024u)
@@ -182,46 +184,48 @@ long WsCodec::parse_frame(const std::vector<std::byte>& buf,
     if (masked) {
         if (buf.size() < off + 4)
             return 0;
-        std::memcpy(mask_key, buf.data() + off, 4);
+        for (int i = 0; i < 4; ++i)
+            mask_key[i] =
+                static_cast<unsigned char>(buf[off + i]);
         off += 4;
     }
     if (buf.size() < off + len)
         return 0;
     out.payload.resize(static_cast<size_t>(len));
     for (size_t i = 0; i < len; ++i) {
-        std::byte v = buf[off + i];
+        unsigned char v = static_cast<unsigned char>(buf[off + i]);
         if (masked)
-            v ^= std::byte(mask_key[i & 3]);
-        out.payload[i] = v;
+            v ^= mask_key[i & 3];
+        out.payload[i] = static_cast<char>(v);
     }
     return static_cast<long>(off + len);
 }
 
-std::vector<std::byte> WsCodec::encode_frame(
-    std::uint8_t opcode, const std::vector<std::byte>& payload) {
-    std::vector<std::byte> out;
-    out.push_back(std::byte(0x80 | (opcode & 0x0F))); // FIN=1
+std::string WsCodec::encode_frame(std::uint8_t opcode,
+                                  const std::string& payload) {
+    std::string out;
+    out.push_back(static_cast<char>(0x80 | (opcode & 0x0F))); // FIN=1
     const size_t len = payload.size();
     if (len < 126) {
-        out.push_back(std::byte(len)); // 服务器不 mask
+        out.push_back(static_cast<char>(len)); // 服务器不 mask
     } else if (len < 65536) {
-        out.push_back(std::byte(126));
-        out.push_back(std::byte((len >> 8) & 0xFF));
-        out.push_back(std::byte(len & 0xFF));
+        out.push_back(static_cast<char>(126));
+        out.push_back(static_cast<char>((len >> 8) & 0xFF));
+        out.push_back(static_cast<char>(len & 0xFF));
     } else {
-        out.push_back(std::byte(127));
+        out.push_back(static_cast<char>(127));
         for (int i = 7; i >= 0; --i)
-            out.push_back(std::byte((len >> (8 * i)) & 0xFF));
+            out.push_back(
+                static_cast<char>((len >> (8 * i)) & 0xFF));
     }
-    out.insert(out.end(), payload.begin(), payload.end());
+    out += payload;
     return out;
 }
 
-bool WsCodec::looks_like_http_upgrade(const std::vector<std::byte>& buf) {
+bool WsCodec::looks_like_http_upgrade(const std::string& buf) {
     if (buf.size() < 4)
         return false;
-    const char* p = reinterpret_cast<const char*>(buf.data());
-    return std::memcmp(p, "GET ", 4) == 0;
+    return std::memcmp(buf.data(), "GET ", 4) == 0;
 }
 
 } // namespace caf_plugin_system

@@ -10,6 +10,8 @@
 #include <caf/all.hpp>
 #include <caf/actor_registry.hpp>
 #include <caf/io/all.hpp>
+#include <caf/json_object.hpp>
+#include <caf/json_value.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -24,27 +26,59 @@ namespace caf_plugin_system {
 namespace {
 
 // ------------------------------------------------------------------
-// HANDSHAKE 载荷（服务器 → 客户端；客户端解析 code==200 后回 ACK）
+// HANDSHAKE 响应载荷（服务器 → 客户端；客户端解析 code==200 后回 ACK）
 // 最小合法体：sys.heartbeat 告诉客户端心跳间隔，客户端自动互答。
+// 编译期生成完整 Package 帧（type=1 + 3B 长度 + JSON body），运行时
+// 只做一次 string 转换（Meyers 静态），每次握手零重复打包。
 // ------------------------------------------------------------------
-constexpr std::string_view k_handshake_json =
+constexpr std::string_view k_handshake_body =
     "{\"code\":200,\"sys\":{\"heartbeat\":60}}";
 
-// 编码一帧写回客户端：Package(DATA, Message(...))
-std::string frame_string(std::uint8_t pkg_type,
-                         const std::vector<std::byte>& msg) {
-    auto pkg = PomeloCodec::encode_pkg(pkg_type, msg);
-    std::string s;
-    s.resize(pkg.size());
-    std::memcpy(s.data(), pkg.data(), pkg.size());
+struct HsFrame {
+    // 帧字节全为 ASCII（type/长度头 + JSON body）——char 数组便于
+    // 直接构造 string（std::copy 免 byte↔char 转换）。
+    char data[4 + 128]; // 4B 头 + body（预留，实际长度由 size 定）
+    size_t size = 0;
+};
+
+constexpr HsFrame make_hs_frame() {
+    HsFrame f{};
+    f.size = 4 + k_handshake_body.size();
+    f.data[0] = static_cast<char>(PomeloCodec::kPkgHandshake);
+    const size_t n = k_handshake_body.size();
+    f.data[1] = static_cast<char>((n >> 16) & 0xFF);
+    f.data[2] = static_cast<char>((n >> 8) & 0xFF);
+    f.data[3] = static_cast<char>(n & 0xFF);
+    for (size_t i = 0; i < n; ++i)
+        f.data[4 + i] = static_cast<char>(k_handshake_body[i]);
+    return f;
+}
+
+constexpr HsFrame k_hs_frame = make_hs_frame();
+
+// 完整握手帧（string 形态，Meyers 静态：进程内只构造一次）。
+// 帧内容编译期生成（constexpr 循环——C++17 的 std::copy 非 constexpr，
+// 编译期求值只能用循环）；运行时转 string 用 std::copy，零重复打包。
+const std::string& hs_frame_string() {
+    static const std::string s = [] {
+        std::string out;
+        out.reserve(k_hs_frame.size);
+        std::copy(k_hs_frame.data, k_hs_frame.data + k_hs_frame.size,
+                  std::back_inserter(out));
+        return out;
+    }();
     return s;
 }
 
+// 编码一帧写回客户端：Package(DATA, Message(...))——string 直通零转换
+std::string frame_string(std::uint8_t pkg_type,
+                         const std::string& msg) {
+    return PomeloCodec::encode_pkg(pkg_type, msg);
+}
+
 std::string response_frame(std::uint32_t id, const std::string& body) {
-    std::vector<std::byte> bytes(body.size());
-    std::memcpy(bytes.data(), body.data(), body.size());
     auto msg = PomeloCodec::encode_msg(id, PomeloCodec::kMsgResponse, "",
-                                       bytes);
+                                       body);
     return frame_string(PomeloCodec::kPkgData, msg);
 }
 
@@ -103,8 +137,10 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
 
     // ---- impl：出站 PUSH 服务（集群 → 客户端主动推送）----
     // 注册为服务 "pomelo_push"：调用方发 plugin_envelope，function =
-    // 外部 PUSH route（客户端在听的频道名），payload = 推送内容。
-    // 转发给 broker 广播（PUSH 帧，无 id）。
+    // 外部 PUSH route（客户端在听的频道名）。payload 约定 JSON：
+    //   {"uid":"player-1","body":"..."} → 定向推给该 uid 的连接
+    //   {"body":"..."} 或纯文本 → 广播给所有已握手连接
+    // 转发给 broker（定向走 write_atom+uid，广播走 write_atom）。
     auto impl = sys.spawn(
         [broker_ref](caf::event_based_actor* self) {
             return caf::behavior{
@@ -113,23 +149,44 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         LOG_WARN("[Pomelo] push with empty route, ignored");
                         return;
                     }
-                    // byte 迭代器不能直接构造 string（无隐式转换）
-                    std::string body(
+                    std::string payload(
                         reinterpret_cast<const char*>(
                             env.payload.data()),
                         env.payload.size());
+                    // 解析 JSON payload：uid 目标 + body 内容
+                    std::string uid, body;
+                    if (auto jv = caf::json_value::parse(payload)) {
+                        if (jv->is_object()) {
+                            auto u = jv->to_object().value("uid");
+                            if (u.is_string())
+                                uid = std::string(u.to_string());
+                            auto b = jv->to_object().value("body");
+                            if (b.is_string())
+                                body = std::string(b.to_string());
+                        }
+                    }
+                    if (body.empty())
+                        body = payload; // 非 JSON：整体当内容
                     auto msg = PomeloCodec::encode_msg(
-                        0, PomeloCodec::kMsgPush, env.function,
-                        std::vector<std::byte>(env.payload.begin(),
-                                               env.payload.end()));
+                        0, PomeloCodec::kMsgPush, env.function, body);
                     auto frame = frame_string(PomeloCodec::kPkgData, msg);
                     auto strong =
                         caf::actor_cast<caf::actor>(*broker_ref);
-                    if (strong)
+                    if (!strong)
+                        return;
+                    if (!uid.empty()) {
+                        // 定向：写目标 uid 的连接
+                        caf::anon_send(strong, write_atom_v, uid,
+                                       std::move(frame));
+                        LOG_INFO("[Pomelo] push uid={} route={} len={}",
+                                 uid, env.function, body.size());
+                    } else {
+                        // 广播：所有已握手连接
                         caf::anon_send(strong, write_atom_v,
                                        std::move(frame));
-                    LOG_INFO("[Pomelo] push route={} len={}",
-                             env.function, body.size());
+                        LOG_INFO("[Pomelo] push broadcast route={} len={}",
+                                 env.function, body.size());
+                    }
                 }};
         });
 
@@ -153,7 +210,7 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
 
             // 每连接读缓冲（rx）；bad = 协议错误连接（忽略后续数据）
             auto rx = std::make_shared<std::map<
-                caf::io::connection_handle, std::vector<std::byte>>>();
+                caf::io::connection_handle, std::string>>();
             auto bad = std::make_shared<std::set<caf::io::connection_handle>>();
             // 每连接握手状态：false = 等 HANDSHAKE_ACK，true = DATA 就绪
             auto ready = std::make_shared<std::map<
@@ -167,17 +224,23 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                 caf::io::connection_handle, bool>>();
             // WS 分片合并（opcode 0 continuation 累积；首帧 opcode 记录）
             auto ws_frag = std::make_shared<std::map<
-                caf::io::connection_handle, std::vector<std::byte>>>();
+                caf::io::connection_handle, std::string>>();
             auto ws_frag_op = std::make_shared<std::map<
                 caf::io::connection_handle, std::uint8_t>>();
+            // 连接身份绑定：uid → connection（握手 user.uid 建立），
+            // 供定向 PUSH 投递；连接关闭时清理。
+            auto uid_map = std::make_shared<std::map<
+                std::string, caf::io::connection_handle>>();
 
-            // 裸写字节到连接（握手响应/非 WS 包装路径用）
+            // 裸写字节到连接（握手响应/非 WS 包装路径用）。
+            // CAF write 有 (handle, size, const void*) 重载——string
+            // 的 data() 直传，零转换。
             auto write_raw = [self, rx, bad](
                                  caf::io::connection_handle h,
-                                 const std::vector<std::byte>& bytes) {
+                                 const std::string& bytes) {
                 if (h.invalid() || !rx->count(h) || bad->count(h))
                     return;
-                self->write(h, caf::make_span(bytes.data(), bytes.size()));
+                self->write(h, bytes.size(), bytes.data());
                 self->flush(h);
             };
 
@@ -188,15 +251,13 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                    const std::string& frame) {
                 if (h.invalid() || !rx->count(h) || bad->count(h))
                     return;
-                std::vector<std::byte> bytes(frame.size());
-                std::memcpy(bytes.data(), frame.data(), frame.size());
                 if (transport->count(h)
                     && (*transport)[h] == Transport::Ws) {
                     auto ws = WsCodec::encode_frame(WsCodec::kOpBinary,
-                                                    bytes);
+                                                    frame);
                     write_raw(h, ws);
                 } else {
-                    write_raw(h, bytes);
+                    write_raw(h, frame);
                 }
             };
 
@@ -204,20 +265,39 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
             // TCP/WS 两传输解析出 Package 后都走这里（协议与通信分离）。
             auto handle_package =
                 [self, rx, bad, ready, transport, registry, routes,
+                 uid_map,
                  write_frame](caf::io::connection_handle h,
                               const PomeloCodec::ParsedPkg& pkg) {
                     if (pkg.type == PomeloCodec::kPkgHandshake) {
                         // 客户端主动握手（官方语义：pomelo-jsclient
-                        // connect 后先发 HANDSHAKE）→ 回 code:200 响应，
-                        // 客户端随后发 HANDSHAKE_ACK 进入 DATA。
-                        std::vector<std::byte> body(
-                            k_handshake_json.size());
-                        std::memcpy(body.data(), k_handshake_json.data(),
-                                    k_handshake_json.size());
-                        write_frame(
-                            h,
-                            frame_string(PomeloCodec::kPkgHandshake,
-                                         body));
+                        // connect 后先发 HANDSHAKE）→ 回 code:200 响应
+                        //（编译期生成的完整帧，零重复打包），客户端随后
+                        // 发 HANDSHAKE_ACK 进入 DATA。
+                        // 提取握手 user.uid（可选）→ uid_map 绑定，
+                        // 供定向 PUSH 投递。pkg.body 已是 string（二进制
+                        // 安全），直接解析。
+                        std::string uid;
+                        if (auto jv =
+                                caf::json_value::parse(pkg.body)) {
+                            if (jv->is_object()) {
+                                auto user =
+                                    jv->to_object().value("user");
+                                if (user.is_object()) {
+                                    auto u =
+                                        user.to_object().value("uid");
+                                    if (u.is_string())
+                                        uid = std::string(
+                                            u.to_string());
+                                }
+                            }
+                        }
+                        if (!uid.empty()) {
+                            (*uid_map)[uid] = h;
+                            LOG_INFO("[Pomelo] conn "
+                                     + std::to_string(h.id())
+                                     + " bound uid=" + uid);
+                        }
+                        write_frame(h, hs_frame_string());
                         LOG_INFO("[Pomelo] conn "
                                  + std::to_string(h.id())
                                  + " handshake request, code=200 sent");
@@ -276,10 +356,8 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                                    + it->second));
                             return;
                         }
-                        std::string body(
-                            reinterpret_cast<const char*>(
-                                msg2.body.data()),
-                            msg2.body.size());
+                        // body 已是 string；拷贝给 then 回调捕获
+                        std::string body = msg2.body;
                         // MSVC 对 LOG_* 宏参数里的 string 变量直接拼接
                         // 偶发推导失败（C2678/C2672）——先拷中间变量。
                         const std::string r = msg2.route;
@@ -360,10 +438,8 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                      + it->second);
                             return;
                         }
-                        std::string body(
-                            reinterpret_cast<const char*>(
-                                msg2.body.data()),
-                            msg2.body.size());
+                        // body 已是 string；拷贝给 then 回调捕获
+                        std::string body = msg2.body;
                         const std::string r = msg2.route;
                         const std::string s = svc;
                         const std::string f = function;
@@ -424,7 +500,10 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     if (bad->count(msg.handle))
                         return;
                     auto& buf = (*rx)[msg.handle];
-                    buf.insert(buf.end(), msg.buf.begin(), msg.buf.end());
+                    // msg.buf 是 byte_buffer = vector<std::byte>，显式转
+                    // char 后入 string 缓冲（仅此处一次转换）
+                    for (std::byte b : msg.buf)
+                        buf.push_back(static_cast<char>(b));
                     LOG_INFO("[Pomelo] rx " + std::to_string(msg.buf.size())
                              + "B from " + std::to_string(msg.handle.id()));
 
@@ -462,8 +541,7 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                     + std::to_string(msg.handle.id()));
                                 break;
                             }
-                            buf.erase(buf.begin(),
-                                      buf.begin() + consumed);
+                            buf.erase(0, static_cast<size_t>(consumed));
                             handle_package(msg.handle, pkg);
                         }
                         return;
@@ -472,17 +550,10 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     // ---- WS：先握手，再按 WS 帧解析 ----
                     if (!(*ws_hs_done)[msg.handle]) {
                         // 找完整 HTTP 头（\r\n\r\n）
-                        static const std::vector<std::byte> k_crlfcrlf = {
-                            std::byte('\r'), std::byte('\n'),
-                            std::byte('\r'), std::byte('\n')};
-                        auto it = std::search(
-                            buf.begin(), buf.end(),
-                            k_crlfcrlf.begin(), k_crlfcrlf.end());
-                        if (it == buf.end())
+                        auto hs_end = buf.find("\r\n\r\n");
+                        if (hs_end == std::string::npos)
                             return; // 头未完整，等更多数据
-                        std::string head(
-                            reinterpret_cast<const char*>(buf.data()),
-                            it + 4 - buf.begin());
+                        std::string head = buf.substr(0, hs_end + 4);
                         std::string key = extract_ws_key(head);
                         if (key.empty()) {
                             bad->insert(msg.handle);
@@ -495,12 +566,9 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                         }
                         std::string resp =
                             WsCodec::handshake_response(key);
-                        std::vector<std::byte> resp_bytes(resp.size());
-                        std::memcpy(resp_bytes.data(), resp.data(),
-                                    resp.size());
-                        write_raw(msg.handle, resp_bytes);
+                        write_raw(msg.handle, resp); // string 直传
                         (*ws_hs_done)[msg.handle] = true;
-                        buf.erase(buf.begin(), it + 4);
+                        buf.erase(0, hs_end + 4);
                         LOG_INFO("[Pomelo] conn "
                                  + std::to_string(msg.handle.id())
                                  + " WS handshake done");
@@ -522,7 +590,7 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                 + std::to_string(msg.handle.id()));
                             break;
                         }
-                        buf.erase(buf.begin(), buf.begin() + consumed);
+                        buf.erase(0, static_cast<size_t>(consumed));
 
                         if (frame.opcode == WsCodec::kOpPing) {
                             auto pong = WsCodec::encode_frame(
@@ -557,26 +625,22 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                 continue;
                             }
                             // 无分片：直接处理（有残留 frag 则合并）
-                            std::vector<std::byte> payload =
-                                std::move(frame.payload);
+                            std::string payload = frame.payload;
                             if (!(*ws_frag)[msg.handle].empty()) {
                                 payload.insert(
-                                    payload.begin(),
-                                    (*ws_frag)[msg.handle].begin(),
-                                    (*ws_frag)[msg.handle].end());
+                                    0, (*ws_frag)[msg.handle]);
                                 (*ws_frag)[msg.handle].clear();
                             }
                             // payload 内可能多个 Pomelo Package
-                            std::vector<std::byte> tmp =
-                                std::move(payload);
+                            std::string tmp = std::move(payload);
                             while (!tmp.empty()) {
                                 PomeloCodec::ParsedPkg pkg;
                                 long n = PomeloCodec::parse_pkg(
                                     tmp, pkg);
                                 if (n <= 0)
                                     break; // 残余忽略（坏帧防御）
-                                tmp.erase(tmp.begin(),
-                                          tmp.begin() + n);
+                                tmp.erase(0,
+                                          static_cast<size_t>(n));
                                 handle_package(msg.handle, pkg);
                             }
                             continue;
@@ -586,15 +650,11 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                             if (!(*ws_frag)[msg.handle].empty()) {
                                 auto& frag =
                                     (*ws_frag)[msg.handle];
-                                frag.insert(frag.end(),
-                                            frame.payload.begin(),
-                                            frame.payload.end());
+                                frag += frame.payload;
                                 if (frame.fin) {
-                                    std::vector<std::byte> payload =
+                                    std::string tmp =
                                         std::move(frag);
                                     (*ws_frag)[msg.handle].clear();
-                                    std::vector<std::byte> tmp =
-                                        std::move(payload);
                                     while (!tmp.empty()) {
                                         PomeloCodec::ParsedPkg pkg;
                                         long n =
@@ -602,8 +662,9 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                                                 tmp, pkg);
                                         if (n <= 0)
                                             break;
-                                        tmp.erase(tmp.begin(),
-                                                  tmp.begin() + n);
+                                        tmp.erase(
+                                            0,
+                                            static_cast<size_t>(n));
                                         handle_package(msg.handle,
                                                        pkg);
                                     }
@@ -617,7 +678,7 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     }
                 },
                 [self, rx, bad, ready, transport, ws_hs_done, ws_frag,
-                 ws_frag_op](caf::io::connection_closed_msg& msg) {
+                 ws_frag_op, uid_map](caf::io::connection_closed_msg& msg) {
                     rx->erase(msg.handle);
                     bad->erase(msg.handle);
                     ready->erase(msg.handle);
@@ -625,8 +686,28 @@ caf::actor spawn_pomelo_bridge(caf::actor_system& sys, caf::actor registry,
                     ws_hs_done->erase(msg.handle);
                     ws_frag->erase(msg.handle);
                     ws_frag_op->erase(msg.handle);
+                    // 清理该连接的 uid 绑定（定向 PUSH 不再投递）
+                    for (auto it = uid_map->begin();
+                         it != uid_map->end();) {
+                        if (it->second == msg.handle)
+                            it = uid_map->erase(it);
+                        else
+                            ++it;
+                    }
                     LOG_INFO("[Pomelo] connection closed: "
                              + std::to_string(msg.handle.id()));
+                },
+                [self, rx, ready, uid_map, write_frame](
+                    write_atom, std::string uid,
+                    const std::string& data) {
+                    // 定向 PUSH：写指定 uid 的连接
+                    auto it = uid_map->find(uid);
+                    if (it == uid_map->end()) {
+                        LOG_WARN("[Pomelo] push to unknown uid=" + uid
+                                 + ", dropped");
+                        return;
+                    }
+                    write_frame(it->second, data);
                 },
                 [self, rx, ready, write_frame](write_atom,
                                                 const std::string& data) {

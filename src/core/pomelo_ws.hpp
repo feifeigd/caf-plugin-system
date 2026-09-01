@@ -17,7 +17,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace caf_plugin_system {
 
@@ -40,19 +39,17 @@ struct WsCodec {
     struct ParsedFrame {
         bool fin = true;
         std::uint8_t opcode = 0;
-        std::vector<std::byte> payload;
+        std::string payload;
     };
-    static long parse_frame(const std::vector<std::byte>& buf,
-                            ParsedFrame& out);
+    static long parse_frame(const std::string& buf, ParsedFrame& out);
 
     /// 编码一帧（服务器 → 客户端，无 mask）。
-    static std::vector<std::byte> encode_frame(std::uint8_t opcode,
-                                               const std::vector<std::byte>&
-                                                   payload);
+    static std::string encode_frame(std::uint8_t opcode,
+                                    const std::string& payload);
 
     /// 判断缓冲头部是否以 HTTP 请求行开头（"GET "）——用于连接级
     /// transport 探测（同端口 TCP/WS 自动识别）。
-    static bool looks_like_http_upgrade(const std::vector<std::byte>& buf);
+    static bool looks_like_http_upgrade(const std::string& buf);
 };
 
 } // namespace caf_plugin_system
