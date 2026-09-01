@@ -1,0 +1,8 @@
+# 统一行尾为 LF（Windows/WSL 双环境检出一致，防行尾噪音 diff）
+# Windows Git 全局 autocrlf=true 会让工作区变 CRLF → WSL git 报全量 M
+# 本文件强制所有文本文件入库/检出均为 LF，无视两侧 autocrlf 设置
+* text=auto eol=lf
+
+# 批处理脚本保留 CRLF（cmd 兼容性，个别旧版 cmd 对 LF 批处理敏感）
+*.bat text eol=crlf
+*.cmd text eol=crlf
