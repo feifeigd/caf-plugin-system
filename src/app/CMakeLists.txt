@@ -28,5 +28,6 @@ endif()
 #（$ORIGIN 运行时按 exe 所在目录解析；拷贝部署不依赖 install 流程）
 if(UNIX)
     set_target_properties(caf_plugin_app PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "$ORIGIN/lib")
 endif()

@@ -1,0 +1,9 @@
+[project]
+name = "caf-py-host-runtime"
+version = "0.1.0"
+description = "Third-party Python dependencies for PythonHostPlugin"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false

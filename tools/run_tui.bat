@@ -3,12 +3,11 @@ title CAF TUI Console (interactive)
 cd /d "%~dp0.."
 
 echo ============================================
-echo  Copy latest exe + start bridge + TUI
+echo  Use staged Debug runtime + start bridge + TUI
 echo ============================================
-copy /y out\build\windows-x64\src\app\Debug\caf_plugin_app.exe run\ >nul
-if errorlevel 1 goto FAIL
+if not exist run\Debug\caf_plugin_app.exe goto FAIL
 
-cd /d run
+cd /d run\Debug
 start "CAF Bridge" cmd /c "(ping -n 181 127.0.0.1 >nul & echo x) | caf_plugin_app.exe --caf-plugin-system.bridge-port=48060"
 
 echo Wait 8s for bridge...
@@ -24,6 +23,6 @@ pause
 exit /b 0
 
 :FAIL
-echo COPY FAILED - exe may be RUNNING (quit TUI / close bridge first) or build missing
+echo Debug runtime missing - run cmake --build --preset windows-x64-debug first
 pause
 exit /b 1

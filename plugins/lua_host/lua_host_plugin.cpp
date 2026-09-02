@@ -20,7 +20,7 @@
 //   call_string(service, cmd) -> ok, reply
 //   config(key) -> value
 //   self_name() -> 服务名
-//   now() -> 毫秒时间戳
+//   标准库 os.time()/os.date() 自动读取统一业务时间偏移
 //
 // 关键决策：
 //   - 零新 type_id / 免 register_meta_objects：全程 plugin_envelope(228) +
@@ -32,6 +32,7 @@
 #include "plugin/plugin_interface.hpp"
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
+#include "services/time_service.hpp"
 #include "common/plugin_config.hpp"
 #include "common/plugin_envelope.hpp"
 #include "templates/job_queue.hpp"
@@ -233,12 +234,39 @@ void bind_bridge(sol::state& L, ScriptState* st) {
                            "caf-plugin-system.lua_host." + key, std::string{});
     });
     L.set_function("self_name", [st]() { return st->self_name; });
-    L.set_function("now", []() {
+    // 仅供下面的标准库 hook 捕获，安装后立即从脚本全局删除。
+    L.set_function("_caf_business_time_ms", []() {
         return static_cast<double>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
+                caf_plugin_system::business_now().time_since_epoch())
                 .count());
     });
+
+    auto hook = L.safe_script(R"lua(
+        local real_time = os.time
+        local real_date = os.date
+        local business_time_ms = _caf_business_time_ms
+        _caf_business_time_ms = nil
+
+        os.time = function(t)
+            if t ~= nil then
+                return real_time(t)
+            end
+            return math.floor(business_time_ms() / 1000)
+        end
+
+        os.date = function(fmt, t)
+            if t ~= nil then
+                return real_date(fmt, t)
+            end
+            return real_date(fmt, os.time())
+        end
+    )lua", sol::script_pass_on_error);
+    if (!hook.valid()) {
+        sol::error err = hook;
+        throw std::runtime_error(std::string("install Lua time hook failed: ")
+                                 + err.what());
+    }
 }
 
 /// 读脚本顶层的 `plugin` 表（manifest）。
@@ -422,7 +450,7 @@ std::shared_ptr<ScriptState> load_script_state(caf::actor_system& sys,
     st->registry = registry;
     st->lua = std::make_shared<sol::state>();
     st->lua->open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
-                            sol::lib::math, sol::lib::utf8);
+                            sol::lib::math, sol::lib::utf8, sol::lib::os);
     bind_bridge(*st->lua, st.get());
 
     auto result = st->lua->safe_script_file(path.string());

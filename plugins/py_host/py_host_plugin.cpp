@@ -19,7 +19,8 @@
 //   def on_save(): return "状态串"
 //   def on_restore(state_str): ...
 //   def on_shutdown(): ...
-// 桥接 API（脚本全局可用）：log / call / call_string / config / self_name / now。
+// 桥接 API（脚本全局可用）：log / call / call_string / config / self_name。
+// Python 标准库 time/datetime 的取当前时间入口由宿主自动 hook 到业务时间。
 //   call(service, function, payload) -> (ok, reply)   # MFA 语义同步调用
 //
 // 关键决策：
@@ -29,25 +30,19 @@
 //   - 单 worker 独占脚本模块：event actor 不阻塞，bridge.call 在 worker 线程
 //     阻塞 request（先释放 GIL），Lua 版同构。
 //
-// 运行时依赖部署（2026-08-31 定稿）：
-//   python 依赖全部随插件走（不进 lib/ 分类目录）：run/plugins/py_host/ 下
-//   放 python312_d.dll + python3_d.dll + Lib/（标准库，标准 <home>/Lib 布局）。
-//   启动必须设 PYTHONHOME=<插件目录>——CPython 3.12 Windows getpath 的
-//   prefix 取 exe 目录 / PYTHONHOME，stdlib 只认 <prefix>/Lib；DLL 目录
-//   混放 .py 不生效（init_fs_encoding 崩）。python312_d.dll 的 DLL 解析走
-//   framework_bootstrap 的 AddDllDirectory(plugins/*/)（USER_DIRS）。
+// 运行时依赖部署：
+//   vcpkg 提供解释器和标准库：run/<Config>/python*.dll + Lib/（Windows），
+//   或 run/<Config>/lib/libpython*.so + lib/python3.12/（Linux）。
 //
-//   业务脚本的第三方依赖（将来脚本 import requests/pydantic 等）：用 uv
-//   装进 Lib/site-packages/（PYTHONHOME 布局自动识别，site 模块自动入 path）：
-//     uv pip install --python <vcpkg tools\python3\python.exe> \
-//       --target run/plugins/py_host/Lib/site-packages <pkg>
-//   解释器本体必须 vcpkg debug 版（/MDd + python312_d.lib）；uv 只有 release
-//   版 CPython，CRT 不匹配且 Debug CRT 泄漏检测失效，不可用于解释器。
+//   第三方依赖只在 plugins/py_host/python/pyproject.toml 声明并由 uv.lock
+//   锁定；tools/sync_python_deps.* 将其安装到各配置的 Lib/site-packages。
+//   解释器本体仍必须使用 vcpkg 对应配置，不能由 uv 替换。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
+#include "services/time_service.hpp"
 #include "common/plugin_config.hpp"
 #include "common/plugin_envelope.hpp"
 #include "templates/job_queue.hpp"
@@ -282,11 +277,11 @@ static PyObject* py_self_name(PyObject*, PyObject*) {
     return PyUnicode_FromString(g_current_script->self_name.c_str());
 }
 
-static PyObject* py_now(PyObject*, PyObject*) {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now().time_since_epoch())
+static PyObject* py_business_time(PyObject*, PyObject*) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  caf_plugin_system::business_now().time_since_epoch())
                   .count();
-    return PyLong_FromLongLong(static_cast<long long>(ms));
+    return PyFloat_FromDouble(static_cast<double>(us) / 1'000'000.0);
 }
 
 static PyMethodDef bridge_methods[] = {
@@ -297,8 +292,11 @@ static PyMethodDef bridge_methods[] = {
      "call_string(service, cmd) -> (ok, reply)"},
     {"config", py_config, METH_VARARGS, "config(key) -> value"},
     {"self_name", py_self_name, METH_NOARGS, "self_name() -> name"},
-    {"now", py_now, METH_NOARGS, "now() -> ms"},
     {nullptr, nullptr, 0, nullptr}
+};
+
+static PyMethodDef business_time_method = {
+    "_caf_business_time", py_business_time, METH_NOARGS, nullptr
 };
 
 /// 把桥接函数注入脚本 globals（等价 lua_host 的 sol2 set_function）
@@ -308,6 +306,53 @@ void inject_bridge(PyObject* globals) {
         PyDict_SetItemString(globals, m->ml_name, fn);
         Py_DECREF(fn);
     }
+
+    PyObject* clock = PyCFunction_New(&business_time_method, nullptr);
+    PyDict_SetItemString(globals, "_caf_business_time", clock);
+    Py_DECREF(clock);
+
+    constexpr const char* hook = R"py(
+def _caf_install_time_hooks(_clock):
+    import time as _time
+    import datetime as _datetime
+
+    # 共享解释器中所有脚本共用标准库模块；热重载时不要重复套子类。
+    if getattr(_time, "_caf_business_time_hooked", False):
+        return
+
+    _time.time = _clock
+    _time.time_ns = lambda: int(_clock() * 1_000_000_000)
+    _time._caf_business_time_hooked = True
+
+    class _BusinessDateTime(_datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(_clock(), tz)
+
+        @classmethod
+        def utcnow(cls):
+            return cls.utcfromtimestamp(_clock())
+
+        @classmethod
+        def today(cls):
+            return cls.fromtimestamp(_clock())
+
+    class _BusinessDate(_datetime.date):
+        @classmethod
+        def today(cls):
+            return cls.fromtimestamp(_clock())
+
+    _datetime.datetime = _BusinessDateTime
+    _datetime.date = _BusinessDate
+
+_caf_install_time_hooks(_caf_business_time)
+del _caf_install_time_hooks
+del _caf_business_time
+)py";
+    PyObject* result = PyRun_String(hook, Py_file_input, globals, globals);
+    if (!result)
+        throw std::runtime_error("install Python time hooks failed");
+    Py_DECREF(result);
 }
 
 /// 读脚本 `plugin` dict（manifest）。须在持 GIL 下调用。

@@ -55,6 +55,140 @@ add_subdirectory(src)
 # Plugins
 add_subdirectory(plugins)
 
+# 跨平台运行目录自动组装。Debug/Release 严格隔离；脚本资源共享。
+# Windows DLL 与 EXE 同目录；Linux ELF 依赖集中在 lib/。
+if(WIN32 OR UNIX)
+    set(APP_RUN_ROOT "${CMAKE_SOURCE_DIR}/run")
+    set(APP_RUN_DIR "${APP_RUN_ROOT}/$<CONFIG>")
+    if(WIN32)
+        set(APP_NATIVE_LIB_DIR "${APP_RUN_DIR}")
+        set(RUNTIME_PLATFORM_KIND "WINDOWS")
+        set(PYTHON_STDLIB_DIR
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/python3/Lib")
+        set(VCPKG_RUNTIME_DIR
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/$<IF:$<CONFIG:Debug>,debug/bin,bin>")
+    else()
+        set(APP_NATIVE_LIB_DIR "${APP_RUN_DIR}/lib")
+        set(RUNTIME_PLATFORM_KIND "UNIX")
+        set(PYTHON_STDLIB_DIR
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/python3/lib/python3.12")
+        set(PYTHON_STDLIB_DEST "${APP_RUN_DIR}/lib/python3.12")
+        set(VCPKG_RUNTIME_DIR
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/$<IF:$<CONFIG:Debug>,debug/lib,lib>")
+    endif()
+    if(WIN32)
+        set(PYTHON_STDLIB_DEST "${APP_RUN_DIR}/Lib")
+    endif()
+
+    set(STAGED_PLUGIN_TARGETS
+        business_plugin
+        cluster_admin_plugin
+        lua_host_plugin
+        mongo_plugin
+        mysql_plugin
+        platform_plugin
+        postgres_plugin
+        py_host_plugin
+        redis_plugin
+        ts_host_plugin
+    )
+
+    add_custom_target(stage_run ALL
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "${APP_RUN_DIR}" "${APP_RUN_DIR}/updates"
+                "${APP_NATIVE_LIB_DIR}"
+                "${APP_RUN_ROOT}/shared/scripts/lua"
+                "${APP_RUN_ROOT}/shared/scripts/python"
+                "${APP_RUN_ROOT}/shared/scripts/typescript"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSOURCE_FILE=${CMAKE_SOURCE_DIR}/caf-application.conf"
+                "-DDEST_FILE=${APP_RUN_DIR}/caf-application.conf"
+                -P "${CMAKE_SOURCE_DIR}/cmake/write_runtime_config.cmake"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/examples/cluster/master.conf"
+                "${APP_RUN_DIR}/master.conf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/examples/cluster/worker-a.conf"
+                "${APP_RUN_DIR}/worker-a.conf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/examples/cluster/worker-b.conf"
+                "${APP_RUN_DIR}/worker-b.conf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:caf_plugin_app>" "${APP_RUN_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:caf_plugin_core>" "${APP_NATIVE_LIB_DIR}/"
+        # 拷贝 vcpkg 安装的运行时依赖库到本地运行目录，避免依赖系统环境
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSOURCE_DIR=${VCPKG_RUNTIME_DIR}"
+                "-DDEST_DIR=${APP_NATIVE_LIB_DIR}"
+                "-DPLATFORM_KIND=${RUNTIME_PLATFORM_KIND}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/copy_runtime_libraries.cmake"
+
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "${APP_RUN_DIR}/plugins/business"
+                "${APP_RUN_DIR}/plugins/cluster_admin"
+                "${APP_RUN_DIR}/plugins/lua_host"
+                "${APP_RUN_DIR}/plugins/mongo"
+                "${APP_RUN_DIR}/plugins/mysql"
+                "${APP_RUN_DIR}/plugins/platform"
+                "${APP_RUN_DIR}/plugins/postgres"
+                "${APP_RUN_DIR}/plugins/py_host"
+                "${APP_RUN_DIR}/plugins/redis"
+                "${APP_RUN_DIR}/plugins/ts_host"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:business_plugin>" "${APP_RUN_DIR}/plugins/business/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:cluster_admin_plugin>" "${APP_RUN_DIR}/plugins/cluster_admin/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:lua_host_plugin>" "${APP_RUN_DIR}/plugins/lua_host/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:mongo_plugin>" "${APP_RUN_DIR}/plugins/mongo/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:mysql_plugin>" "${APP_RUN_DIR}/plugins/mysql/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:platform_plugin>" "${APP_RUN_DIR}/plugins/platform/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:postgres_plugin>" "${APP_RUN_DIR}/plugins/postgres/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:py_host_plugin>" "${APP_RUN_DIR}/plugins/py_host/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:redis_plugin>" "${APP_RUN_DIR}/plugins/redis/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:ts_host_plugin>" "${APP_RUN_DIR}/plugins/ts_host/"
+
+        # 清理旧布局遗留的按配置脚本副本；脚本只保留 shared/ 一份。
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                "${APP_RUN_DIR}/plugins/lua_host/scripts"
+                "${APP_RUN_DIR}/plugins/py_host/scripts"
+                "${APP_RUN_DIR}/plugins/ts_host/scripts"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:business_plugin_v2>"
+                "${APP_RUN_DIR}/updates/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${CMAKE_SOURCE_DIR}/plugins/lua_host/scripts"
+                "${APP_RUN_ROOT}/shared/scripts/lua"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${CMAKE_SOURCE_DIR}/plugins/py_host/scripts"
+                "${APP_RUN_ROOT}/shared/scripts/python"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${PYTHON_STDLIB_DIR}"
+                "${PYTHON_STDLIB_DEST}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${CMAKE_SOURCE_DIR}/plugins/ts_host/scripts"
+                "${APP_RUN_ROOT}/shared/scripts/typescript"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/plugins/postgres/resource.json"
+                "${APP_RUN_DIR}/plugins/postgres/resource.json"
+        DEPENDS
+            caf_plugin_app
+            caf_plugin_core
+            business_plugin_v2
+            ${STAGED_PLUGIN_TARGETS}
+        COMMENT "Staging current $<CONFIG> runtime into ${APP_RUN_DIR}"
+        VERBATIM
+    )
+endif()
+
 # Tests
 enable_testing()
 add_subdirectory(tests)

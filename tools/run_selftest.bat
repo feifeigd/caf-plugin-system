@@ -3,15 +3,14 @@ title CAF Bridge Selftest (one-click)
 cd /d "%~dp0.."
 
 echo ============================================
-echo  [0/3] Copy latest exe to run\
+echo  [0/3] Use staged Debug runtime
 echo ============================================
-copy /y out\build\windows-x64\src\app\Debug\caf_plugin_app.exe run\ >nul
-if errorlevel 1 goto FAIL
+if not exist run\Debug\caf_plugin_app.exe goto FAIL
 
 echo ============================================
 echo  [1/3] Start standalone bridge (48060, 180s)
 echo ============================================
-cd /d run
+cd /d run\Debug
 start "CAF Bridge" cmd /c "(ping -n 181 127.0.0.1 >nul & echo x) | caf_plugin_app.exe --caf-plugin-system.bridge-port=48060"
 
 echo [2/3] Wait 8s for bridge...
@@ -29,6 +28,6 @@ pause
 exit /b 0
 
 :FAIL
-echo COPY FAILED - exe may be RUNNING (quit TUI / close bridge first) or build missing
+echo Debug runtime missing - run cmake --build --preset windows-x64-debug first
 pause
 exit /b 1

@@ -7,7 +7,8 @@
 function(apply_plugin_rpath target)
     if(UNIX)
         set_target_properties(${target} PROPERTIES
-            INSTALL_RPATH "$ORIGIN/../lib")
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "$ORIGIN/../../lib")
     endif()
 endfunction()
 

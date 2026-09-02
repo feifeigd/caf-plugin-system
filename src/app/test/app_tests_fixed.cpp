@@ -73,7 +73,11 @@ void run_smoke_tests(caf::actor_system& sys, const BootstrapResult& fw) {
     // BIZ_HOT_V2 编出，绕过 Windows 文件锁与 LoadLibrary 路径缓存）。
     self->request(fw.plugin_mgr, caf::infinite, reload_atom{},
                   std::string("BusinessPlugin"),
+#ifdef _WIN32
                   std::string("./updates/business_plugin_v2.dll"))
+#else
+                  std::string("./updates/libbusiness_plugin_v2.so"))
+#endif
         .receive([](bool ok) {
                      std::cout << "[HotUpdate] reload result: " << ok << std::endl;
                  },

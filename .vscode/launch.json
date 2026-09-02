@@ -5,11 +5,11 @@
       "name": "Debug master (cluster)",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/out/build/windows-x64/src/app/Debug/caf_plugin_app.exe",
+      "program": "${workspaceFolder}/run/Debug/caf_plugin_app.exe",
       "args": [
         "--config-file=master.conf"
       ],
-      "cwd": "${workspaceFolder}/out/build/windows-x64/run",
+      "cwd": "${workspaceFolder}/run/Debug",
       "console": "integratedTerminal",
       "preLaunchTask": "cmake-build-debug",
       "stopAtEntry": false,
@@ -19,11 +19,11 @@
       "name": "Debug worker-a (cluster)",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/out/build/windows-x64/src/app/Debug/caf_plugin_app.exe",
+      "program": "${workspaceFolder}/run/Debug/caf_plugin_app.exe",
       "args": [
         "--config-file=worker-a.conf"
       ],
-      "cwd": "${workspaceFolder}/out/build/windows-x64/run",
+      "cwd": "${workspaceFolder}/run/Debug",
       "console": "integratedTerminal",
       "preLaunchTask": "cmake-build-debug",
       "stopAtEntry": false,
@@ -33,11 +33,11 @@
       "name": "Debug worker-b (cluster)",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/out/build/windows-x64/src/app/Debug/caf_plugin_app.exe",
+      "program": "${workspaceFolder}/run/Debug/caf_plugin_app.exe",
       "args": [
         "--config-file=worker-b.conf"
       ],
-      "cwd": "${workspaceFolder}/out/build/windows-x64/run",
+      "cwd": "${workspaceFolder}/run/Debug",
       "console": "integratedTerminal",
       "preLaunchTask": "cmake-build-debug",
       "stopAtEntry": false,
@@ -47,9 +47,9 @@
       "name": "Debug standalone (smoke)",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/out/build/windows-x64/src/app/Debug/caf_plugin_app.exe",
+      "program": "${workspaceFolder}/run/Debug/caf_plugin_app.exe",
       "args": [],
-      "cwd": "${workspaceFolder}/out/build/windows-x64/run",
+      "cwd": "${workspaceFolder}/run/Debug",
       "console": "integratedTerminal",
       "preLaunchTask": "cmake-build-debug",
       "stopAtEntry": false,

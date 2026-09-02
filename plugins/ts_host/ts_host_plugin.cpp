@@ -10,7 +10,8 @@
 //   function on_init(manager) / on_call(fn, payload) / on_string(cmd)
 //   function on_save() / on_restore(state_str) / on_shutdown()
 //
-// 桥接 API（脚本全局可用）：log / call / call_string / config / self_name / now。
+// 桥接 API（脚本全局可用）：log / call / call_string / config / self_name。
+// Date.now()/new Date()/Date() 由宿主自动 hook 到统一业务时间。
 //
 // 关键决策：
 //   - 零新 type_id / 免 register_meta_objects：全程 plugin_envelope + std::string。
@@ -20,6 +21,7 @@
 #include "plugin/plugin_interface.hpp"
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
+#include "services/time_service.hpp"
 #include "common/plugin_config.hpp"
 #include "common/plugin_envelope.hpp"
 #include "templates/job_queue.hpp"
@@ -257,9 +259,10 @@ static JSValue js_self_name(JSContext* ctx, JSValueConst, int, JSValueConst*) {
     return JS_NewString(ctx, n);
 }
 
-static JSValue js_now(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+static JSValue js_business_time_ms(JSContext* ctx, JSValueConst, int,
+                                   JSValueConst*) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now().time_since_epoch())
+                  caf_plugin_system::business_now().time_since_epoch())
                   .count();
     return JS_NewFloat64(ctx, static_cast<double>(ms));
 }
@@ -276,9 +279,36 @@ void inject_bridge(JSContext* ctx) {
                       JS_NewCFunction(ctx, js_config, "config", 1));
     JS_SetPropertyStr(ctx, global, "self_name",
                       JS_NewCFunction(ctx, js_self_name, "self_name", 0));
-    JS_SetPropertyStr(ctx, global, "now",
-                      JS_NewCFunction(ctx, js_now, "now", 0));
+    JS_SetPropertyStr(ctx, global, "_caf_business_time_ms",
+                      JS_NewCFunction(ctx, js_business_time_ms,
+                                     "_caf_business_time_ms", 0));
     JS_FreeValue(ctx, global);
+
+    constexpr const char* hook = R"js(
+        (() => {
+            const NativeDate = Date;
+            const clock = globalThis._caf_business_time_ms;
+            const BusinessDate = new Proxy(NativeDate, {
+                apply() {
+                    return new NativeDate(clock()).toString();
+                },
+                construct(target, args, newTarget) {
+                    return Reflect.construct(
+                        target, args.length === 0 ? [clock()] : args, newTarget);
+                }
+            });
+            BusinessDate.now = clock;
+            globalThis.Date = BusinessDate;
+            delete globalThis._caf_business_time_ms;
+        })();
+    )js";
+    JSValue result = JS_Eval(ctx, hook, std::strlen(hook), "<time-hook>",
+                             JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, result);
+        throw std::runtime_error("install JavaScript Date hooks failed");
+    }
+    JS_FreeValue(ctx, result);
 }
 
 /// 读脚本 `plugin` 对象（manifest）。须在 worker 线程调用。

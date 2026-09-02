@@ -3,21 +3,22 @@ title CAF Cluster Test (master + bridge + TUI)
 cd /d "%~dp0.."
 
 echo ============================================
-echo  [0/4] Copy latest exe to run\ and run_bridge\
+echo  [0/4] Use staged Debug runtime and prepare run_bridge\
 echo ============================================
-copy /y out\build\windows-x64\src\app\Debug\caf_plugin_app.exe run\ >nul
-if errorlevel 1 goto FAIL
+if not exist run\Debug\caf_plugin_app.exe goto FAIL
 if not exist run_bridge mkdir run_bridge
-for %%f in (caf_plugin_app.exe caf_core.dll caf_io.dll fmtd.dll spdlogd.dll caf-application.conf) do (
-    copy /y run\%%f run_bridge\ >nul
+for %%f in (caf_plugin_app.exe caf-application.conf) do (
+    copy /y run\Debug\%%f run_bridge\ >nul
     if errorlevel 1 goto FAIL
 )
-xcopy /e /i /y run\plugins run_bridge\plugins >nul
+copy /y run\Debug\*.dll run_bridge\ >nul
+if errorlevel 1 goto FAIL
+xcopy /e /i /y run\Debug\plugins run_bridge\plugins >nul
 
 echo ============================================
 echo  [1/4] Start master (47096, test-bridge-call)
 echo ============================================
-cd /d run
+cd /d run\Debug
 start "CAF Master" cmd /c "(ping -n 181 127.0.0.1 >nul & echo x) | caf_plugin_app.exe --caf-plugin-system.node-kind=master --caf-plugin-system.node-name=master --caf-plugin-system.node-port=47096 --caf-plugin-system.lease-seconds=6 --caf-plugin-system.test-bridge-call=bridge-a"
 
 echo ============================================
@@ -41,6 +42,6 @@ pause
 exit /b 0
 
 :FAIL
-echo COPY FAILED - exe may be RUNNING (quit TUI / close bridge first) or build missing
+echo Debug runtime missing or run_bridge file locked
 pause
 exit /b 1

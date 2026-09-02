@@ -56,6 +56,13 @@ target_include_directories(caf_plugin_core PUBLIC
 # cluster 需要 CAF::io（middleman）；日志服务需要 spdlog（sinks 归 logging_service）
 target_link_libraries(caf_plugin_core PUBLIC CAF::core CAF::io fmt::fmt spdlog::spdlog)
 
+if(UNIX)
+    # stage_run 将 core 放到 exe_dir/lib；其第三方依赖也在同目录。
+    set_target_properties(caf_plugin_core PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN")
+endif()
+
 if(WIN32)
     # 自动导出全部非 inline 符号（普通函数/类成员免手标 CORE_API；
     # inline 变量如 g_time_offset 仍须显式 CORE_API，见 core_export.hpp）
