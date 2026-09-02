@@ -66,6 +66,32 @@ if(WIN32)
 endif()
 
 # ------------------------------------------------------------------
+# Python 插件端到端回归：从最终 staging 目录加载解释器/标准库/共享脚本，
+# 覆盖 envelope、string、热重载状态交接与优雅关机。
+# ------------------------------------------------------------------
+if(WIN32 OR UNIX)
+    if(WIN32)
+        set(python_stdlib_sentinel "${APP_RUN_DIR}/Lib/encodings/__init__.py")
+    else()
+        set(python_stdlib_sentinel
+            "${APP_RUN_DIR}/lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/encodings/__init__.py")
+    endif()
+    add_test(NAME python_plugin_smoke
+        COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_NAME=python_plugin_smoke"
+            "-DRUNTIME_DIR=${APP_RUN_DIR}"
+            "-DAPP_EXE=${APP_RUN_DIR}/caf_plugin_app${CMAKE_EXECUTABLE_SUFFIX}"
+            "-DPYTHON_STDLIB_SENTINEL=${python_stdlib_sentinel}"
+            "-DSHARED_SCRIPT=${APP_RUN_ROOT}/shared/scripts/python/echo.py"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_python_plugin_test.cmake"
+    )
+    set_tests_properties(python_plugin_smoke PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 60
+    )
+endif()
+
+# ------------------------------------------------------------------
 # 最小 libpq 泄露测试（独立 exe，不链接 caf，纯 PQconnectdb+PQfinish）
 # ------------------------------------------------------------------
 add_subdirectory(pg_leak_test)

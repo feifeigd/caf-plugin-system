@@ -3,8 +3,6 @@
 # Python 走 vcpkg python3（vcpkg.json 依赖）；find_package(Python3) 由
 # vcpkg toolchain 解析到 vcpkg_installed 的 Python3::Python（官方 usage 同款）。
 
-find_package(Python3 COMPONENTS Development REQUIRED)
-
 add_library(py_host_plugin SHARED
     py_host_plugin.cpp
 )

@@ -42,6 +42,7 @@ endif()
 find_package(CAF REQUIRED COMPONENTS core)
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 # CAF 内部 Debug 日志只在 Debug 配置编译。Release/RelWithDebInfo 不定义
 # CAF_LOG_LEVEL，避免把框架调度级日志字符串与分支带进生产二进制。
@@ -63,22 +64,49 @@ if(WIN32 OR UNIX)
     if(WIN32)
         set(APP_NATIVE_LIB_DIR "${APP_RUN_DIR}")
         set(RUNTIME_PLATFORM_KIND "WINDOWS")
-        set(PYTHON_STDLIB_DIR
-            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/python3/Lib")
+        set(PYTHON_STDLIB_DEST "${APP_RUN_DIR}/Lib")
         set(VCPKG_RUNTIME_DIR
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/$<IF:$<CONFIG:Debug>,debug/bin,bin>")
     else()
         set(APP_NATIVE_LIB_DIR "${APP_RUN_DIR}/lib")
         set(RUNTIME_PLATFORM_KIND "UNIX")
-        set(PYTHON_STDLIB_DIR
-            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/python3/lib/python3.12")
-        set(PYTHON_STDLIB_DEST "${APP_RUN_DIR}/lib/python3.12")
+        set(PYTHON_STDLIB_DEST
+            "${APP_RUN_DIR}/lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}")
         set(VCPKG_RUNTIME_DIR
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/$<IF:$<CONFIG:Debug>,debug/lib,lib>")
     endif()
-    if(WIN32)
-        set(PYTHON_STDLIB_DEST "${APP_RUN_DIR}/Lib")
-    endif()
+    find_program(UV_EXECUTABLE NAMES uv REQUIRED)
+    file(TO_CMAKE_PATH "${Python3_STDLIB}" PYTHON_STDLIB_SOURCE)
+    set(PYTHON_STDLIB_STAMP
+        "${CMAKE_BINARY_DIR}/stage/$<CONFIG>/python-stdlib.stamp")
+    add_custom_target(stage_python_stdlib
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSOURCE_DIR=${PYTHON_STDLIB_SOURCE}"
+                "-DDEST_DIR=${PYTHON_STDLIB_DEST}"
+                "-DSTAMP_FILE=${PYTHON_STDLIB_STAMP}"
+                "-DPYTHON_VERSION=${Python3_VERSION}"
+                "-DCONFIGURATION=$<CONFIG>"
+                -P "${CMAKE_SOURCE_DIR}/cmake/sync_python_stdlib.cmake"
+        COMMENT "Staging Python ${Python3_VERSION} standard library ($<CONFIG>)"
+        VERBATIM
+    )
+
+    add_custom_target(sync_python_deps
+        COMMAND "${CMAKE_COMMAND}"
+                "-DUV_EXECUTABLE=${UV_EXECUTABLE}"
+                "-DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}"
+                "-DPROJECT_DIR=${CMAKE_SOURCE_DIR}/plugins/py_host/python"
+                "-DTARGET_DIR=${PYTHON_STDLIB_DEST}/site-packages"
+                "-DCONFIGURATION=$<CONFIG>"
+                "-DPLATFORM_KIND=${RUNTIME_PLATFORM_KIND}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/sync_python_deps.cmake"
+        DEPENDS
+            "${CMAKE_SOURCE_DIR}/plugins/py_host/python/pyproject.toml"
+            "${CMAKE_SOURCE_DIR}/plugins/py_host/python/uv.lock"
+            stage_python_stdlib
+        COMMENT "Synchronizing locked Python dependencies with uv ($<CONFIG>)"
+        VERBATIM
+    )
 
     set(STAGED_PLUGIN_TARGETS
         business_plugin
@@ -92,6 +120,11 @@ if(WIN32 OR UNIX)
         redis_plugin
         ts_host_plugin
     )
+    set(RUNTIME_SCAN_BINARIES
+        "$<TARGET_FILE:caf_plugin_app>|$<TARGET_FILE:caf_plugin_core>")
+    foreach(runtime_target IN LISTS STAGED_PLUGIN_TARGETS)
+        string(APPEND RUNTIME_SCAN_BINARIES "|$<TARGET_FILE:${runtime_target}>")
+    endforeach()
 
     add_custom_target(stage_run ALL
         COMMAND "${CMAKE_COMMAND}" -E make_directory
@@ -117,12 +150,14 @@ if(WIN32 OR UNIX)
                 "$<TARGET_FILE:caf_plugin_app>" "${APP_RUN_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:caf_plugin_core>" "${APP_NATIVE_LIB_DIR}/"
-        # 拷贝 vcpkg 安装的运行时依赖库到本地运行目录，避免依赖系统环境
+        # 从应用、核心及全部插件计算真实运行时依赖闭包。
         COMMAND "${CMAKE_COMMAND}"
-                "-DSOURCE_DIR=${VCPKG_RUNTIME_DIR}"
+                "-DBINARIES=${RUNTIME_SCAN_BINARIES}"
+                "-DSEARCH_DIR=${VCPKG_RUNTIME_DIR}"
+                "-DALLOWED_ROOT=${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}"
                 "-DDEST_DIR=${APP_NATIVE_LIB_DIR}"
                 "-DPLATFORM_KIND=${RUNTIME_PLATFORM_KIND}"
-                -P "${CMAKE_SOURCE_DIR}/cmake/copy_runtime_libraries.cmake"
+                -P "${CMAKE_SOURCE_DIR}/cmake/copy_runtime_dependencies.cmake"
 
         COMMAND "${CMAKE_COMMAND}" -E make_directory
                 "${APP_RUN_DIR}/plugins/business"
@@ -171,9 +206,6 @@ if(WIN32 OR UNIX)
                 "${CMAKE_SOURCE_DIR}/plugins/py_host/scripts"
                 "${APP_RUN_ROOT}/shared/scripts/python"
         COMMAND "${CMAKE_COMMAND}" -E copy_directory
-                "${PYTHON_STDLIB_DIR}"
-                "${PYTHON_STDLIB_DEST}"
-        COMMAND "${CMAKE_COMMAND}" -E copy_directory
                 "${CMAKE_SOURCE_DIR}/plugins/ts_host/scripts"
                 "${APP_RUN_ROOT}/shared/scripts/typescript"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -184,6 +216,8 @@ if(WIN32 OR UNIX)
             caf_plugin_core
             business_plugin_v2
             ${STAGED_PLUGIN_TARGETS}
+            stage_python_stdlib
+            sync_python_deps
         COMMENT "Staging current $<CONFIG> runtime into ${APP_RUN_DIR}"
         VERBATIM
     )

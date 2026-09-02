@@ -787,19 +787,15 @@ public:
         // （pystate.c:1770 断言 / 0xC0000005）。见 PyHostThread 注释。
         if (!python_ready().exchange(true)) {
             auto& h = py_host_thread();
+            {
+                std::lock_guard<std::mutex> lk(h.mtx);
+                h.init_done = false;
+                h.stop = false;
+            }
             h.th = std::thread([&h]() {
-                // PYTHONMALLOC=malloc：禁用 pymalloc arena（CPython 的
-                // arena 在 Py_Finalize 后不归还 CRT 堆，Debug CRT 泄漏检测
-                // 会把它报成固定 262168/131096 字节的"泄漏"）。走系统
-                // malloc 后基线固定泄漏 6 块（248/120/38/90/82/82 B，
-                // 8-31 起各轮实测一致）。分配栈 hook 实锤：6 块全部由
-                // python312_d.dll 内部（PyMem→type-alloc 路径）分配，
-                // py_host 仅触发者——最小实验（纯 init / 线程结构复刻 /
-                // 桥接注入+完整脚本链）均 0 块，仅在 py_host 的 CAF 环境
-                // （多线程 actor 系统 + 完整关机链）下出现；Py_FinalizeEx
-                // 后解释器驻留，进程退出由 OS 统一回收，非真泄漏
-                // （EXIT 恒 0、与 DLL 卸载无关）。
-                _putenv("PYTHONMALLOC=malloc");
+                // 保持 CPython 默认 pymalloc。强制 PYMEM_ALLOCATOR_MALLOC 会
+                // 把解释器/扩展模块的进程级缓存逐对象登记为 CRT 泄漏，既
+                // 放大噪声，也掩盖真正属于宿主的分配。
                 Py_Initialize();
                 py_main_thread_state() = PyEval_SaveThread();
                 {
@@ -811,8 +807,10 @@ public:
                 std::unique_lock<std::mutex> lk(h.mtx);
                 h.cv.wait(lk, [&h]() { return h.stop; });
                 // 同线程（本线程）恢复主线程状态 + finalize
-                if (auto* ts = py_main_thread_state())
+                if (auto* ts = py_main_thread_state()) {
                     PyEval_RestoreThread(ts);
+                    py_main_thread_state() = nullptr;
+                }
                 Py_FinalizeEx();
             });
             // 等解释器初始化完成（脚本 worker 的 PyGILState_Ensure 依赖）
