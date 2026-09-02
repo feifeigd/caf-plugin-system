@@ -63,6 +63,21 @@ if(WIN32)
             TIMEOUT 60
         )
     endforeach()
+
+    add_test(NAME sqlite_plugin_leak
+        COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_NAME=sqlite_plugin_leak"
+            "-DRUNTIME_DIR=${CMAKE_CURRENT_BINARY_DIR}/sqlite_plugin_leak-$<CONFIG>"
+            "-DAPP_EXE=$<TARGET_FILE:caf_plugin_app>"
+            "-DCORE_DLL=$<TARGET_FILE:caf_plugin_core>"
+            "-DSQLITE_DLL=$<TARGET_FILE:sqlite_plugin>"
+            "-DTHIRD_PARTY_DLL_DIR=${vcpkg_runtime_dir}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_sqlite_plugin_test.cmake"
+    )
+    set_tests_properties(sqlite_plugin_leak PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 60
+    )
 endif()
 
 # ------------------------------------------------------------------

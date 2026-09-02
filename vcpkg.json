@@ -15,6 +15,7 @@
     "hiredis",
     "libmariadb",
     "libpq",
+    "sqlite3",
     "mongo-cxx-driver"
   ],
   "overrides": [

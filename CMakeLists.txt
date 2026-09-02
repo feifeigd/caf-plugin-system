@@ -118,6 +118,7 @@ if(WIN32 OR UNIX)
         postgres_plugin
         py_host_plugin
         redis_plugin
+        sqlite_plugin
         ts_host_plugin
     )
     set(RUNTIME_SCAN_BINARIES
@@ -169,6 +170,7 @@ if(WIN32 OR UNIX)
                 "${APP_RUN_DIR}/plugins/postgres"
                 "${APP_RUN_DIR}/plugins/py_host"
                 "${APP_RUN_DIR}/plugins/redis"
+                "${APP_RUN_DIR}/plugins/sqlite"
                 "${APP_RUN_DIR}/plugins/ts_host"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:business_plugin>" "${APP_RUN_DIR}/plugins/business/"
@@ -188,6 +190,8 @@ if(WIN32 OR UNIX)
                 "$<TARGET_FILE:py_host_plugin>" "${APP_RUN_DIR}/plugins/py_host/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:redis_plugin>" "${APP_RUN_DIR}/plugins/redis/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:sqlite_plugin>" "${APP_RUN_DIR}/plugins/sqlite/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:ts_host_plugin>" "${APP_RUN_DIR}/plugins/ts_host/"
 
