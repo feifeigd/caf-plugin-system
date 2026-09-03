@@ -6,12 +6,12 @@
 //      非事务请求 round-robin 分配
 //   2. 参数化查询：mysql_stmt_prepare + bind（全字符串参数，
 //      空串 ≠ NULL；NULL 参数 v1 不支持）
-//   3. 事务状态机：tx_begin 借空闲连接（busy 标记）→ 带 tx_handle 的
+//   3. 事务状态机：tx_begin 从公共连接池借空闲槽位→ 带 tx_handle 的
 //      请求钉在该连接 → commit/rollback 归还。tx_begin 响应 db_result，
 //      成功时 insert_id = tx_handle（十进制字符串），调用方 stoull 后
 //      用于后续 commit/rollback 消息。
-//      tx_handle 编码 = (命名连接在配置中的序号 << 32) | 槽序号：
-//      路由零查找、零锁竞争（worker 回调只碰 atomic busy）。
+//      tx_handle 编码含连接序号、槽序号和代际号：
+//      路由零查找，旧句柄不能误操作后来复用同一槽的新事务。
 //
 // 配置（CAF 配置系统，同文件字段区分）：
 //   caf-plugin-system {
@@ -29,7 +29,8 @@
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
 #include "common/plugin_config.hpp"
-#include "templates/job_queue.hpp"
+#include "templates/sql_service_handlers.hpp"
+#include "templates/sql_uri_config.hpp"
 
 // libmariadb 依赖 winsock2（同 hiredis 坑），必须最先包含
 #ifdef _WIN32
@@ -40,15 +41,10 @@
 #include <caf/all.hpp>
 
 #include <atomic>
-#include <condition_variable>
-#include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <functional>
 #include <iostream>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,6 +52,12 @@
 namespace db = caf_plugin_system::db;
 
 namespace {
+
+using Op = caf_plugin_system::sql_backend::Operation;
+using Job = caf_plugin_system::sql_backend::Job;
+using ConnSlot = caf_plugin_system::sql_backend::ConnectionSlot;
+using SqlPool = caf_plugin_system::sql_backend::ConnectionPool;
+using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 
 // 声明式配置（PLUGIN_CONFIG 宏，见 common/plugin_config.hpp）：
 // 字段 + 默认值，读取路径 caf-plugin-system.mysql.<字段名>（conf 嵌套块）。
@@ -66,92 +68,13 @@ namespace {
 PLUGIN_CONFIG(MYSQL_FIELDS)
 #undef MYSQL_FIELDS
 
-/// 单个命名连接的解析结果（mysql://user:pass@host:port/dbname）。
-struct SqlSpec {
-    std::string name;
-    std::string user = "root";
-    std::string pass;
-    std::string host = "127.0.0.1";
-    int port = 3306;
-    std::string dbname;
-};
+using SqlSpec = caf_plugin_system::sql_backend::ConnectionSpec;
 
-/// 从配置 dictionary 构造命名连接表（键 = 连接名，值 = uri 字符串）。
 std::vector<SqlSpec> parse_uris(const caf::settings& uris) {
-    std::vector<SqlSpec> out;
-    for (const auto& [name, value] : uris) {
-        auto uri_v = caf::get_if<std::string>(&value);
-        if (!uri_v)
-            continue;
-        SqlSpec cs;
-        cs.name = name;
-        std::string uri = *uri_v;
-        if (uri.rfind("mysql://", 0) == 0)
-            uri = uri.substr(8);
-        auto at = uri.find('@');
-        if (at != std::string::npos) {
-            std::string up = uri.substr(0, at);
-            uri = uri.substr(at + 1);
-            auto colon = up.find(':');
-            if (colon != std::string::npos) {
-                cs.user = up.substr(0, colon);
-                cs.pass = up.substr(colon + 1);
-            } else {
-                cs.user = up;
-            }
-        }
-        auto slash = uri.find('/');
-        std::string hostport = (slash == std::string::npos) ? uri : uri.substr(0, slash);
-        auto colon = hostport.find(':');
-        if (colon != std::string::npos) {
-            cs.host = hostport.substr(0, colon);
-            cs.port = std::atoi(hostport.substr(colon + 1).c_str());
-        } else if (!hostport.empty()) {
-            cs.host = hostport;
-        }
-        if (slash != std::string::npos)
-            cs.dbname = uri.substr(slash + 1);
-        if (cs.name.empty())
-            cs.name = "default";
-        out.push_back(std::move(cs));
-    }
-    if (out.empty()) {
-        SqlSpec cs;
-        cs.name = "default";
-        out.push_back(std::move(cs));
-    }
-    return out;
+    const caf_plugin_system::sql_backend::ConnectionUriParser parser{
+        {"mysql://"}, "root", 3306};
+    return parser.parse(uris);
 }
-
-/// 操作类型：事务命令（文本执行）与查询/写（参数化 stmt）。
-enum class Op { Query, Exec, Begin, Commit, Rollback };
-
-struct Job {
-    Op op = Op::Query;
-    std::string sql;
-    std::vector<std::string> params;
-    std::function<void(db::db_result&)> done;  // worker 执行完回调（deliver）
-
-    /// 失败交付方式（JobQueue::fail_all 统一调用）。
-    void fail(const std::string& err) {
-        if (done) {
-            db::db_result r;
-            r.ok = false;
-            r.error = err;
-            done(r);
-        }
-    }
-};
-
-using JobQueue = caf_plugin_system::JobQueue<Job>;
-
-/// 连接槽：一条连接 + 专属队列 + worker 线程 + 事务占用标记。
-struct ConnSlot {
-    std::shared_ptr<JobQueue> queue = std::make_shared<JobQueue>();
-    std::shared_ptr<std::thread> thread;
-    std::atomic<bool> busy{false};
-};
-
 /// 文本命令（BEGIN/COMMIT/ROLLBACK）。
 db::db_result exec_text(MYSQL* c, const char* cmd) {
     db::db_result r;
@@ -272,7 +195,7 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
 void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot) {
     MYSQL* c = mysql_init(nullptr);
     if (!c) {
-        slot->queue->fail_all("mysql_init failed");
+        slot->fail_pending("mysql_init failed");
         return;
     }
     if (!mysql_real_connect(c, spec.host.c_str(), spec.user.c_str(), spec.pass.c_str(),
@@ -282,14 +205,14 @@ void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot) {
         mysql_close(c);
         LOG_ERROR("MySQL [{}] connect failed: {} ({}:{} user={} db={})",
                   spec.name, err, spec.host, spec.port, spec.user, spec.dbname);
-        slot->queue->fail_all("mysql connect failed: " + err);
+        slot->fail_pending("mysql connect failed: " + err);
         return;
     }
     LOG_INFO("MySQL [{}] connected: {}:{}/{} user={}", spec.name, spec.host,
              spec.port, spec.dbname, spec.user);
 
     for (;;) {
-        auto job = slot->queue->pop();
+        auto job = slot->next_job();
         if (!job)
             break;
         auto t0 = std::chrono::steady_clock::now();
@@ -312,12 +235,6 @@ void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot) {
     LOG_INFO("MySQL [{}] worker exited", spec.name);
 }
 
-// tx_handle 编码：高 32 位 = specs 中的命名连接序号，低 32 位 = 槽序号
-inline uint64_t make_tx_handle(size_t name_idx, size_t slot_idx) {
-    return (static_cast<uint64_t>(name_idx) << 32) | static_cast<uint64_t>(slot_idx);
-}
-inline size_t tx_name_idx(uint64_t tx) { return static_cast<size_t>(tx >> 32); }
-inline size_t tx_slot_idx(uint64_t tx) { return static_cast<size_t>(tx & 0xffffffffu); }
 
 } // namespace
 
@@ -343,8 +260,7 @@ public:
         return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<SqlSpec>>(parse_uris(uris));
             // 池表：name → slots（按 specs 顺序构建，槽序号 = specs 内索引）
-            auto pools = std::make_shared<std::map<std::string, std::vector<std::shared_ptr<ConnSlot>>>>();
-            auto rr = std::make_shared<std::atomic<size_t>>(0);
+            auto pools = std::make_shared<SqlPool>("mysql");
             auto started = std::make_shared<std::atomic<bool>>(false);
             auto default_conn = std::make_shared<std::string>("default");
 
@@ -354,125 +270,13 @@ public:
                 if (!specs->empty())
                     *default_conn = specs->front().name;
                 for (const auto& s : *specs) {
-                    auto& slots = (*pools)[s.name];
-                    slots.reserve(pool_size);
                     for (int i = 0; i < pool_size; ++i) {
-                        auto slot = std::make_shared<ConnSlot>();
-                        slot->thread = std::make_shared<std::thread>(sql_worker_main, s, slot);
-                        slots.push_back(slot);
+                        auto slot = pools->add_slot(s.name);
+                        slot->start_worker(sql_worker_main, s, slot);
                     }
                     LOG_INFO_SELF(self, "pool launched: [{}] {}:{}/{} size={}",
                                   s.name, s.host, s.port, s.dbname, pool_size);
                 }
-            };
-
-            // 找命名连接在 specs 中的序号（事务 handle 编码用）
-            auto name_index = [=](const std::string& name) -> int {
-                for (size_t i = 0; i < specs->size(); ++i)
-                    if ((*specs)[i].name == name)
-                        return static_cast<int>(i);
-                return -1;
-            };
-
-            // 事务结束（commit/rollback 执行完，无论成败）释放槽；worker 线程调用
-            auto release_slot = [=](uint64_t tx) {
-                size_t name_idx = tx_name_idx(tx);
-                size_t slot_idx = tx_slot_idx(tx);
-                if (name_idx < specs->size()) {
-                    auto it = pools->find((*specs)[name_idx].name);
-                    if (it != pools->end() && slot_idx < it->second.size())
-                        it->second[slot_idx]->busy = false;
-                }
-            };
-
-            // 入队到指定连接槽（事务钉连接）
-            auto enqueue_slot = [=](const std::string& name, size_t idx, std::shared_ptr<Job> job) {
-                auto it = pools->find(name);
-                if (it == pools->end() || idx >= it->second.size()) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "unknown mysql connection: " + name;
-                    if (job->done)
-                        job->done(r);
-                    return;
-                }
-                it->second[idx]->queue->push(std::move(job));
-            };
-
-            // 非事务请求：round-robin 到该命名连接的池
-            auto enqueue_rr = [=](const std::string& name, std::shared_ptr<Job> job) {
-                auto it = pools->find(name);
-                if (it == pools->end()) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "unknown mysql connection: " + name;
-                    if (job->done)
-                        job->done(r);
-                    return;
-                }
-                auto& slots = it->second;
-                size_t idx = (rr->fetch_add(1)) % slots.size();
-                slots[idx]->queue->push(std::move(job));
-            };
-
-            // 事务请求：按 tx_handle 解码路由
-            auto enqueue_tx = [=](uint64_t tx, std::shared_ptr<Job> job) {
-                size_t name_idx = tx_name_idx(tx);
-                size_t slot_idx = tx_slot_idx(tx);
-                if (name_idx >= specs->size()) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "invalid transaction: " + std::to_string(tx);
-                    if (job->done)
-                        job->done(r);
-                    return;
-                }
-                enqueue_slot((*specs)[name_idx].name, slot_idx, std::move(job));
-            };
-
-            // 事务 begin：借空闲连接 → 编码 tx_handle → BEGIN job
-            auto do_begin = [=](const std::string& conn) {
-                auto rp = self->make_response_promise<db::db_result>();
-                auto it = pools->find(conn);
-                if (it == pools->end()) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "unknown mysql connection: " + conn;
-                    rp.deliver(std::move(r));
-                    return;
-                }
-                int name_idx = name_index(conn);
-                if (name_idx < 0) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "internal: connection not in specs";
-                    rp.deliver(std::move(r));
-                    return;
-                }
-                auto& slots = it->second;
-                for (size_t i = 0; i < slots.size(); ++i) {
-                    size_t idx = (rr->fetch_add(1)) % slots.size();
-                    bool expected = false;
-                    if (slots[idx]->busy.compare_exchange_strong(expected, true)) {
-                        uint64_t tx = make_tx_handle(static_cast<size_t>(name_idx), idx);
-                        auto job = std::make_shared<Job>();
-                        job->op = Op::Begin;
-                        // 失败时释放槽再交付；成功时 insert_id 携带 tx_handle
-                        job->done = [=](db::db_result& r) mutable {
-                            if (!r.ok)
-                                slots[idx]->busy = false;
-                            else
-                                r.insert_id = std::to_string(tx);
-                            rp.deliver(std::move(r));
-                        };
-                        slots[idx]->queue->push(std::move(job));
-                        return;
-                    }
-                }
-                db::db_result r;
-                r.ok = false;
-                r.error = "mysql pool exhausted (all connections busy)";
-                rp.deliver(std::move(r));
             };
 
             // 自检：默认连接上 SELECT 1 + 建表写读（串行链，顺序确定）
@@ -506,91 +310,9 @@ public:
                 });
             };
 
-            caf::message_handler business{
-                [=](sql_query_atom, const std::string& conn, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Query;
-                    job->sql = sql;
-                    job->params = params;
-                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
-                    enqueue_rr(conn, std::move(job));
-                },
-                [=](sql_query_atom, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Query;
-                    job->sql = sql;
-                    job->params = params;
-                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
-                    enqueue_rr(*default_conn, std::move(job));
-                },
-                [=](sql_exec_atom, const std::string& conn, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Exec;
-                    job->sql = sql;
-                    job->params = params;
-                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
-                    enqueue_rr(conn, std::move(job));
-                },
-                [=](sql_exec_atom, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Exec;
-                    job->sql = sql;
-                    job->params = params;
-                    job->done = [rp](db::db_result& r) mutable { rp.deliver(std::move(r)); };
-                    enqueue_rr(*default_conn, std::move(job));
-                },
-                [=](tx_begin_atom, const std::string& conn) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    do_begin(conn);
-                },
-                [=](tx_begin_atom) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    do_begin(*default_conn);
-                },
-                [=](tx_commit_atom, uint64_t tx) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Commit;
-                    job->done = [=](db::db_result& r) mutable {
-                        release_slot(tx);  // 无论成败事务已结束
-                        rp.deliver(std::move(r));
-                    };
-                    enqueue_tx(tx, std::move(job));
-                },
-                [=](tx_rollback_atom, uint64_t tx) {
-                    if (!self->current_message_id().is_request())
-                        return;
-                    auto rp = self->make_response_promise<db::db_result>();
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Rollback;
-                    job->done = [=](db::db_result& r) mutable {
-                        release_slot(tx);
-                        rp.deliver(std::move(r));
-                    };
-                    enqueue_tx(tx, std::move(job));
-                },
-            };
-
+            auto dispatcher = SqlDispatcher::create(
+                self, pools, default_conn);
+            auto business = dispatcher->handlers();
             return caf::behavior{business.or_else(plugin_lifecycle(self, PluginLifecycleHooks{
                 .on_init = [=](caf::actor, const std::string&) {
                     LOG_INFO_SELF(self, "MySqlPlugin initialized, conns={}", uris.size());
@@ -602,19 +324,7 @@ public:
                     return {};
                 },
                 .on_shutdown = [=]() {
-                    for (auto& [name, slots] : *pools) {
-                        for (auto& s : slots)
-                            s->queue->stop();
-                    }
-                    size_t joined = 0;
-                    for (auto& [name, slots] : *pools) {
-                        for (auto& s : slots) {
-                            if (s->thread->joinable()) {
-                                s->thread->join();
-                                ++joined;
-                            }
-                        }
-                    }
+                    auto joined = pools->stop_and_join();
                     std::cout << "[MySqlPlugin] shutdown hook: " << joined
                               << " workers joined" << std::endl;
                     LOG_INFO_SELF(self, "MySqlPlugin shutdown, {} workers joined", joined);

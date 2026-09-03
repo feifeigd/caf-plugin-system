@@ -11,6 +11,18 @@ target_link_libraries(test_dependency_graph PRIVATE caf_plugin_core)
 # 注册为 CTest 测试
 add_test(NAME dependency_graph COMMAND test_dependency_graph)
 
+add_executable(test_entity_store_contract
+    test_entity_store_contract.cpp
+)
+target_link_libraries(test_entity_store_contract PRIVATE caf_plugin_core)
+add_test(NAME entity_store_contract COMMAND test_entity_store_contract)
+
+add_executable(test_sql_connection_pool
+    test_sql_connection_pool.cpp
+)
+target_link_libraries(test_sql_connection_pool PRIVATE caf_plugin_core)
+add_test(NAME sql_connection_pool COMMAND test_sql_connection_pool)
+
 # ------------------------------------------------------------------
 # typed_actor 跨 DLL 冒烟验证（评估 typed 重构可行性的最小试验田）
 # 结构：typed_smoke_plugin.dll（模拟插件，实现 typed 服务）

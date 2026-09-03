@@ -142,3 +142,16 @@ X_TAG(service_gone_atom, 275) // 服务注销广播（PM 统一解绑）：插�
 X_TAG(protocols_atom, 276)    // 查服务外部协议表：(svc) → external_protocol_table
 X_REG(external_protocol_table, (external_protocol_table),
       277, "external_protocol_table")
+
+// -- 通用实体仓储（entity_store_contract.hpp）------------------------------
+// 业务层只看逻辑实体、字段投影与 patch；一条 save 请求是一个原子事务。
+X_REG(entity_load_request, (caf_plugin_system::entity_store::load_request),
+      278, "entity_store::load_request")
+X_REG(entity_load_result, (caf_plugin_system::entity_store::load_result),
+      279, "entity_store::load_result")
+X_REG(entity_save_request, (caf_plugin_system::entity_store::save_request),
+      280, "entity_store::save_request")
+X_REG(entity_save_result, (caf_plugin_system::entity_store::save_result),
+      281, "entity_store::save_result")
+X_TAG(entity_load_atom, 282) // (load_request) -> load_result
+X_TAG(entity_save_atom, 283) // (save_request) -> save_result（整批原子提交）

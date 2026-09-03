@@ -3,16 +3,14 @@
 #include "plugin/plugin_interface.hpp"
 #include "plugin/plugin_lifecycle.hpp"
 #include "services/logging_service.hpp"
-#include "templates/job_queue.hpp"
+#include "templates/sql_service_handlers.hpp"
 
 #include <caf/all.hpp>
 #include <sqlite3.h>
 
-#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
-#include <functional>
-#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -21,6 +19,12 @@
 namespace db = caf_plugin_system::db;
 
 namespace {
+
+using Op = caf_plugin_system::sql_backend::Operation;
+using Job = caf_plugin_system::sql_backend::Job;
+using ConnSlot = caf_plugin_system::sql_backend::ConnectionSlot;
+using SqlPool = caf_plugin_system::sql_backend::ConnectionPool;
+using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 
 // caf-plugin-system { sqlite { databases { default = "./data/app.db" }
 // pool_size = 1 busy_timeout_ms = 5000 } }
@@ -45,30 +49,6 @@ std::vector<DbSpec> parse_databases(const caf::settings& values) {
         result.push_back({"default", "./data/app.db"});
     return result;
 }
-
-enum class Op { Query, Exec, Begin, Commit, Rollback };
-
-struct Job {
-    Op op = Op::Query;
-    std::string sql;
-    std::vector<std::string> params;
-    std::function<void(db::db_result&)> done;
-
-    void fail(const std::string& message) {
-        db::db_result result;
-        result.error = message;
-        if (done)
-            done(result);
-    }
-};
-
-using JobQueue = caf_plugin_system::JobQueue<Job>;
-
-struct ConnSlot {
-    std::shared_ptr<JobQueue> queue = std::make_shared<JobQueue>();
-    std::shared_ptr<std::thread> thread;
-    std::atomic<bool> busy{false};
-};
 
 db::db_result error_result(sqlite3* conn, const std::string& prefix) {
     db::db_result result;
@@ -166,7 +146,7 @@ void worker_main(DbSpec spec, int timeout_ms, std::shared_ptr<ConnSlot> slot) {
     else
         LOG_ERROR("SQLite [{}] open failed: {}", spec.name, open_error);
 
-    while (auto job = slot->queue->pop()) {
+    while (auto job = slot->next_job()) {
         auto started = std::chrono::steady_clock::now();
         db::db_result result;
         if (open_error.empty())
@@ -184,11 +164,7 @@ void worker_main(DbSpec spec, int timeout_ms, std::shared_ptr<ConnSlot> slot) {
     LOG_INFO("SQLite [{}] worker exited", spec.name);
 }
 
-uint64_t make_tx(size_t db_index, size_t slot_index) {
-    return (static_cast<uint64_t>(db_index) << 32) | slot_index;
-}
-size_t tx_db(uint64_t tx) { return static_cast<size_t>(tx >> 32); }
-size_t tx_slot(uint64_t tx) { return static_cast<size_t>(tx & 0xffffffffu); }
+
 
 } // namespace
 
@@ -205,165 +181,130 @@ public:
         int pool_size = config.pool_size < 1 ? 1 : config.pool_size;
         int timeout_ms = config.busy_timeout_ms < 0 ? 0 : config.busy_timeout_ms;
         auto database_config = config.databases;
+        bool run_transaction_selfcheck = caf::get_or(
+            sys.config(), "caf-plugin-system.test-auto-shutdown", false);
 
-        return sys.spawn([database_config, pool_size, timeout_ms](
+        return sys.spawn([database_config, pool_size, timeout_ms,
+                          run_transaction_selfcheck](
                              caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<DbSpec>>(
                 parse_databases(database_config));
-            auto pools = std::make_shared<
-                std::map<std::string, std::vector<std::shared_ptr<ConnSlot>>>>();
-            auto round_robin = std::make_shared<std::atomic<size_t>>(0);
+            auto pools = std::make_shared<SqlPool>("sqlite");
             auto default_db = std::make_shared<std::string>(specs->front().name);
 
             auto launch = [=] {
                 for (const auto& spec : *specs) {
                     auto count = spec.path == ":memory:" ? 1 : pool_size;
-                    auto& slots = (*pools)[spec.name];
                     for (int i = 0; i < count; ++i) {
-                        auto slot = std::make_shared<ConnSlot>();
-                        slot->thread = std::make_shared<std::thread>(
+                        auto slot = pools->add_slot(spec.name);
+                        slot->start_worker(
                             worker_main, spec, timeout_ms, slot);
-                        slots.push_back(std::move(slot));
                     }
                 }
             };
 
-            auto spec_index = [=](const std::string& name) -> int {
-                for (size_t i = 0; i < specs->size(); ++i)
-                    if ((*specs)[i].name == name)
-                        return static_cast<int>(i);
-                return -1;
+            auto transaction_selfcheck = [=] {
+                const auto service = caf::actor{self};
+                const auto create_sql = std::string{
+                    "CREATE TABLE IF NOT EXISTS hermes_tx_selfcheck ("
+                    "id INTEGER PRIMARY KEY, stable_value TEXT, changed_value TEXT)"};
+                self->request(service, std::chrono::seconds(5), sql_exec_atom_v,
+                              create_sql, std::vector<std::string>{})
+                    .then(
+                        [=](db::db_result& created) {
+                            if (!created.ok) {
+                                LOG_ERROR_SELF(self, "SQLite transaction selfcheck create: {}",
+                                               created.error);
+                                return;
+                            }
+                            self->request(
+                                    service, std::chrono::seconds(5), sql_exec_atom_v,
+                                    std::string{
+                                        "INSERT INTO hermes_tx_selfcheck "
+                                        "(id, stable_value, changed_value) VALUES (1, ?, ?) "
+                                        "ON CONFLICT(id) DO UPDATE SET "
+                                        "stable_value=excluded.stable_value, "
+                                        "changed_value=excluded.changed_value"},
+                                    std::vector<std::string>{"keep", "before"})
+                                .then(
+                                    [=](db::db_result& seeded) {
+                                        if (!seeded.ok) {
+                                            LOG_ERROR_SELF(self, "SQLite transaction selfcheck seed: {}", seeded.error);
+                                            return;
+                                        }
+                                        self->request(service, std::chrono::seconds(5),
+                                                      tx_begin_atom_v)
+                                            .then(
+                                                [=](db::db_result& begun) {
+                                                    uint64_t tx = 0;
+                                                    auto first = begun.insert_id.data();
+                                                    auto last = first + begun.insert_id.size();
+                                                    auto parsed = std::from_chars(first, last, tx);
+                                                    if (!begun.ok
+                                                        || parsed.ec != std::errc{}
+                                                        || parsed.ptr != last) {
+                                                        LOG_ERROR_SELF(self, "SQLite transaction selfcheck begin: {}", begun.error);
+                                                        return;
+                                                    }
+                                                    self->request(
+                                                            service, std::chrono::seconds(5),
+                                                            sql_exec_atom_v, tx,
+                                                            std::string{
+                                                                "UPDATE hermes_tx_selfcheck "
+                                                                "SET changed_value=? WHERE id=1"},
+                                                            std::vector<std::string>{"after"})
+                                                        .then(
+                                                            [=](db::db_result& patched) {
+                                                                if (!patched.ok) {
+                                                                    LOG_ERROR_SELF(self, "SQLite transaction selfcheck patch: {}", patched.error);
+                                                                    return;
+                                                                }
+                                                                self->request(
+                                                                        service, std::chrono::seconds(5),
+                                                                        tx_commit_atom_v, tx)
+                                                                    .then(
+                                                                        [=](db::db_result& committed) {
+                                                                            if (!committed.ok) {
+                                                                                LOG_ERROR_SELF(self, "SQLite transaction selfcheck commit: {}", committed.error);
+                                                                                return;
+                                                                            }
+                                                                            self->request(
+                                                                                    service, std::chrono::seconds(5),
+                                                                                    sql_query_atom_v,
+                                                                                    std::string{"SELECT stable_value, changed_value FROM hermes_tx_selfcheck WHERE id=1"},
+                                                                                    std::vector<std::string>{})
+                                                                                .then(
+                                                                                    [=](db::db_result& checked) {
+                                                                                        const bool ok = checked.ok && checked.rows.size() == 1 && checked.rows[0].size() == 2 && checked.rows[0][0] == "keep" && checked.rows[0][1] == "after";
+                                                                                        LOG_INFO_SELF(self, "SQLite transaction selfcheck ok={}", ok);
+                                                                                    },
+                                                                                    [=](caf::error& error) {
+                                                                                        LOG_ERROR_SELF(self, "SQLite transaction selfcheck query failed: {}", caf::to_string(error));
+                                                                                    });
+                                                                        },
+                                                                        [=](caf::error& error) {
+                                                                            LOG_ERROR_SELF(self, "SQLite transaction selfcheck commit failed: {}", caf::to_string(error));
+                                                                        });
+                                                            },
+                                                            [=](caf::error& error) {
+                                                                LOG_ERROR_SELF(self, "SQLite transaction selfcheck patch failed: {}", caf::to_string(error));
+                                                            });
+                                                },
+                                                [=](caf::error& error) {
+                                                    LOG_ERROR_SELF(self, "SQLite transaction selfcheck begin failed: {}", caf::to_string(error));
+                                                });
+                                    },
+                                    [=](caf::error& error) {
+                                        LOG_ERROR_SELF(self, "SQLite transaction selfcheck seed failed: {}", caf::to_string(error));
+                                    });
+                        },
+                        [=](caf::error& error) {
+                            LOG_ERROR_SELF(self, "SQLite transaction selfcheck create failed: {}",
+                                           caf::to_string(error));
+                        });
             };
 
-            auto enqueue_slot = [=](const std::string& name, size_t index,
-                                    std::shared_ptr<Job> job) {
-                auto it = pools->find(name);
-                if (it == pools->end() || index >= it->second.size()) {
-                    job->fail("unknown sqlite database: " + name);
-                    return;
-                }
-                it->second[index]->queue->push(std::move(job));
-            };
-
-            auto enqueue = [=](const std::string& name, std::shared_ptr<Job> job) {
-                auto it = pools->find(name);
-                if (it == pools->end() || it->second.empty()) {
-                    job->fail("unknown sqlite database: " + name);
-                    return;
-                }
-                auto index = round_robin->fetch_add(1) % it->second.size();
-                it->second[index]->queue->push(std::move(job));
-            };
-
-            auto request_job = [=](Op op, const std::string& sql,
-                                   const std::vector<std::string>& params) {
-                auto promise = self->make_response_promise<db::db_result>();
-                auto job = std::make_shared<Job>();
-                job->op = op;
-                job->sql = sql;
-                job->params = params;
-                job->done = [promise](db::db_result& result) mutable {
-                    promise.deliver(std::move(result));
-                };
-                return job;
-            };
-
-            auto begin = [=](const std::string& name) {
-                auto promise = self->make_response_promise<db::db_result>();
-                auto it = pools->find(name);
-                auto db_index = spec_index(name);
-                if (it == pools->end() || db_index < 0) {
-                    db::db_result result;
-                    result.error = "unknown sqlite database: " + name;
-                    promise.deliver(std::move(result));
-                    return;
-                }
-                for (size_t i = 0; i < it->second.size(); ++i) {
-                    bool expected = false;
-                    if (!it->second[i]->busy.compare_exchange_strong(expected, true))
-                        continue;
-                    auto tx = make_tx(static_cast<size_t>(db_index), i);
-                    auto job = std::make_shared<Job>();
-                    job->op = Op::Begin;
-                    job->done = [=](db::db_result& result) mutable {
-                        if (result.ok)
-                            result.insert_id = std::to_string(tx);
-                        else
-                            it->second[i]->busy = false;
-                        promise.deliver(std::move(result));
-                    };
-                    it->second[i]->queue->push(std::move(job));
-                    return;
-                }
-                db::db_result result;
-                result.error = "sqlite transaction pool exhausted: " + name;
-                promise.deliver(std::move(result));
-            };
-
-            auto finish = [=](Op op, uint64_t tx) {
-                auto promise = self->make_response_promise<db::db_result>();
-                auto db_index = tx_db(tx);
-                auto slot_index = tx_slot(tx);
-                if (db_index >= specs->size()) {
-                    db::db_result result;
-                    result.error = "invalid sqlite transaction: " + std::to_string(tx);
-                    promise.deliver(std::move(result));
-                    return;
-                }
-                auto it = pools->find((*specs)[db_index].name);
-                if (it == pools->end() || slot_index >= it->second.size() ||
-                    !it->second[slot_index]->busy.load()) {
-                    db::db_result result;
-                    result.error = "inactive sqlite transaction: " + std::to_string(tx);
-                    promise.deliver(std::move(result));
-                    return;
-                }
-                auto job = std::make_shared<Job>();
-                job->op = op;
-                job->done = [=](db::db_result& result) mutable {
-                    it->second[slot_index]->busy = false;
-                    promise.deliver(std::move(result));
-                };
-                it->second[slot_index]->queue->push(std::move(job));
-            };
-
-            caf::message_handler business{
-                [=](sql_query_atom, const std::string& name, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (self->current_message_id().is_request())
-                        enqueue(name, request_job(Op::Query, sql, params));
-                },
-                [=](sql_query_atom, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (self->current_message_id().is_request())
-                        enqueue(*default_db, request_job(Op::Query, sql, params));
-                },
-                [=](sql_exec_atom, const std::string& name, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (self->current_message_id().is_request())
-                        enqueue(name, request_job(Op::Exec, sql, params));
-                },
-                [=](sql_exec_atom, const std::string& sql,
-                    const std::vector<std::string>& params) {
-                    if (self->current_message_id().is_request())
-                        enqueue(*default_db, request_job(Op::Exec, sql, params));
-                },
-                [=](tx_begin_atom, const std::string& name) {
-                    if (self->current_message_id().is_request())
-                        begin(name);
-                },
-                [=](tx_begin_atom) {
-                    if (self->current_message_id().is_request())
-                        begin(*default_db);
-                },
-                [=](tx_commit_atom, uint64_t tx) {
-                    if (self->current_message_id().is_request())
-                        finish(Op::Commit, tx);
-                },
-                [=](tx_rollback_atom, uint64_t tx) {
-                    if (self->current_message_id().is_request())
-                        finish(Op::Rollback, tx);
-                },
+            caf::message_handler plugin_handlers{
                 [=](plugin_envelope env) -> caf::result<std::string> {
                     if (env.function == "hello") {
                         if (auto input = plugin_wire::decode_text(env))
@@ -373,7 +314,9 @@ public:
                                            "sqlite_service: unknown function");
                 },
             };
-
+            auto dispatcher = SqlDispatcher::create(
+                self, pools, default_db);
+            auto business = dispatcher->handlers().or_else(plugin_handlers);
             return caf::behavior{business.or_else(plugin_lifecycle(
                 self, PluginLifecycleHooks{
                           .on_init = [=](caf::actor, const std::string&) {
@@ -381,6 +324,8 @@ public:
                               LOG_INFO_SELF(self,
                                             "SqlitePlugin initialized, databases={}, pool={}",
                                             specs->size(), pool_size);
+                              if (run_transaction_selfcheck)
+                                  transaction_selfcheck();
                               self->request(caf::actor{self}, std::chrono::seconds(5),
                                             sql_query_atom_v,
                                             std::string{"SELECT sqlite_version()"},
@@ -399,16 +344,7 @@ public:
                           },
                           .on_save = [] { return std::vector<std::byte>{}; },
                           .on_shutdown = [=] {
-                              for (auto& [name, slots] : *pools)
-                                  for (auto& slot : slots)
-                                      slot->queue->stop();
-                              size_t joined = 0;
-                              for (auto& [name, slots] : *pools)
-                                  for (auto& slot : slots)
-                                      if (slot->thread && slot->thread->joinable()) {
-                                          slot->thread->join();
-                                          ++joined;
-                                      }
+                              auto joined = pools->stop_and_join();
                               LOG_INFO_SELF(self, "SqlitePlugin shutdown, {} workers joined",
                                             joined);
                           },

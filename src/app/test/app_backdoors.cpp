@@ -59,9 +59,11 @@ std::string build_reload_command(const std::string& spec) {
 /// 测试跑完进程挂死在等输入。
 void backdoor_auto_shutdown(caf::actor_system& sys, const BootstrapResult& fw) {
     run_smoke_tests(sys, fw);
-    std::cout << "[OpsTest] auto shutdown after smoke tests (delayed 2s)"
+    // SQL 插件自检是异步链；在负载较高的 CI 上，固定 2 秒会与事务
+    // COMMIT/校验回调竞态。留出 5 秒窗口后再触发统一关机。
+    std::cout << "[OpsTest] auto shutdown after smoke tests (delayed 5s)"
               << std::endl;
-    delayed_registry_send(sys, "shutdown_mgr", std::chrono::seconds(2),
+    delayed_registry_send(sys, "shutdown_mgr", std::chrono::seconds(5),
                           shutdown_atom{});
 }
 

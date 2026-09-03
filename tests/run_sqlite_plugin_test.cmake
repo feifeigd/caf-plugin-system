@@ -52,6 +52,7 @@ endif()
 
 foreach(marker
     "SQLite selfcheck ok=true rows=1"
+    "SQLite transaction selfcheck ok=true"
     "SqlitePlugin shutdown, 2 workers joined"
     "State: STOPPED"
     "framework shutdown complete")
@@ -69,4 +70,4 @@ if(NOT leak_pos EQUAL -1)
 endif()
 
 message(STATUS
-  "${TEST_NAME}: PASS (query ok, 2 workers joined, exit=0, no CRT leak report)")
+  "${TEST_NAME}: PASS (query + transaction ok, 2 workers joined, exit=0, no CRT leak report)")

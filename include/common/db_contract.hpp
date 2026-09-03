@@ -11,10 +11,14 @@
 //     且天然可序列化 → 跨节点调用可直接塞 plugin_envelope（function
 //     由各插件自管命名）。
 //
+// SQL 消息形态：
+//   - 普通请求：(sql, params) / (conn, sql, params)
+//   - 事务请求：(tx_handle, sql, params)
+//
 // 事务：tx_handle = uint64（CAF 内置类型，无需注册）。v1 语义：
-//   - MySQL/PG：begin 时从连接池借一条连接并标记占用（按调用方
-//     actor 维度），后续带 tx_handle 的请求钉在该连接上，
-//     commit/rollback 归还；
+//   - SQLite/MySQL/PG：begin 时从连接池借一条连接并标记占用，
+//     后续带 tx_handle 的 query/exec 钉在该连接上，commit/rollback
+//     归还；handle 是短生命周期不透明令牌，不应交给业务层持久化；
 //   - Redis：MULTI/EXEC 本身就是命令流，无需显式事务状态机；
 //   - MongoDB：多文档事务 v1 不支持（调用方自行承担）。
 // ------------------------------------------------------------------
