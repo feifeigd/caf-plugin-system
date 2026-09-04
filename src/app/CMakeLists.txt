@@ -5,6 +5,7 @@ add_executable(caf_plugin_app
     main.cpp
     test/app_backdoors.cpp
     test/app_tests_fixed.cpp
+    test/entity_store_tests.cpp
     ../core/plugin/dynamic_library.cpp
 )
 

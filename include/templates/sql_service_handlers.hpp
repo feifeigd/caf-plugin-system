@@ -70,6 +70,10 @@ public:
             [dispatcher](::tx_begin_atom, const std::string& name) {
                 dispatcher->begin_transaction(name);
             },
+            [dispatcher](::tx_begin_atom, const std::string& name,
+                         const std::string& request_key) {
+                dispatcher->begin_transaction(name, request_key);
+            },
             [dispatcher](::tx_begin_atom) {
                 dispatcher->begin_transaction(
                     dispatcher->default_connection());
@@ -79,6 +83,10 @@ public:
             },
             [dispatcher](::tx_rollback_atom, uint64_t tx) {
                 dispatcher->finish_transaction(tx, Operation::Rollback);
+            },
+            [dispatcher](::tx_rollback_atom, const std::string& request_key) {
+                dispatcher->finish_transaction(request_key,
+                                               Operation::Rollback);
             },
         };
     }
@@ -122,7 +130,7 @@ private:
         auto job = make_request_job(operation, sql, params);
         auto route = pools_->route_idle(name);
         if (!route) {
-            job->fail(route.error);
+            job->fail(route.error, route.code);
             return;
         }
         route.enqueue(std::move(job));
@@ -134,26 +142,38 @@ private:
         if (!is_request())
             return;
         auto job = make_request_job(operation, sql, params);
+        job->transaction = transaction;
         auto route = pools_->route_transaction(transaction);
         if (!route) {
-            job->fail(route.error);
+            // A request rejected while COMMIT is still queued must not release
+            // that transaction's slot. Only an executed job can report loss.
+            job->fail(route.error, db::error_code::transaction_lost);
             return;
         }
+        auto deliver = std::move(job->done);
+        job->done = [deliver = std::move(deliver), pools = pools_, transaction](
+                        db::db_result& result) mutable {
+            if (!result.ok && db::is_connection_error(result.code))
+                pools->release_transaction(transaction);
+            deliver(result);
+        };
         route.enqueue(std::move(job));
     }
 
-    void begin_transaction(const std::string& name) {
+    void begin_transaction(const std::string& name,
+                           const std::string& request_key = {}) {
         if (!is_request())
             return;
         auto promise = actor_->make_response_promise<db::db_result>();
-        auto route = pools_->acquire_transaction(name);
+        auto route = pools_->acquire_transaction(name, request_key);
         if (!route) {
-            deliver_error(promise, std::move(route.error));
+            deliver_error(promise, std::move(route.error), route.code);
             return;
         }
         const auto transaction = route.transaction;
         auto job = std::make_shared<Job>();
         job->op = Operation::Begin;
+        job->transaction = transaction;
         job->done = [promise, pools = pools_,
                      transaction](db::db_result& result) mutable {
             if (result.ok)
@@ -165,19 +185,44 @@ private:
         route.enqueue(std::move(job));
     }
 
-    void finish_transaction(uint64_t transaction, Operation operation) {
+    template <class Token>
+    void finish_transaction(const Token& token, Operation operation) {
         if (!is_request())
             return;
         auto promise = actor_->make_response_promise<db::db_result>();
-        auto route = pools_->route_transaction(transaction, true);
+        auto route = pools_->route_transaction(token, true);
         if (!route) {
-            deliver_error(promise, std::move(route.error));
+            deliver_error(promise, std::move(route.error),
+                          db::error_code::transaction_lost);
             return;
         }
+        const auto transaction = route.transaction;
         auto job = std::make_shared<Job>();
         job->op = operation;
-        job->done = [promise, pools = pools_,
-                     transaction](db::db_result& result) mutable {
+        job->transaction = transaction;
+        job->done = [promise, pools = pools_, slot = route.slot,
+                     transaction, operation](db::db_result& result) mutable {
+            if (operation == Operation::Commit && !result.ok) {
+                // COMMIT 失败不代表连接已退出事务。先在同一 worker 上清理，
+                // 再归还槽位，防止下一笔普通请求误入未结束的事务。
+                auto original = std::make_shared<db::db_result>(
+                    std::move(result));
+                auto cleanup = std::make_shared<Job>();
+                cleanup->op = Operation::Rollback;
+                cleanup->transaction = transaction;
+                cleanup->done = [promise, pools, slot, transaction, original](
+                                    db::db_result& rollback) mutable {
+                    if (!rollback.ok && !slot->recoverable())
+                        slot->fail_pending("transaction rollback failed");
+                    pools->release_transaction(transaction);
+                    promise.deliver(std::move(*original));
+                };
+                slot->enqueue(std::move(cleanup));
+                return;
+            }
+            if (operation == Operation::Rollback && !result.ok
+                && !slot->recoverable())
+                slot->fail_pending("transaction rollback failed");
             pools->release_transaction(transaction);
             promise.deliver(std::move(result));
         };
@@ -185,9 +230,11 @@ private:
     }
 
     template <class Promise>
-    static void deliver_error(Promise promise, std::string error) {
+    static void deliver_error(Promise promise, std::string error,
+                              db::error_code code) {
         db::db_result result;
         result.error = std::move(error);
+        result.code = code;
         promise.deliver(std::move(result));
     }
 

@@ -119,6 +119,7 @@ if(WIN32 OR UNIX)
         py_host_plugin
         redis_plugin
         sqlite_plugin
+        entity_store_plugin
         ts_host_plugin
     )
     set(RUNTIME_SCAN_BINARIES
@@ -159,6 +160,10 @@ if(WIN32 OR UNIX)
                 "-DDEST_DIR=${APP_NATIVE_LIB_DIR}"
                 "-DPLATFORM_KIND=${RUNTIME_PLATFORM_KIND}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/copy_runtime_dependencies.cmake"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSOURCE_BIN_DIR=${VCPKG_RUNTIME_DIR}"
+                "-DDEST_DIR=${APP_NATIVE_LIB_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/copy_mariadb_auth_plugins.cmake"
 
         COMMAND "${CMAKE_COMMAND}" -E make_directory
                 "${APP_RUN_DIR}/plugins/business"
@@ -171,6 +176,7 @@ if(WIN32 OR UNIX)
                 "${APP_RUN_DIR}/plugins/py_host"
                 "${APP_RUN_DIR}/plugins/redis"
                 "${APP_RUN_DIR}/plugins/sqlite"
+                "${APP_RUN_DIR}/plugins/entity_store"
                 "${APP_RUN_DIR}/plugins/ts_host"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:business_plugin>" "${APP_RUN_DIR}/plugins/business/"
@@ -192,6 +198,8 @@ if(WIN32 OR UNIX)
                 "$<TARGET_FILE:redis_plugin>" "${APP_RUN_DIR}/plugins/redis/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:sqlite_plugin>" "${APP_RUN_DIR}/plugins/sqlite/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:entity_store_plugin>" "${APP_RUN_DIR}/plugins/entity_store/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "$<TARGET_FILE:ts_host_plugin>" "${APP_RUN_DIR}/plugins/ts_host/"
 

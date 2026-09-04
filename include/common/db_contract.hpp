@@ -23,13 +23,64 @@
 //   - MongoDB：多文档事务 v1 不支持（调用方自行承担）。
 // ------------------------------------------------------------------
 
-#include <caf/fwd.hpp>
+#include <caf/default_enum_inspect.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace caf_plugin_system::db {
+
+// Classify recovery decisions without parsing localized driver messages.
+// A retryable error never authorizes replay of an individual SQL statement.
+enum class error_code : uint8_t {
+    none, sql_error, connection_unavailable, connection_lost,
+    transaction_lost, outcome_unknown,
+};
+
+inline std::string to_string(error_code code) {
+    switch (code) {
+        case error_code::none: return "none";
+        case error_code::sql_error: return "sql_error";
+        case error_code::connection_unavailable: return "connection_unavailable";
+        case error_code::connection_lost: return "connection_lost";
+        case error_code::transaction_lost: return "transaction_lost";
+        case error_code::outcome_unknown: return "outcome_unknown";
+    }
+    return "unknown";
+}
+
+inline bool from_integer(uint8_t raw, error_code& code) {
+    if (raw > static_cast<uint8_t>(error_code::outcome_unknown))
+        return false;
+    code = static_cast<error_code>(raw);
+    return true;
+}
+
+inline bool from_string(std::string_view text, error_code& code) {
+    for (uint8_t raw = 0; raw <= static_cast<uint8_t>(error_code::outcome_unknown); ++raw) {
+        auto candidate = static_cast<error_code>(raw);
+        if (text == to_string(candidate)) {
+            code = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class Inspector>
+bool inspect(Inspector& f, error_code& code) {
+    return caf::default_enum_inspect(f, code);
+}
+
+inline bool is_connection_error(error_code code) noexcept {
+    return code == error_code::connection_unavailable
+           || code == error_code::connection_lost
+           || code == error_code::transaction_lost
+           || code == error_code::outcome_unknown;
+}
 
 /// 统一结果集。
 /// - 查询：columns + rows（每行 = 每列字符串化的 cell）
@@ -40,9 +91,20 @@ struct db_result {
     std::string error;
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
+    // 与 rows 同形状：1 表示 SQL NULL，0 表示普通值。保留 rows 的字符串
+    // 契约，同时让上层区分 NULL 与空字符串；旧生产者不填时按非 NULL。
+    std::vector<std::vector<uint8_t>> nulls;
     int64_t affected = 0;
     std::string insert_id;
     int64_t duration_ms = 0;   // 执行耗时（驱动侧计时）
+    error_code code = error_code::none;
+    std::string native_code;
+    std::string sql_state;
+
+    bool is_null(size_t row, size_t column) const noexcept {
+        return row < nulls.size() && column < nulls[row].size()
+               && nulls[row][column] != 0;
+    }
 };
 
 template <class Inspector>
@@ -52,9 +114,13 @@ bool inspect(Inspector& f, db_result& x) {
         f.field("error", x.error),
         f.field("columns", x.columns),
         f.field("rows", x.rows),
+        f.field("nulls", x.nulls),
         f.field("affected", x.affected),
         f.field("insert_id", x.insert_id),
-        f.field("duration_ms", x.duration_ms)
+        f.field("duration_ms", x.duration_ms),
+        f.field("code", x.code),
+        f.field("native_code", x.native_code),
+        f.field("sql_state", x.sql_state)
     );
 }
 

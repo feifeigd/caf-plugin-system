@@ -13,7 +13,9 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -25,16 +27,19 @@ enum class Operation { Query, Exec, Begin, Commit, Rollback };
 
 struct Job {
     Operation op = Operation::Query;
+    uint64_t transaction = 0;
     std::string sql;
     std::vector<std::string> params;
     std::function<void(db::db_result&)> done;
 
-    void fail(const std::string& error) {
+    void fail(const std::string& error,
+              db::error_code code = db::error_code::connection_unavailable) {
         if (!done)
             return;
         db::db_result result;
         result.ok = false;
         result.error = error;
+        result.code = code;
         done(result);
     }
 };
@@ -93,8 +98,8 @@ class ConnectionSlot {
 public:
     using job_ptr = std::shared_ptr<Job>;
 
-    void enqueue(job_ptr job) {
-        queue_->push(std::move(job));
+    bool enqueue(job_ptr job) {
+        return queue_->push(std::move(job));
     }
 
     job_ptr next_job() {
@@ -102,8 +107,20 @@ public:
     }
 
     void fail_pending(const std::string& error) {
+        stop_source_.request_stop();
         queue_->fail_all(error);
     }
+
+    bool stopped() const { return stop_source_.stop_requested() || queue_->stopped(); }
+
+    std::stop_token stop_token() const noexcept { return stop_source_.get_token(); }
+
+    bool wait_for_stop(std::chrono::milliseconds timeout) {
+        return queue_->wait_for_stop(timeout);
+    }
+
+    void enable_recovery() noexcept { recoverable_.store(true); }
+    bool recoverable() const noexcept { return recoverable_.load(); }
 
     template <class Function, class... Args>
     void start_worker(Function&& function, Args&&... args) {
@@ -114,6 +131,9 @@ public:
     }
 
     void stop() {
+        // Callbacks only interrupt I/O; the owning worker still performs all
+        // native connection cleanup. Do not hold queue/transaction locks here.
+        stop_source_.request_stop();
         queue_->stop();
     }
 
@@ -136,19 +156,22 @@ private:
     friend class ConnectionPool;
 
     std::shared_ptr<JobQueue> queue_ = std::make_shared<JobQueue>();
+    std::stop_source stop_source_;
     std::shared_ptr<std::thread> worker_;
     TransactionSlot transaction_;
+    std::atomic<bool> recoverable_{false};
 };
 
 struct Route {
     std::shared_ptr<ConnectionSlot> slot;
     uint64_t transaction = 0;
     std::string error;
+    db::error_code code = db::error_code::none;
 
     explicit operator bool() const noexcept { return slot != nullptr; }
 
-    void enqueue(std::shared_ptr<Job> job) const {
-        slot->enqueue(std::move(job));
+    bool enqueue(std::shared_ptr<Job> job) const {
+        return slot->enqueue(std::move(job));
     }
 };
 
@@ -183,14 +206,18 @@ public:
         auto start = round_robin_.fetch_add(1, std::memory_order_relaxed);
         for (size_t offset = 0; offset < slots.size(); ++offset) {
             auto index = (start + offset) % slots.size();
-            if (slots[index]->transaction_.idle())
+            if (!slots[index]->stopped() && slots[index]->transaction_.idle())
                 return Route{slots[index], 0, {}};
         }
         return failed(backend_
                       + " pool exhausted (all connections in transactions)");
     }
 
-    Route acquire_transaction(const std::string& name) {
+    Route acquire_transaction(const std::string& name,
+                              const std::string& request_key = {}) {
+        std::lock_guard lock{transaction_keys_mutex_};
+        if (!request_key.empty() && keyed_transactions_.contains(request_key))
+            return failed("duplicate " + backend_ + " transaction request key");
         auto pool_it = pools_.find(name);
         auto index_it = indexes_.find(name);
         if (pool_it == pools_.end() || index_it == indexes_.end()
@@ -203,6 +230,8 @@ public:
         auto start = round_robin_.fetch_add(1, std::memory_order_relaxed);
         for (size_t offset = 0; offset < slots.size(); ++offset) {
             auto slot_index = (start + offset) % slots.size();
+            if (slots[slot_index]->stopped())
+                continue;
             auto generation = slots[slot_index]->transaction_.try_acquire();
             if (generation == 0)
                 continue;
@@ -212,6 +241,10 @@ public:
                               + " transaction slot index exceeds handle capacity");
             }
             auto tx = encode(pool_index, slot_index, generation);
+            if (!request_key.empty()) {
+                keyed_transactions_.emplace(request_key, tx);
+                transaction_keys_.emplace(tx, request_key);
+            }
             return Route{slots[slot_index], tx, {}};
         }
         return failed(backend_ + " transaction pool exhausted: " + name);
@@ -246,15 +279,36 @@ public:
         return Route{std::move(slot), tx, {}};
     }
 
+    // BEGIN 回执可能晚于调用方超时。关联键在投递 BEGIN 前已登记，调用方
+    // 无须知道 tx_handle 即可取消；ROLLBACK 会排在同一连接的 BEGIN 后。
+    Route route_transaction(const std::string& request_key,
+                            bool closing = false) {
+        std::lock_guard lock{transaction_keys_mutex_};
+        const auto it = keyed_transactions_.find(request_key);
+        if (it == keyed_transactions_.end())
+            return failed("inactive " + backend_ + " transaction request key");
+        return route_transaction(it->second, closing);
+    }
+
     bool release_transaction(uint64_t tx) {
+        std::lock_guard lock{transaction_keys_mutex_};
         const auto parts = decode(tx);
         if (parts.pool_index >= names_.size())
             return false;
         auto pool_it = pools_.find(names_[parts.pool_index]);
         if (pool_it == pools_.end() || parts.slot_index >= pool_it->second.size())
             return false;
-        return pool_it->second[parts.slot_index]->transaction_.release(
-            parts.generation);
+        const auto released =
+            pool_it->second[parts.slot_index]->transaction_.release(
+                parts.generation);
+        if (released) {
+            const auto key = transaction_keys_.find(tx);
+            if (key != transaction_keys_.end()) {
+                keyed_transactions_.erase(key->second);
+                transaction_keys_.erase(key);
+            }
+        }
+        return released;
     }
 
     size_t stop_and_join() {
@@ -295,8 +349,9 @@ private:
         };
     }
 
-    static Route failed(std::string error) {
-        return Route{nullptr, 0, std::move(error)};
+    static Route failed(std::string error,
+                        db::error_code code = db::error_code::connection_unavailable) {
+        return Route{nullptr, 0, std::move(error), code};
     }
 
     std::string backend_;
@@ -304,6 +359,9 @@ private:
     std::map<std::string, size_t> indexes_;
     std::vector<std::string> names_;
     std::atomic<size_t> round_robin_{0};
+    std::mutex transaction_keys_mutex_;
+    std::map<std::string, uint64_t> keyed_transactions_;
+    std::map<uint64_t, std::string> transaction_keys_;
 };
 
 } // namespace caf_plugin_system::sql_backend

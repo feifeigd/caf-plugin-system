@@ -100,6 +100,9 @@ struct framework_config : caf::actor_system_config {
     /// request，断言返回 request_timeout 错误（消除无穷等待）而非挂死
     ///（--test-timeout）。
     bool test_timeout = false;
+    /// EntityStore + SQLite 端到端验证后门：覆盖建档、字段 patch、幂等、
+    /// 同分区时序、乐观锁、事务回滚和读写连接分离。
+    bool test_entity_store = false;
     /// 集群验证后门：master 延迟后跨节点调用指定节点的 external_echo
     ///（--test-bridge-call=<节点名>，验证集群→外部进程链路）。
     std::string test_bridge_call;
@@ -138,7 +141,7 @@ struct framework_config : caf::actor_system_config {
             || test_ts_script || !test_cross_call.empty()
             || !test_cross_call_ex.empty() || !test_remote_reload.empty()
             || !test_bridge_call.empty() || !test_unload.empty()
-            || test_pomelo_push || test_timeout;
+            || test_pomelo_push || test_timeout || test_entity_store;
     }
 
     framework_config();

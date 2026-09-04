@@ -23,6 +23,40 @@ add_executable(test_sql_connection_pool
 target_link_libraries(test_sql_connection_pool PRIVATE caf_plugin_core)
 add_test(NAME sql_connection_pool COMMAND test_sql_connection_pool)
 
+add_executable(test_sql_entity_store
+    test_sql_entity_store.cpp
+)
+target_link_libraries(test_sql_entity_store PRIVATE caf_plugin_core)
+add_test(NAME sql_entity_store COMMAND test_sql_entity_store)
+
+foreach(sql_test sql_schema_provider sql_reconnecting_worker entity_store_recovery entity_store_schema_startup)
+    add_executable(test_${sql_test} test_${sql_test}.cpp)
+    target_link_libraries(test_${sql_test} PRIVATE caf_plugin_core)
+    add_test(NAME ${sql_test} COMMAND test_${sql_test})
+    set_tests_properties(${sql_test} PROPERTIES TIMEOUT 30)
+endforeach()
+
+# Socket lifetime/cancellation tests do not require a database or Docker.
+add_executable(test_sql_socket_cancellation test_sql_socket_cancellation.cpp)
+target_link_libraries(test_sql_socket_cancellation PRIVATE caf_plugin_core)
+if(WIN32)
+    target_link_libraries(test_sql_socket_cancellation PRIVATE ws2_32)
+endif()
+add_test(NAME sql_socket_cancellation COMMAND test_sql_socket_cancellation)
+set_tests_properties(sql_socket_cancellation PROPERTIES TIMEOUT 30)
+
+# Executed by the Docker runner against its existing isolated MySQL container.
+# Include the real driver implementation in this test so its worker I/O path is
+# exercised without adding a production-only test message or application hook.
+find_package(unofficial-libmariadb CONFIG REQUIRED)
+add_executable(test_mysql_cancellation test_mysql_cancellation.cpp)
+target_include_directories(test_mysql_cancellation PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_mysql_cancellation PRIVATE caf_plugin_core unofficial::libmariadb)
+target_compile_definitions(test_mysql_cancellation PRIVATE PLUGIN_NAME="mysql-cancellation-test")
+if(WIN32)
+    target_link_libraries(test_mysql_cancellation PRIVATE ws2_32)
+endif()
+
 # ------------------------------------------------------------------
 # typed_actor 跨 DLL 冒烟验证（评估 typed 重构可行性的最小试验田）
 # 结构：typed_smoke_plugin.dll（模拟插件，实现 typed 服务）
@@ -90,6 +124,37 @@ if(WIN32)
         RUN_SERIAL TRUE
         TIMEOUT 60
     )
+
+    add_test(NAME entity_store_plugin_e2e
+        COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_NAME=entity_store_plugin_e2e"
+            "-DRUNTIME_DIR=${CMAKE_CURRENT_BINARY_DIR}/entity_store_plugin_e2e-$<CONFIG>"
+            "-DAPP_EXE=$<TARGET_FILE:caf_plugin_app>"
+            "-DCORE_DLL=$<TARGET_FILE:caf_plugin_core>"
+            "-DSQLITE_DLL=$<TARGET_FILE:sqlite_plugin>"
+            "-DENTITY_STORE_DLL=$<TARGET_FILE:entity_store_plugin>"
+            "-DTHIRD_PARTY_DLL_DIR=${vcpkg_runtime_dir}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_entity_store_plugin_test.cmake"
+    )
+    set_tests_properties(entity_store_plugin_e2e PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 60
+    )
+
+    # Opt in explicitly: normal unit tests do not require Docker Desktop.
+    option(CAF_ENABLE_DOCKER_TESTS "Run real SQL backend tests using temporary Docker containers" OFF)
+    if(CAF_ENABLE_DOCKER_TESTS)
+        find_program(ENTITY_STORE_PWSH NAMES pwsh REQUIRED)
+        add_test(NAME entity_store_docker
+            COMMAND "${ENTITY_STORE_PWSH}" -NoProfile -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_entity_store_docker.ps1"
+                -BuildDir "${CMAKE_BINARY_DIR}" -Configuration "$<CONFIG>"
+        )
+        set_tests_properties(entity_store_docker PROPERTIES
+            RUN_SERIAL TRUE
+            TIMEOUT 600
+        )
+    endif()
 endif()
 
 # ------------------------------------------------------------------

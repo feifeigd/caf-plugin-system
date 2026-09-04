@@ -405,7 +405,9 @@ framework_config::framework_config() {
         .add(test_pomelo_push, "test-pomelo-push",
              "after startup, push game.event=hello-push to all pomelo connections (PUSH test)")
         .add(test_timeout, "test-timeout",
-             "request to a non-responding actor must return request_timeout instead of hanging (no-infinite-wait test)");
+             "request to a non-responding actor must return request_timeout instead of hanging (no-infinite-wait test)")
+        .add(test_entity_store, "test-entity-store",
+             "run EntityStore SQLite end-to-end test and shut down");
 }
 
 bool bootstrap_system_components(caf::actor_system& sys,

@@ -32,6 +32,9 @@ void run_ts_script_test(caf::actor_system& sys, const BootstrapResult& fw);
 /// == 配置偏移（time-offset），打印业务时间串与真实时间串对比。
 void run_time_offset_test();
 
+/// EntityStore + SQLite 端到端验证：业务侧只发送实体请求，不出现 SQL。
+bool run_entity_store_test(caf::actor_system& sys, const BootstrapResult& fw);
+
 /// 跨节点调用验证（--test-cross-call=<服务名>，master 进程执行）。
 /// RemoteCaller 缓存句柄 + 失败自动重试；循环调用观察杀/重启目标节点时
 /// "失败 → 自动恢复"（缓存失效 → 重新 resolve）。

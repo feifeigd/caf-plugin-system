@@ -304,6 +304,16 @@ void backdoor_timeout_check(caf::actor_system& sys, const app_config& cfg,
     caf::anon_send(fw.shutdown_mgr, shutdown_atom{});
 }
 
+/// EntityStore 端到端验证完成后直接走统一关机链。测试内部同步等待每一步，
+/// 因此无需固定延迟，也不会在事务尚未结束时关闭数据库连接池。
+void backdoor_entity_store(caf::actor_system& sys, const app_config& cfg,
+                           const BootstrapResult& fw) {
+    if (!cfg.test_entity_store)
+        return;
+    run_entity_store_test(sys, fw);
+    caf::anon_send(fw.shutdown_mgr, shutdown_atom{});
+}
+
 } // namespace
 
 void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
@@ -324,6 +334,7 @@ void run_test_backdoors(caf::actor_system& sys, const app_config& cfg,
     backdoor_unload_plugin(sys, cfg, fw);
     backdoor_pomelo_push(sys, cfg, fw);
     backdoor_timeout_check(sys, cfg, fw);
+    backdoor_entity_store(sys, cfg, fw);
 }
 
 } // namespace caf_plugin_system

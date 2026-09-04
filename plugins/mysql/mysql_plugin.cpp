@@ -20,8 +20,7 @@
 //   }
 // uri = mysql://user:pass@host:port/dbname（各段可省略）
 //
-// 断线重连：v1 不做（执行失败返回 error；驱动自动重连 MYSQL_OPT_RECONNECT
-// 留 v2 决策）。
+// 断线由公共 worker 分类并有界重连；已发送 SQL 不自动重放，旧事务失效。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
@@ -31,12 +30,15 @@
 #include "common/plugin_config.hpp"
 #include "templates/sql_service_handlers.hpp"
 #include "templates/sql_uri_config.hpp"
+#include "templates/sql_reconnecting_worker.hpp"
+#include "templates/sql_socket_cancellation.hpp"
 
 // libmariadb 依赖 winsock2（同 hiredis 坑），必须最先包含
 #ifdef _WIN32
 #include <winsock2.h>
 #endif
 #include <mysql.h>
+#include <errmsg.h>
 
 #include <caf/all.hpp>
 
@@ -64,7 +66,11 @@ using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 // X = 只读 conf；XC = conf + CLI 双通道（Phase 4 接线后生效）。
 #define MYSQL_FIELDS(X, XC)                                                   \
     X(caf::settings, uris, {})                                                \
-    X(int, pool_size, 2)
+    X(int, pool_size, 2)                                                      \
+    X(int, reconnect_attempts, 3)                                            \
+    X(int, reconnect_delay_ms, 100)                                          \
+    X(int, connect_timeout_seconds, 2)                                       \
+    X(int, io_timeout_seconds, 5)
 PLUGIN_CONFIG(MYSQL_FIELDS)
 #undef MYSQL_FIELDS
 
@@ -75,13 +81,39 @@ std::vector<SqlSpec> parse_uris(const caf::settings& uris) {
         {"mysql://"}, "root", 3306};
     return parser.parse(uris);
 }
+
+db::db_result mysql_failure(MYSQL* connection, MYSQL_STMT* statement = nullptr) {
+    db::db_result result;
+    const auto number = statement ? mysql_stmt_errno(statement)
+                                  : mysql_errno(connection);
+    result.native_code = std::to_string(number);
+    result.error = statement ? mysql_stmt_error(statement) : mysql_error(connection);
+    const char* state = statement ? mysql_stmt_sqlstate(statement)
+                                  : mysql_sqlstate(connection);
+    if (state)
+        result.sql_state = state;
+    result.code = number == CR_SERVER_GONE_ERROR || number == CR_SERVER_LOST
+                          || number == CR_SERVER_LOST_EXTENDED
+                          || number == CR_CONNECTION_ERROR || number == CR_CONN_HOST_ERROR
+                          || number == CR_IPSOCK_ERROR
+                          || result.sql_state.rfind("08", 0) == 0
+                      ? db::error_code::connection_lost
+                      : db::error_code::sql_error;
+    return result;
+}
+
+db::db_result mysql_cancelled() {
+    db::db_result result;
+    result.code = db::error_code::connection_lost;
+    result.sql_state = "08006";
+    result.error = "MySQL operation interrupted by shutdown";
+    return result;
+}
 /// 文本命令（BEGIN/COMMIT/ROLLBACK）。
 db::db_result exec_text(MYSQL* c, const char* cmd) {
     db::db_result r;
     if (mysql_real_query(c, cmd, static_cast<unsigned long>(std::strlen(cmd))) != 0) {
-        r.ok = false;
-        r.error = mysql_error(c);
-        return r;
+        return mysql_failure(c);
     }
     r.ok = true;
     return r;
@@ -90,7 +122,8 @@ db::db_result exec_text(MYSQL* c, const char* cmd) {
 /// 参数化查询/写。参数全字符串（MYSQL_TYPE_STRING）；结果集用
 /// mysql_stmt_fetch_column 两遍读取（先取长度再读），正确处理任意长度列。
 db::db_result stmt_execute(MYSQL* c, const std::string& sql,
-                           const std::vector<std::string>& params, bool want_rows) {
+                           const std::vector<std::string>& params, bool want_rows,
+                           std::stop_token stop) {
     db::db_result r;
     MYSQL_STMT* st = mysql_stmt_init(c);
     if (!st) {
@@ -98,7 +131,12 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
         return r;
     }
     if (mysql_stmt_prepare(st, sql.c_str(), static_cast<unsigned long>(sql.size())) != 0) {
-        r.error = mysql_stmt_error(st);
+        r = mysql_failure(c, st);
+        mysql_stmt_close(st);
+        return r;
+    }
+    if (mysql_stmt_param_count(st) != params.size()) {
+        r.error = "SQL parameter count does not match placeholders";
         mysql_stmt_close(st);
         return r;
     }
@@ -114,18 +152,18 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
             binds[i].buffer_length = static_cast<unsigned long>(params[i].size());
         }
         if (mysql_stmt_bind_param(st, binds.data()) != 0) {
-            r.error = mysql_stmt_error(st);
+            r = mysql_failure(c, st);
             mysql_stmt_close(st);
             return r;
         }
     }
     if (mysql_stmt_execute(st) != 0) {
-        r.error = mysql_stmt_error(st);
+        r = mysql_failure(c, st);
         mysql_stmt_close(st);
         return r;
     }
 
-    if (want_rows) {
+    if (want_rows) {    // Op::Query
         MYSQL_RES* meta = mysql_stmt_result_metadata(st);
         if (meta) {
             unsigned ncols = mysql_num_fields(meta);
@@ -145,42 +183,61 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
                 rbinds[i].is_null = &isnull[i];
             }
             if (mysql_stmt_bind_result(st, rbinds.data()) != 0) {
-                r.error = mysql_stmt_error(st);
+                r = mysql_failure(c, st);
                 mysql_free_result(meta);
                 mysql_stmt_close(st);
                 return r;
             }
-            while (mysql_stmt_fetch(st) == 0) {
+            for (;;) {
+                // Socket shutdown wakes blocked fetches. This also handles
+                // rows already buffered in the driver without another read.
+                if (stop.stop_requested()) {
+                    mysql_free_result(meta);
+                    mysql_stmt_close(st);
+                    return mysql_cancelled();
+                }
+                const auto fetched = mysql_stmt_fetch(st);
+                if (fetched == MYSQL_NO_DATA)
+                    break;
+                // Length-only bindings intentionally report truncated data.
+                // The complete values are read with fetch_column below.
+                if (fetched != 0 && fetched != MYSQL_DATA_TRUNCATED) {
+                    r = mysql_failure(c, st);
+                    mysql_free_result(meta);
+                    mysql_stmt_close(st);
+                    return r;
+                }
                 std::vector<std::string> row;
+                std::vector<uint8_t> nulls;
                 row.reserve(ncols);
+                nulls.reserve(ncols);
                 for (unsigned i = 0; i < ncols; ++i) {
                     if (isnull[i]) {
                         row.emplace_back();
+                        nulls.push_back(1u);
                         continue;
                     }
-                    // 第一遍：只拿长度（buffer 置空，驱动只填 length）
+                    nulls.push_back(0u);
+                    // fetch has already populated the full length and NULL bit.
                     MYSQL_BIND col = rbinds[i];
-                    col.buffer = nullptr;
-                    col.buffer_length = 0;
-                    if (mysql_stmt_fetch_column(st, &col, i, 0) != 0) {
-                        row.emplace_back();
-                        continue;
-                    }
-                    // 第二遍：分配后真正读取
                     std::string cell(rlen[i], '\0');
                     col.buffer = cell.data();
                     col.buffer_length = static_cast<unsigned long>(cell.size());
-                    if (mysql_stmt_fetch_column(st, &col, i, 0) == 0)
-                        row.push_back(std::move(cell));
-                    else
-                        row.emplace_back();
+                    if (!cell.empty() && mysql_stmt_fetch_column(st, &col, i, 0) != 0) {
+                        r = mysql_failure(c, st);
+                        mysql_free_result(meta);
+                        mysql_stmt_close(st);
+                        return r;
+                    }
+                    row.push_back(std::move(cell));
                 }
                 r.rows.push_back(std::move(row));
+                r.nulls.push_back(std::move(nulls));
             }
             mysql_free_result(meta);
         }
         r.ok = true;
-    } else {
+    } else { // Op::Exec
         r.affected = static_cast<int64_t>(mysql_stmt_affected_rows(st));
         unsigned long long id = mysql_insert_id(c);
         if (id != 0)
@@ -191,47 +248,106 @@ db::db_result stmt_execute(MYSQL* c, const std::string& sql,
     return r;
 }
 
-/// worker 主循环：独占一条连接，串行执行队列。
-void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot) {
-    MYSQL* c = mysql_init(nullptr);
-    if (!c) {
-        slot->fail_pending("mysql_init failed");
-        return;
-    }
-    if (!mysql_real_connect(c, spec.host.c_str(), spec.user.c_str(), spec.pass.c_str(),
-                            spec.dbname.empty() ? nullptr : spec.dbname.c_str(),
-                            spec.port, nullptr, 0)) {
-        std::string err = mysql_error(c);
-        mysql_close(c);
-        LOG_ERROR("MySQL [{}] connect failed: {} ({}:{} user={} db={})",
-                  spec.name, err, spec.host, spec.port, spec.user, spec.dbname);
-        slot->fail_pending("mysql connect failed: " + err);
-        return;
-    }
-    LOG_INFO("MySQL [{}] connected: {}:{}/{} user={}", spec.name, spec.host,
-             spec.port, spec.dbname, spec.user);
+using ReconnectPolicy = caf_plugin_system::sql_backend::ReconnectPolicy;
 
-    for (;;) {
-        auto job = slot->next_job();
-        if (!job)
-            break;
-        auto t0 = std::chrono::steady_clock::now();
-        db::db_result r;
-        switch (job->op) {
-            case Op::Begin:    r = exec_text(c, "BEGIN"); break;
-            case Op::Commit:   r = exec_text(c, "COMMIT"); break;
-            case Op::Rollback: r = exec_text(c, "ROLLBACK"); break;
-            case Op::Query:    r = stmt_execute(c, job->sql, job->params, true); break;
-            case Op::Exec:     r = stmt_execute(c, job->sql, job->params, false); break;
+class MySqlConnection final : public caf_plugin_system::sql_backend::SqlConnection {
+public:
+    MySqlConnection(SqlSpec spec, std::shared_ptr<ConnSlot> slot, ReconnectPolicy policy)
+        : spec_(std::move(spec)), slot_(std::move(slot)), policy_(policy) {}
+    ~MySqlConnection() override { close(); }
+
+    db::db_result connect() override {
+        close();
+        handle_ = mysql_init(nullptr);
+        if (!handle_) {
+            db::db_result result;
+            result.code = db::error_code::sql_error;
+            result.error = "mysql_init failed";
+            return result;
         }
-        r.duration_ms = static_cast<int64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - t0).count());
-        if (job->done)
-            job->done(r);
+        const my_bool automatic_reconnect = 0;
+        // Never let the driver silently replace a session inside a transaction.
+        if (mysql_options(handle_, MYSQL_OPT_RECONNECT, &automatic_reconnect) != 0
+            || mysql_options(handle_, MYSQL_OPT_CONNECT_TIMEOUT,
+                             &policy_.connect_timeout_seconds) != 0
+            || mysql_options(handle_, MYSQL_OPT_READ_TIMEOUT,
+                             &policy_.io_timeout_seconds) != 0
+            || mysql_options(handle_, MYSQL_OPT_WRITE_TIMEOUT,
+                             &policy_.io_timeout_seconds) != 0
+            || mysql_options(handle_, MYSQL_SET_CHARSET_NAME, "utf8mb4") != 0)
+            return mysql_failure(handle_);
+        if (!mysql_real_connect(handle_, spec_.host.c_str(), spec_.user.c_str(),
+                                spec_.pass.c_str(),
+                                spec_.dbname.empty() ? nullptr : spec_.dbname.c_str(),
+                                spec_.port, nullptr, 0)) {
+            auto result = mysql_failure(handle_);
+            if (db::is_connection_error(result.code))
+                result.code = db::error_code::connection_unavailable;
+            LOG_WARN("MySQL [{}] connection unavailable: {}", spec_.name, result.error);
+            return result;
+        }
+        // Register only after connect has returned on the owning worker. A
+        // concurrently requested stop is delivered immediately on registration.
+        cancellation_ = std::make_unique<caf_plugin_system::sql_backend::SocketCancellation>(
+            mysql_get_socket(handle_), slot_->stop_token());
+        if (!cancellation_->valid()) {
+            db::db_result result;
+            result.code = db::error_code::connection_unavailable;
+            result.error = "cannot create MySQL I/O cancellation handle";
+            return result;
+        }
+        if (slot_->stopped())
+            return mysql_cancelled();
+        LOG_INFO("MySQL [{}] connected: {}:{}/{} user={}", spec_.name,
+                 spec_.host, spec_.port, spec_.dbname, spec_.user);
+        db::db_result result;
+        result.ok = true;
+        return result;
     }
 
-    mysql_close(c);
+    void close() noexcept override {
+        // Unregister/wait for the stop callback and close the duplicate first.
+        // mysql_close and statement cleanup run only on this worker thread.
+        cancellation_.reset();
+        if (handle_) {
+            mysql_close(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    db::db_result execute(const Job& job) override {
+        if (slot_->stopped())
+            return mysql_cancelled();
+        db::db_result result;
+        switch (job.op) {
+            case Op::Begin: result = exec_text(handle_, "BEGIN"); break;
+            case Op::Commit: result = exec_text(handle_, "COMMIT"); break;
+            case Op::Rollback: result = exec_text(handle_, "ROLLBACK"); break;
+            case Op::Query:
+                result = stmt_execute(handle_, job.sql, job.params, true, slot_->stop_token());
+                break;
+            case Op::Exec:
+                result = stmt_execute(handle_, job.sql, job.params, false, slot_->stop_token());
+                break;
+        }
+        // Do not report partial rows or a racing driver success after cancel.
+        // The common worker preserves outcome_unknown for Exec/COMMIT.
+        return slot_->stopped() ? mysql_cancelled() : result;
+    }
+
+private:
+    SqlSpec spec_;
+    std::shared_ptr<ConnSlot> slot_;
+    ReconnectPolicy policy_;
+    MYSQL* handle_ = nullptr;
+    std::unique_ptr<caf_plugin_system::sql_backend::SocketCancellation> cancellation_;
+};
+
+void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot,
+                     ReconnectPolicy policy) {
+    caf_plugin_system::sql_backend::ReconnectingSqlWorker worker{
+        slot, std::make_unique<MySqlConnection>(spec, slot, policy), policy};
+    worker.run();
     LOG_INFO("MySQL [{}] worker exited", spec.name);
 }
 
@@ -256,8 +372,13 @@ public:
         auto cfg = load_plugin_config(sys.config());
         caf::settings uris = cfg.uris;
         int pool_size = cfg.pool_size < 1 ? 1 : cfg.pool_size;
+        ReconnectPolicy reconnect;
+        reconnect.max_attempts = static_cast<unsigned>(std::clamp(cfg.reconnect_attempts, 1, 10));
+        reconnect.initial_delay = std::chrono::milliseconds{std::clamp(cfg.reconnect_delay_ms, 1, 1000)};
+        reconnect.connect_timeout_seconds = static_cast<unsigned>(std::clamp(cfg.connect_timeout_seconds, 1, 10));
+        reconnect.io_timeout_seconds = static_cast<unsigned>(std::clamp(cfg.io_timeout_seconds, 1, 30));
 
-        return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
+        return sys.spawn([logger, uris, pool_size, reconnect](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<SqlSpec>>(parse_uris(uris));
             // 池表：name → slots（按 specs 顺序构建，槽序号 = specs 内索引）
             auto pools = std::make_shared<SqlPool>("mysql");
@@ -272,7 +393,7 @@ public:
                 for (const auto& s : *specs) {
                     for (int i = 0; i < pool_size; ++i) {
                         auto slot = pools->add_slot(s.name);
-                        slot->start_worker(sql_worker_main, s, slot);
+                        slot->start_worker(sql_worker_main, s, slot, reconnect);
                     }
                     LOG_INFO_SELF(self, "pool launched: [{}] {}:{}/{} size={}",
                                   s.name, s.host, s.port, s.dbname, pool_size);

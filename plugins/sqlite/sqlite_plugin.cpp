@@ -98,14 +98,19 @@ db::db_result execute(sqlite3* conn, const Job& job) {
                 columns_added = true;
             }
             std::vector<std::string> row;
+            std::vector<uint8_t> nulls;
             row.reserve(static_cast<size_t>(count));
+            nulls.reserve(static_cast<size_t>(count));
             for (int i = 0; i < count; ++i) {
+                const auto is_null = sqlite3_column_type(stmt, i) == SQLITE_NULL;
                 auto text = sqlite3_column_text(stmt, i);
                 auto bytes = sqlite3_column_bytes(stmt, i);
                 row.emplace_back(text ? reinterpret_cast<const char*>(text) : "",
                                  text ? static_cast<size_t>(bytes) : 0);
+                nulls.push_back(is_null ? 1u : 0u);
             }
             result.rows.push_back(std::move(row));
+            result.nulls.push_back(std::move(nulls));
         } else if (rc == SQLITE_DONE) {
             break;
         } else {

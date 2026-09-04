@@ -8,13 +8,14 @@
 // 存/取/停，零业务知识。
 //
 // 语义（四个数据库插件逐字复制的版本统一收敛于此）：
-//   - push()：入队 + notify_one
+//   - push()：运行中入队；停止后立即回错误，绝不把任务留在无人消费的队列
 //   - pop()：阻塞直到有 job 或 stop；返回 nullptr = 应退出
 //   - fail_all()：清空队列 + 全部回错误 + 停（连接失败场景）
 //   - stop()：仅置 running=false 并唤醒，残留 job 不处理
 // ------------------------------------------------------------------
 
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -27,12 +28,22 @@ class JobQueue {
 public:
     using job_ptr = std::shared_ptr<Job>;
 
-    void push(job_ptr j) {
+    bool push(job_ptr j) {
+        bool accepted = false;
         {
             std::lock_guard<std::mutex> lk(m);
-            jobs.push_back(std::move(j));
+            if (running) {
+                jobs.push_back(std::move(j));
+                accepted = true;
+            }
         }
-        cv.notify_one();
+        if (accepted) {
+            cv.notify_one();
+            return true;
+        }
+        if (j)
+            j->fail("database worker queue is stopped");
+        return false;
     }
 
     // 返回 nullptr = 应退出（stop 已调用且队列清空）
@@ -67,8 +78,19 @@ public:
         cv.notify_all();
     }
 
+    bool stopped() const {
+        std::lock_guard<std::mutex> lk(m);
+        return !running;
+    }
+
+    // New work must not shorten the reconnect backoff; shutdown must.
+    bool wait_for_stop(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, timeout, [this] { return !running; });
+    }
+
 private:
-    std::mutex m;
+    mutable std::mutex m;
     std::condition_variable cv;
     std::deque<job_ptr> jobs;
     bool running = true;

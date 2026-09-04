@@ -50,6 +50,18 @@ int main() {
     assert(pools.route_transaction(next.transaction));
     assert(pools.release_transaction(next.transaction));
 
+    // 即使 BEGIN 回执尚未返回，关联键也能定位并取消同一笔事务。
+    auto cancellable = pools.acquire_transaction("main", "begin-request-1");
+    assert(cancellable);
+    assert(!pools.acquire_transaction("main", "begin-request-1"));
+    auto cancel_route = pools.route_transaction(std::string{"begin-request-1"},
+                                               true);
+    assert(cancel_route);
+    assert(cancel_route.transaction == cancellable.transaction);
+    assert(cancel_route.slot == cancellable.slot);
+    assert(pools.release_transaction(cancellable.transaction));
+    assert(!pools.route_transaction(std::string{"begin-request-1"}));
+
     auto missing = pools.route_idle("missing");
     assert(!missing);
     assert(missing.error.find("unknown") != std::string::npos);
@@ -77,6 +89,17 @@ int main() {
     assert(completed.get());
     assert(worker_pool.stop_and_join() == 1);
     assert(worker_pool.stop_and_join() == 0);
+
+    // 连接失败后队列已停止：后续请求必须立刻失败，不能无限堆积。
+    auto stopped = std::make_shared<caf_plugin_system::sql_backend::Job>();
+    bool stopped_failed = false;
+    stopped->done = [&stopped_failed](
+                        caf_plugin_system::db::db_result& result) {
+        stopped_failed = !result.ok
+                         && result.error.find("stopped") != std::string::npos;
+    };
+    assert(!worker_slot->enqueue(std::move(stopped)));
+    assert(stopped_failed);
 
     caf::settings uri_settings{
         {"main", caf::config_value{std::string{
