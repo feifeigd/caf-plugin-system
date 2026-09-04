@@ -181,6 +181,15 @@ try {
                 # Also covers staging/cleanup failures before CMake removes credentials.
                 $configPath = "$runtime/caf-application.conf"
                 if (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath }
+                # Preserve diagnostics, not duplicate copies of build outputs.
+                if (Test-Path -LiteralPath $runtime) {
+                    $resolvedRuntime = (Resolve-Path -LiteralPath $runtime).Path
+                    if ([IO.Path]::GetDirectoryName($resolvedRuntime) -ne
+                        [IO.Path]::GetFullPath("$buildRoot/tests")) { throw 'Unexpected runtime cleanup target.' }
+                    Get-ChildItem -LiteralPath $resolvedRuntime -File |
+                        Where-Object Extension -in @('.exe', '.dll', '.pdb') |
+                        ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+                }
             }
             [ordered]@{
                 backend = $kind; image = $image; image_id = $imageId

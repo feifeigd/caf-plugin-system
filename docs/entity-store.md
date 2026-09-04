@@ -4,8 +4,8 @@
 
 游戏、订单、支付等业务只依赖逻辑实体，不手写日常读写 SQL。统一协议在
 `include/common/entity_store_contract.hpp`，`EntityStorePlugin` 已提供
-`entity_store` 服务，当前有 SQLite、MySQL、PostgreSQL 三种 SQL 方言。
-MongoDB/Redis 的实体适配尚未实现，不能把底层数据库插件存在等同于实体层已经支持。
+`entity_store` 服务，支持 SQLite、MySQL、PostgreSQL 和 MongoDB。
+Redis 目前仍只有底层操作接口，没有接入这个实体事务协议。
 
 ```text
 Game / Order / Payment actor
@@ -15,7 +15,8 @@ Game / Order / Payment actor
     EntityStore service
       | schema、读写路由、时序、版本、幂等、事务
       v
-SQL adapter -> mysql_service / pg_service / sqlite_service
+SQL adapter   -> mysql_service / pg_service / sqlite_service
+Mongo adapter -> mongo_service
 ```
 
 这层划分有两个目的：
@@ -122,7 +123,7 @@ WHERE order_id = ? AND version = ?;
 
 ## 事务执行
 
-EntityStore 对一次 save 执行固定状态机：
+SQL EntityStore 对一次 save 执行固定状态机（MongoDB 执行路径见下方专节）：
 
 1. 校验请求、schema、字段类型、幂等键长度、在途请求上限和同分区约束。
 2. 开启数据库事务并取得仅在适配器内部使用的 `tx_handle`。
@@ -161,12 +162,58 @@ worker 的策略。旧事务令牌永远不能在重连后的新会话继续执�
 SQLite、MySQL 和 PostgreSQL 插件只保留连接建立、参数绑定、SQL 执行和结果集
 转换等驱动相关代码。EntityStore 自身也按 OOP 拆分为：
 
-- `sql_entity_store_schema.hpp`：`schema_catalog`，字段白名单和读写服务/连接配置；
+- `entity_store_schema.hpp`：SQL/Mongo 共用的 `schema_catalog`，字段白名单和读写路由；
+  `sql_entity_store_schema.hpp` 保留旧命名空间别名，兼容已有调用；
 - `sql_entity_store_statements.hpp`：`sql_dialect`、`statement_builder`，参数化 SQL 生成和结果解码；
 - `sql_entity_store_actor.hpp`：`entity_store_actor`，保存队列、事务状态机、幂等回放和排空。
 - `sql_entity_store_schema_provider.hpp`：`schema_provider` 及三种数据库实现，生成
   参数化元数据查询、补全字段、校验业务配置；本身不做 I/O。
 - `sql_entity_store_recovery.hpp`：actor 的异步表结构加载、纯读取和整笔保存重试。
+
+## MongoDB 适配
+
+使用 `dialect = "mongodb"`（也接受 `"mongo"`），同时加载 `MongoPlugin` 与
+`EntityStorePlugin`；完整配置见 [MongoDB 示例](../examples/entity_store/mongodb.conf)。
+业务层继续使用上面的 `load_request` / `save_request`，不用手写 SQL 或 Mongo 更新文档。
+
+- 沿用公共 schema 配置：`table` 对应集合，`column` 对应 BSON 字段。
+  `keys` / `fields` 是明确的字段白名单；只修改 patch 中的字段，保留未涉及的数据。
+  Mongo 当前仅支持 `schema_source = "manual"`；集合没有固定表结构，不能安全地用
+  抽样文档推断整套字段、必填约束和键，因此 `database` 模式会明确报错。
+- `set` / `increment` / `erase` 分别映射到 `$set` / `$inc` / `$unset`。
+  `value::null()` 写 BSON null，`erase` 删除字段；两者仅允许用于 nullable 字段，
+  读取缺失的 nullable 字段返回 null。Mongo 缺失字段可由 `$inc` 创建，但显式 null 不能
+  直接累加（会报错并回滚），这与 SQL 的 NULL 运算规则不同。新建时必须提供所有必填字段。
+- 键字段、只读字段和版本字段禁止 patch 修改。版本必须是正 BSON int64，新建为 1。
+  已有文档应先迁移到该约定。系统 `_id` 可以映射为业务键，不能映射成普通字段或版本；
+  未显式映射的 `_id` 不会暴露给业务，当前协议没有 ObjectId 类型；JSON 数组不能作为键。
+  默认读取只返回普通字段；键已在 `target` 中，需要时可通过字段投影显式请求。
+- 首次保存会在事务外创建去重集合和业务键唯一索引。已有重复键、冲突索引或权限不足会
+  令保存失败；账号需要相应建集合/建索引权限。不会重写已有文档或自动修复脏数据。
+- 一次保存固定在一个 worker 的同一个 session 中，业务变更与去重结果使用真正的多文档
+  事务，snapshot 读取、primary 路由、majority 提交；不能跨不同 store / 数据库连接。
+  MongoDB 必须是副本集或支持事务的分片集群，普通 standalone 不支持该能力。
+  参见 [MongoDB 官方事务说明](https://www.mongodb.com/docs/manual/core/transactions/)。
+- 同一 `store + partition` 按接收顺序排队，并固定到同一写 worker；不同分区可并行。
+  这不是跨进程全局排序，仍应使用版本检查。load 按读路由执行，读副本可在对应 URI
+  配置 `readPreference=secondaryPreferred`；不保证副本上的写后即读。
+- 事务暂态失败可在预算内重试整笔；`UnknownTransactionCommitResult` 只重试确认
+  同一笔提交。无法确认时返回 `commit_unknown`，调用方必须保留原 `request_id` 和内容。
+  同一去重集合内 `request_id` 必须全局唯一，限制为 255 字节；
+  同 ID 换内容（包括改 partition）返回 `conflict`。去重记录没有自动过期策略。
+- 共享 `request_timeout_ms`、重试次数/退避和排队上限。Mongo worker 的连接、选主与
+  socket 等待固定限制为各 2 秒，覆盖 URI 中这些超时配置，并关闭驱动普通读写自动重放；
+  EntityStore 自行控制重试。停止会取消排队/退避，当前阻塞调用等待驱动超时，再由所属
+  worker 释放 session/client 并 join；总退出时间并非硬实时保证。
+
+类型转换由独立 `EntityCodec` 负责：布尔、signed int64、double、字符串、二进制均为
+BSON 原生类型；decimal 和 unsigned integer 使用 Decimal128（不经过 double），
+JSON 对象/数组存为嵌套 BSON，不是 JSON 字符串。整数越界、非有限数值、类型不符会被
+拒绝；JSON 标量不支持。Mongo 支持 `bytes`，SQL 的二进制限制不变。保存签名最大 8 MiB。
+
+Mongo 专用调度、配置、BSON 转换和原生事务分别放在独立类/文件中；底层已有的
+`mongo_op_atom` CRUD 接口仍可使用，但该接口的多次调用不自动组成 EntityStore 事务，
+也不自动获得实体层的版本、白名单、排序和幂等保护。
 
 ## 写入时序
 
@@ -192,7 +239,7 @@ SQLite、MySQL 和 PostgreSQL 插件只保留连接建立、参数绑定、SQL �
 这只是路由能力，不会自动建立数据库复制，也不消除副本延迟。需要强一致读取时，
 把该 store 的读路由指向主库；当前 load_request 没有自动 read-your-writes 标记。
 
-## 并发、超时与重试
+## SQL 并发、超时与重试
 
 - 推荐所有可覆盖写都带 `check_version=true`，防止最后写入者静默覆盖。
 - `increment` 必须生成数据库原子表达式，不能先读后加。
@@ -290,18 +337,30 @@ MySQL 已建立连接的阻塞读写支持停止中断：每个槽保留一个�
 可用示例见 [SQLite 配置](../examples/entity_store/sqlite.conf) 和
 [SQLite 业务表迁移](../examples/entity_store/sqlite-schema.sql)。配置加载入口必须同时
 包含 `EntityStorePlugin` 与选定的数据库插件；数据库类型由 `dialect` 决定。
-EntityStore 优先级为 100，内置 SQL 插件为 0，默认先启动数据库、先停止 EntityStore。
+EntityStore 优先级为 100，内置数据库插件为 0，默认先启动数据库、先停止 EntityStore。
 若显式指定 `shutdown-order`，也应保持这个停机次序。
 数据库插件单独热更前也应先排空上层 EntityStore；当前不支持让已开始的事务
 跨数据库插件实例续接，旧实例的事务句柄不能在新实例中复用。
 
-业务代码不需要 SQL；建表、索引和结构迁移仍属于数据库部署工作。EntityStore 只自动
+SQL 业务代码不需要 SQL；建表、索引和结构迁移仍属于数据库部署工作。SQL EntityStore 只自动
 创建自己的幂等表，不自动迁移业务表。SQLite 金额示例使用整数分，避免浮点运算精度问题。
 SQL schema 当前不接受 `bytes` 字段；NULL 与空字符串通过结果集的 NULL 位图区分。
 PostgreSQL 文本不支持内嵌 NUL 字节；驱动会拒绝这类参数和 SQL，避免静默截断主键或字段。
 
 ## 验证范围
 
+- 2026-09-04：最新 Debug 完整构建成功，全部 **19/19 CTest 通过**（190.75 秒），
+  包含 SQLite 应用集成以及依次新建的 MySQL、PostgreSQL、MongoDB 容器测试。
+  首轮全量回归曾因工作盘空间不足在复制运行库时失败；清理本轮副本并补上自动回收后，
+  完整重跑通过。运行库副本可重新生成，源码、原始构建产物和诊断日志未删除。
+- MongoDB 新增独立 schema/config、actor 调度和真实插件 Docker 测试。2026-09-04 的
+  单节点副本集联调通过：字段投影、原生 BSON、部分更新/NULL/删除、整数边界、多集合
+  提交/回滚、版本冲突、幂等与跨 partition 重用 ID 拒绝、同分区顺序和独立读写连接。
+  服务器日志确认暂态事务错误及提交 writeConcernError 两个失败注入确实触发，重试未重复累加。
+  程序自然退出，worker 完整回收，未发现 CRT 泄漏报告；临时容器及数据已清理。
+- Mongo actor 强制退出用例在独立 actor_system/时钟自然销毁后检查弱引用，排除 CAF 1.1
+  请求超时定时器的合法外部引用后检测自环；同分区队列、路由、限流、drain 和超时测试
+  连续重复 5 次通过。上述结果不等于所有负载、故障和第三方驱动场景均绝无泄漏。
 - 单元测试覆盖契约、SQL 方言、字段投影、patch、NULL/版本列校验、事务连接路由及关联键取消。
 - `entity_store_plugin_e2e` 使用真实 SQLite、两组命名连接和每组两个 worker，覆盖
   建档、部分更新、幂等重放/冲突、同分区时序、乐观锁、多实体回滚、读写路由、NULL 和提前取消事务。
@@ -348,6 +407,8 @@ PowerShell 7，以及本机已有 `mysql:8.0` 和 `postgres:16-alpine` 镜像。
 `database-stdout.log` / `database-stderr.log` 分别保存两种 Schema 模式的应用输出，
 `database.log` 保存数据库日志，
 `docker-run.json` 记录镜像 ID、容器 ID 和运行时间；数据本身不保留。
+每轮结束自动删除隔离运行目录中的 EXE/DLL/PDB 副本，保留日志与元数据；
+原始构建产物不受影响，避免多次联调持续占用工作盘。
 
 也可在 CMake 配置中启用 `CAF_ENABLE_DOCKER_TESTS=ON`，将串行的
 `entity_store_docker` 加入 CTest；默认关闭，普通测试不依赖 Docker。
@@ -368,11 +429,28 @@ MySQL 容器内还运行 `test_mysql_cancellation`：持续慢结果流、等待
 强制杀死脚本进程或 Docker 引擎失联时，不能保证自动清理；可依据容器上的
 `caf.test=entity-store` / `caf.test.run` 标签定位本轮测试容器，勿清理已有业务数据库。
 
+### MongoDB Docker 回归
+
+```powershell
+cmake --build --preset windows-x64-debug --target test_mongo_entity_store --parallel 2
+pwsh -NoProfile -File ./tests/run_mongo_entity_store_docker.ps1
+```
+
+需要本机已有 `mongo:7` 镜像。脚本每次新建一个单节点副本集，随机端口只绑定
+127.0.0.1，使用与 SQL 脚本相同的互斥锁；不会复用或停止已有数据库容器。
+测试执行后自然退出，收集日志，再删除本次容器；不验证跨节点复制延迟或真实选主故障切换。
+启用 `CAF_ENABLE_DOCKER_TESTS` 后，CTest 同时注册 `mongo_entity_store_docker`。
+每轮日志保存在 `out/build/windows-x64/tests/mongo_entity_store_docker-<配置>-<运行号>/`，
+包含 `stdout.log`、`stderr.log`、数据库日志和镜像/容器 ID 元数据。强制终止脚本或
+Docker 引擎失联可能阻断清理，应根据本轮 ID 与 `caf.test=entity-store-mongo` 标签确认后处理。
+Mongo runner 从已有依赖目录加载第三方 DLL，并在结束时删除本轮运行库副本；
+即使日志写入失败，也会尝试清理已确认归属的容器。
+
 ## 后端能力边界
 
 - MySQL / PostgreSQL / SQLite：实体 SQL 适配层已实现字段投影、patch、乐观锁和单连接事务。
-- MongoDB：字段投影与 patch 可直接映射；多文档事务需要 replica set/session
-  支持，实现前不能声称 save 批次原子。
+- MongoDB：已实现字段投影、patch、版本检查、持久化幂等和 session 多文档事务；
+  需要副本集或支持事务的分片集群，字段 schema 目前手动配置。
 - Redis：适合作缓存或通过 Lua 实现单 key 原子更新；不要把 MULTI/EXEC 的
   命令流伪装成跨实体强事务。
 

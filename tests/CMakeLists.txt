@@ -29,12 +29,30 @@ add_executable(test_sql_entity_store
 target_link_libraries(test_sql_entity_store PRIVATE caf_plugin_core)
 add_test(NAME sql_entity_store COMMAND test_sql_entity_store)
 
+foreach(mongo_test mongo_entity_store_schema mongo_entity_store_actor)
+    add_executable(test_${mongo_test} test_${mongo_test}.cpp)
+    target_link_libraries(test_${mongo_test} PRIVATE caf_plugin_core)
+    add_test(NAME ${mongo_test} COMMAND test_${mongo_test})
+    set_tests_properties(${mongo_test} PROPERTIES TIMEOUT 30)
+endforeach()
+
 foreach(sql_test sql_schema_provider sql_reconnecting_worker entity_store_recovery entity_store_schema_startup)
     add_executable(test_${sql_test} test_${sql_test}.cpp)
     target_link_libraries(test_${sql_test} PRIVATE caf_plugin_core)
     add_test(NAME ${sql_test} COMMAND test_${sql_test})
     set_tests_properties(${sql_test} PROPERTIES TIMEOUT 30)
 endforeach()
+
+# Native BSON inspection plus two dynamically loaded production plugins.
+# The executable requires an isolated replica set; only the Docker runner invokes it.
+find_package(mongocxx CONFIG REQUIRED)
+add_executable(test_mongo_entity_store test_mongo_entity_store.cpp)
+if(TARGET mongo::mongocxx_shared)
+    target_link_libraries(test_mongo_entity_store PRIVATE caf_plugin_core mongo::mongocxx_shared)
+else()
+    target_link_libraries(test_mongo_entity_store PRIVATE caf_plugin_core mongo::mongocxx_static)
+endif()
+add_dependencies(test_mongo_entity_store mongo_plugin entity_store_plugin)
 
 # Socket lifetime/cancellation tests do not require a database or Docker.
 add_executable(test_sql_socket_cancellation test_sql_socket_cancellation.cpp)
@@ -142,7 +160,7 @@ if(WIN32)
     )
 
     # Opt in explicitly: normal unit tests do not require Docker Desktop.
-    option(CAF_ENABLE_DOCKER_TESTS "Run real SQL backend tests using temporary Docker containers" OFF)
+    option(CAF_ENABLE_DOCKER_TESTS "Run real database tests using temporary Docker containers" OFF)
     if(CAF_ENABLE_DOCKER_TESTS)
         find_program(ENTITY_STORE_PWSH NAMES pwsh REQUIRED)
         add_test(NAME entity_store_docker
@@ -153,6 +171,15 @@ if(WIN32)
         set_tests_properties(entity_store_docker PROPERTIES
             RUN_SERIAL TRUE
             TIMEOUT 600
+        )
+        add_test(NAME mongo_entity_store_docker
+            COMMAND "${ENTITY_STORE_PWSH}" -NoProfile -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_mongo_entity_store_docker.ps1"
+                -BuildDir "${CMAKE_BINARY_DIR}" -Configuration "$<CONFIG>"
+        )
+        set_tests_properties(mongo_entity_store_docker PROPERTIES
+            RUN_SERIAL TRUE
+            TIMEOUT 300
         )
     endif()
 endif()

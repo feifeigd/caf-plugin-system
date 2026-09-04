@@ -6,7 +6,7 @@
 //   （独占 mongocxx::client）→ rp.deliver() 回调用方。
 // 差异仅在驱动适配：
 //   - 操作：JSON 参数化（BSON 天然 JSON 化，无注入面）
-//   - 无事务状态机：多文档事务 v1 不支持（调用方自行承担）
+//   - 原始 mongo_op 保持原语义；EntityStore 使用 session 多文档事务
 //   - 结果：find/aggregate → 每文档一行 JSON；写操作 → affected/insert_id
 //
 // 消息（mongo_op_atom，db_contract 契约）：
@@ -63,10 +63,13 @@
 #include <bsoncxx/exception/exception.hpp>
 #include <bsoncxx/json.hpp>
 
+#include "mongo_entity_store.hpp"
+
 #include <caf/all.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -78,9 +81,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <stop_token>
 
 namespace db = caf_plugin_system::db;
 namespace bbs = bsoncxx::builder::basic;
+namespace entities = caf_plugin_system::entity_store;
+namespace mongo_entities = caf_plugin_system::entity_store::mongo;
 
 namespace {
 
@@ -137,9 +143,30 @@ struct Job {
     std::string collection;
     std::string json;
     std::function<void(db::db_result&)> done;  // worker 执行完回调（deliver）
+    std::function<void(entities::load_result)> load_done;
+    std::function<void(entities::save_result)> save_done;
+    entities::load_request load;
+    entities::save_request save;
+    std::chrono::steady_clock::time_point deadline;
+    std::function<void()> released;
+
+    ~Job() { if (released) released(); }
 
     /// 失败交付方式（JobQueue::fail_all 统一调用）。
     void fail(const std::string& err) {
+        if (load_done) {
+            entities::load_result result;
+            result.target = load.target;
+            result.code = entities::result_code::unavailable;
+            result.error = err;
+            load_done(std::move(result));
+        } else if (save_done) {
+            entities::save_result result;
+            result.request_id = save.request_id;
+            result.code = entities::result_code::unavailable;
+            result.error = err;
+            save_done(std::move(result));
+        }
         if (done) {
             db::db_result r;
             r.ok = false;
@@ -152,9 +179,38 @@ struct Job {
 using JobQueue = caf_plugin_system::JobQueue<Job>;
 
 /// 连接槽：一个 mongocxx::client + 专属队列 + worker 线程。
-struct ConnSlot {
+struct WorkerState {
     std::shared_ptr<JobQueue> queue = std::make_shared<JobQueue>();
-    std::shared_ptr<std::thread> thread;
+    std::stop_source stop;
+    std::atomic<size_t> pending{0};
+};
+
+class ConnSlot {
+public:
+    ConnSlot(const MongoSpec& spec, std::shared_ptr<const mongo_entities::service_config> settings);
+    ~ConnSlot() { stop(); join(); }
+    ConnSlot(const ConnSlot&) = delete;
+    ConnSlot& operator=(const ConnSlot&) = delete;
+    void push(std::shared_ptr<Job> job) {
+        if (state_->pending.fetch_add(1) >= max_pending_) {
+            state_->pending.fetch_sub(1);
+            job->fail("Mongo worker request queue is full");
+            return;
+        }
+        job->released = [state = state_] { state->pending.fetch_sub(1); };
+        state_->queue->push(std::move(job));
+    }
+    void stop() {
+        state_->stop.request_stop();
+        state_->queue->fail_all("Mongo worker is stopping");
+    }
+    void join() {
+        if (thread_.joinable()) thread_.join();
+    }
+private:
+    std::shared_ptr<WorkerState> state_ = std::make_shared<WorkerState>();
+    size_t max_pending_;
+    std::thread thread_;
 };
 
 /// 取 json 中的 document 字段（缺省返回 fallback 文档）。
@@ -168,9 +224,23 @@ bsoncxx::document::value get_doc(bsoncxx::document::view v, const char* key) {
 /// 执行一次 Mongo 操作 → db_result（异常全捕获，驱动错误进 error）。
 db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                             const std::string& collection, Op op,
-                            const std::string& json) {
+                            const std::string& json, std::stop_token stop) {
     db::db_result r;
+    bool command_started = false;
+    // Aggregate can contain $out/$merge, so cancellation is conservatively
+    // treated as a possibly applied write for that raw operation too.
+    const bool may_write = op != Op::Find && op != Op::FindOne
+                           && op != Op::Count && op != Op::Distinct;
+    auto check_stop = [&] {
+        if (stop.stop_requested())
+            throw std::runtime_error{"Mongo operation interrupted by shutdown"};
+    };
+    auto before_command = [&] {
+        check_stop();
+        command_started = true;
+    };
     try {
+        check_stop();
         auto db = client[dbname];
         auto coll = db[collection];
         bsoncxx::document::value params = bsoncxx::from_json(json.empty() ? "{}" : json);
@@ -187,14 +257,19 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 auto sort_el = v["sort"];
                 if (sort_el && sort_el.type() == bsoncxx::type::k_document)
                     fo.sort(bsoncxx::document::value{sort_el.get_document().value});
+                before_command();
                 auto cursor = coll.find(get_doc(v, "filter").view(), fo);
                 r.columns = {"doc"};
-                for (auto&& doc : cursor)
+                for (auto&& doc : cursor) {
+                    check_stop();
                     r.rows.push_back({bsoncxx::to_json(doc)});
+                    check_stop();
+                }
                 r.ok = true;
                 break;
             }
             case Op::InsertOne: {
+                before_command();
                 auto res = coll.insert_one(get_doc(v, "doc").view());
                 if (res) {
                     // 4.0: inserted_id() 返回 bson_value::view（非 optional）——type 分发转字符串
@@ -228,7 +303,9 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 }
                 int64_t n = 0;
                 for (auto&& el : docs.get_array().value) {
+                    check_stop();
                     if (el.type() == bsoncxx::type::k_document) {
+                        before_command();
                         coll.insert_one(el.get_document().value);
                         ++n;
                     }
@@ -245,6 +322,7 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 // （is_block_type_valid）。move 进 view_or_value 由驱动持有。
                 auto filter = get_doc(v, "filter");
                 auto update = get_doc(v, "update");
+                before_command();
                 auto res = (op == Op::UpdateOne)
                                ? coll.update_one(std::move(filter), std::move(update))
                                : coll.update_many(std::move(filter), std::move(update));
@@ -260,6 +338,7 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 // bson_destroy/bson_free 在无效块头上断言崩溃（delete_many 卡死
                 // 与 is_block_type_valid 崩溃同根）。
                 auto filter = get_doc(v, "filter");
+                before_command();
                 auto res = (op == Op::DeleteOne)
                                ? coll.delete_one(std::move(filter))
                                : coll.delete_many(std::move(filter));
@@ -270,6 +349,7 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 break;
             }
             case Op::Count: {
+                before_command();
                 r.affected = static_cast<int64_t>(
                     coll.count_documents(get_doc(v, "filter").view()));
                 r.ok = true;
@@ -280,20 +360,26 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 // 逐阶段 append_stage（新版 API 不接受裸 document）
                 mongocxx::pipeline pipeline;
                 for (auto&& el : v) {
+                    check_stop();
                     if (el.type() == bsoncxx::type::k_document) {
                         bbs::document stage;
                         stage.append(bbs::kvp(el.key(), el.get_document().value));
                         pipeline.append_stage(stage.extract());
                     }
                 }
+                before_command();
                 auto cursor = coll.aggregate(pipeline);
                 r.columns = {"doc"};
-                for (auto&& doc : cursor)
+                for (auto&& doc : cursor) {
+                    check_stop();
                     r.rows.push_back({bsoncxx::to_json(doc)});
+                    check_stop();
+                }
                 r.ok = true;
                 break;
             }
             case Op::Drop: {
+                before_command();
                 coll.drop();
                 r.ok = true;
                 break;
@@ -303,6 +389,7 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 auto name = v["name"];
                 if (name && name.type() == bsoncxx::type::k_string)
                     iopts.name(name.get_string().value.data());
+                before_command();
                 coll.create_index(get_doc(v, "keys").view(), iopts);
                 r.affected = 1;
                 r.ok = true;
@@ -314,10 +401,12 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                     r.error = "distinct requires field string";
                     break;
                 }
+                before_command();
                 auto values = coll.distinct(field.get_string().value.data(),
                                             get_doc(v, "filter").view());
                 r.columns = {"value"};
                 for (auto& val : values) {
+                    check_stop();
                     bbs::document d;
                     d.append(bbs::kvp("value", val));
                     r.rows.push_back({bsoncxx::to_json(d.extract())});
@@ -326,6 +415,7 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
                 break;
             }
         }
+        check_stop();
     } catch (const mongocxx::exception& e) {
         r.ok = false;
         r.error = e.what();
@@ -336,50 +426,93 @@ db::db_result mongo_execute(mongocxx::client& client, const std::string& dbname,
         r.ok = false;
         r.error = e.what();
     }
+    if (!r.ok) {
+        // A failed/cancelled cursor must not masquerade as a complete result.
+        r.columns.clear();
+        r.rows.clear();
+        r.insert_id.clear();
+        r.affected = 0;
+        if (stop.stop_requested()) {
+            r.code = may_write && command_started ? db::error_code::outcome_unknown
+                                                  : db::error_code::connection_unavailable;
+            r.error = "Mongo operation interrupted by shutdown";
+            if (may_write && command_started)
+                r.error += "; raw Mongo writes are not transactional and may have been partially applied";
+        }
+    }
     return r;
 }
 
-/// worker 主循环：独占一个 mongocxx::client，串行执行队列。
-void mongo_worker_main(const MongoSpec& spec, std::shared_ptr<ConnSlot> slot) {
-    try {
-        // instance 已由 spawn() 的 instance::current() 创建（进程级单例），
-        // worker 只建 client，不再创建 instance（重复创建会抛异常）
-        // 4.0 的 options::client 无 server_selection_timeout_ms——用 uri 查询参数
-        // 控制连接超时（默认 30s 太久，连不上会卡死 worker 启动）
-        std::string uri = spec.uri;
-        if (uri.find('?') == std::string::npos)
-            uri += "?serverSelectionTimeoutMS=3000";
-        else
-            uri += "&serverSelectionTimeoutMS=3000";
-        mongocxx::client client{mongocxx::uri{uri}};
-        LOG_INFO("MONGO-DBG client constructed");
-        // 连接验证（client 构造不连接，首次操作才连；失败抛异常 → fail_all）
-        auto db = client[spec.dbname.empty() ? "admin" : spec.dbname];
-        LOG_INFO("MONGO-DBG db acquired");
-        db.run_command(bsoncxx::from_json("{\"ping\":1}").view());
-        LOG_INFO("MONGO-DBG ping ok");
-        LOG_INFO("Mongo [{}] connected: {}", spec.name, spec.uri);
-
-        for (;;) {
-            auto job = slot->queue->pop();
-            if (!job)
-                break;
-            auto t0 = std::chrono::steady_clock::now();
-            db::db_result r = mongo_execute(client, spec.dbname, job->collection,
-                                            job->op, job->json);
-            r.duration_ms = static_cast<int64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - t0).count());
-            if (job->done)
-                job->done(r);
+// Clamp native blocking waits without logging or otherwise exposing URI credentials.
+// mongocxx's callback transaction API has a fixed 120s retry window; the native
+// engine uses the core API instead, with our own request deadline and attempt cap.
+std::string bounded_uri(const std::string& input) {
+    auto query = input.find('?');
+    std::string result = input.substr(0, query);
+    std::vector<std::string> options;
+    if (query != std::string::npos) {
+        size_t begin = query + 1;
+        while (begin < input.size()) {
+            auto end = input.find('&', begin);
+            auto option = input.substr(begin, end == std::string::npos ? end : end - begin);
+            auto equals = option.find('=');
+            auto name = option.substr(0, equals);
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+            if (name != "serverselectiontimeoutms" && name != "connecttimeoutms"
+                && name != "sockettimeoutms" && name != "retrywrites" && name != "retryreads")
+                options.push_back(std::move(option));
+            if (end == std::string::npos) break;
+            begin = end + 1;
         }
-    } catch (const mongocxx::exception& e) {
-        LOG_ERROR("Mongo [{}] connect failed: {}", spec.name, e.what());
-        slot->queue->fail_all("mongo connect failed: " + std::string(e.what()));
-        return;
+    }
+    result += "?serverSelectionTimeoutMS=2000&connectTimeoutMS=2000&socketTimeoutMS=2000&retryWrites=false&retryReads=false";
+    for (const auto& option : options) result += "&" + option;
+    return result;
+}
+
+void mongo_worker_main(MongoSpec spec, std::shared_ptr<WorkerState> state,
+                       std::shared_ptr<const mongo_entities::service_config> settings) {
+    // The thread captures WorkerState, not ConnSlot: the owning slot can always
+    // destruct, signal stop and join, including actor failure/send_exit paths.
+    std::unique_ptr<mongocxx::client> client;
+    std::unique_ptr<mongo_entities::EntityStoreEngine> engine;
+    std::string database;
+    for (;;) {
+        auto job = state->queue->pop();
+        if (!job) break;
+        if (state->stop.stop_requested()) { job->fail("Mongo worker is stopping"); continue; }
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            if (!client) {
+                mongocxx::uri uri{bounded_uri(spec.uri)};
+                database = uri.database();
+                client = std::make_unique<mongocxx::client>(uri);
+                engine = std::make_unique<mongo_entities::EntityStoreEngine>(
+                    *client, database, spec.name, *settings, state->stop.get_token());
+                LOG_INFO("Mongo [{}] client initialized", spec.name);
+            }
+            if (job->load_done) job->load_done(engine->load(job->load, job->deadline));
+            else if (job->save_done) job->save_done(engine->save(job->save, job->deadline));
+            else {
+                auto result = mongo_execute(*client, database.empty() ? "admin" : database,
+                    job->collection, job->op, job->json, state->stop.get_token());
+                result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                if (job->done) job->done(result);
+            }
+        } catch (const std::exception&) {
+            // Constructor/configuration errors must not strand this queue.
+            // Avoid echoing driver URI parse messages, which can contain secrets.
+            engine.reset(); client.reset();
+            job->fail("Mongo client initialization or operation failed");
+        }
     }
     LOG_INFO("Mongo [{}] worker exited", spec.name);
 }
+
+ConnSlot::ConnSlot(const MongoSpec& spec, std::shared_ptr<const mongo_entities::service_config> settings)
+    : max_pending_(settings->max_pending_requests),
+      thread_(mongo_worker_main, spec, state_, std::move(settings)) {}
 
 /// 字符串 op → 枚举；未知返回 false。
 bool parse_op(const std::string& s, Op& out) {
@@ -424,8 +557,13 @@ public:
         auto cfg = load_plugin_config(sys.config());
         caf::settings uris = cfg.uris;
         int pool_size = cfg.pool_size < 1 ? 1 : cfg.pool_size;
+        auto entity_settings = std::make_shared<mongo_entities::service_config>();
+        if (auto config = caf::get_if<caf::settings>(&sys.config().content, "caf-plugin-system.entity_store"))
+            *entity_settings = mongo_entities::parse_service_config(*config);
+        else
+            entity_settings->config_error = "entity_store configuration is missing";
 
-        return sys.spawn([logger, uris, pool_size](caf::event_based_actor* self) -> caf::behavior {
+        return sys.spawn([logger, uris, pool_size, entity_settings](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<MongoSpec>>(parse_uris(uris));
             auto pools = std::make_shared<std::map<std::string, std::vector<std::shared_ptr<ConnSlot>>>>();
             auto rr = std::make_shared<std::atomic<size_t>>(0);
@@ -441,12 +579,10 @@ public:
                     auto& slots = (*pools)[s.name];
                     slots.reserve(pool_size);
                     for (int i = 0; i < pool_size; ++i) {
-                        auto slot = std::make_shared<ConnSlot>();
-                        slot->thread = std::make_shared<std::thread>(mongo_worker_main, s, slot);
+                        auto slot = std::make_shared<ConnSlot>(s, entity_settings);
                         slots.push_back(slot);
                     }
-                    LOG_INFO_SELF(self, "pool launched: [{}] {} size={}",
-                                  s.name, s.uri, pool_size);
+                    LOG_INFO_SELF(self, "pool launched: [{}] size={}", s.name, pool_size);
                 }
             };
 
@@ -463,7 +599,21 @@ public:
                 }
                 auto& slots = it->second;
                 size_t idx = (rr->fetch_add(1)) % slots.size();
-                slots[idx]->queue->push(std::move(job));
+                slots[idx]->push(std::move(job));
+            };
+
+            // Same store/partition stays on one worker even if the frontend's
+            // request times out. Its retries complete before later saves run.
+            auto enqueue_entity = [=](const std::string& name, const entities::entity_ref& target,
+                                      std::shared_ptr<Job> job) {
+                auto found = pools->find(name);
+                if (found == pools->end()) {
+                    job->fail("unknown mongo connection: " + name);
+                    return;
+                }
+                const auto key = std::to_string(target.store.size()) + ":" + target.store + target.partition;
+                auto& slots = found->second;
+                slots[std::hash<std::string>{}(key) % slots.size()]->push(std::move(job));
             };
 
             auto make_job = [](Op op, const std::string& coll, const std::string& json,
@@ -507,6 +657,29 @@ public:
             };
 
             caf::message_handler business{
+                [=](entity_load_atom, const std::string& conn,
+                    const entities::load_request& request, uint64_t timeout_ms) {
+                    if (!self->current_message_id().is_request()) return;
+                    auto rp = self->make_response_promise<entities::load_result>();
+                    auto job = std::make_shared<Job>();
+                    job->load = request;
+                    job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{
+                        static_cast<int64_t>(std::min(timeout_ms, uint64_t(entity_settings->request_timeout.count())))};
+                    job->load_done = [rp](entities::load_result result) mutable { rp.deliver(std::move(result)); };
+                    enqueue_entity(conn, request.target, std::move(job));
+                },
+                [=](entity_save_atom, const std::string& conn,
+                    const entities::save_request& request, uint64_t timeout_ms) {
+                    if (!self->current_message_id().is_request()) return;
+                    auto rp = self->make_response_promise<entities::save_result>();
+                    auto job = std::make_shared<Job>();
+                    job->save = request;
+                    job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{
+                        static_cast<int64_t>(std::min(timeout_ms, uint64_t(entity_settings->request_timeout.count())))};
+                    job->save_done = [rp](entities::save_result result) mutable { rp.deliver(std::move(result)); };
+                    enqueue_entity(conn, request.changes.empty() ? entities::entity_ref{} : request.changes.front().target,
+                                   std::move(job));
+                },
                 [=](mongo_op_atom, const std::string& conn, const std::string& coll,
                     const std::string& op, const std::string& json) {
                     if (!self->current_message_id().is_request())
@@ -554,19 +727,15 @@ public:
                 .on_shutdown = [=]() {
                     for (auto& [name, slots] : *pools) {
                         for (auto& s : slots)
-                            s->queue->stop();
+                            s->stop();
                     }
                     size_t joined = 0;
                     for (auto& [name, slots] : *pools) {
                         for (auto& s : slots) {
-                            if (s->thread->joinable()) {
-                                s->thread->join();
-                                ++joined;
-                            }
+                            s->join();
+                            ++joined;
                         }
                     }
-                    std::cout << "[MongoPlugin] shutdown hook: " << joined
-                              << " workers joined" << std::endl;
                     LOG_INFO_SELF(self, "MongoPlugin shutdown, {} workers joined", joined);
                 },
             }))};

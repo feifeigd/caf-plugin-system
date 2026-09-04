@@ -2,6 +2,7 @@
 #include "plugin/plugin_interface.hpp"
 #include "services/logging_service.hpp"
 #include "templates/sql_entity_store_actor.hpp"
+#include "templates/mongo_entity_store_actor.hpp"
 
 #include <caf/all.hpp>
 
@@ -79,7 +80,15 @@ public:
                      const std::vector<caf::actor>&,
                      const std::string&) override {
         caf_plugin_system::set_log_source(PLUGIN_NAME);
-        auto settings = make_service_config(load_plugin_config(sys.config()));
+        auto config = load_plugin_config(sys.config());
+        if (config.dialect == "mongo" || config.dialect == "mongodb") {
+            auto raw = caf::get_or(sys.config(), "caf-plugin-system.entity_store", caf::settings{});
+            auto settings = caf_plugin_system::entity_store::mongo::parse_service_config(raw);
+            if (!settings.config_error.empty())
+                LOG_ERROR("MongoDB EntityStore configuration error: {}", settings.config_error);
+            return sys.spawn<caf_plugin_system::entity_store::mongo::entity_store_actor>(std::move(settings));
+        }
+        auto settings = make_service_config(config);
         if (!settings.config_error.empty())
             LOG_ERROR("EntityStore configuration error: {}",
                       settings.config_error);
