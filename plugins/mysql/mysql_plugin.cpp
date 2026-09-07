@@ -1,8 +1,8 @@
 // ------------------------------------------------------------------
-// MySQL 插件（libmariadb，Phase 2 参考实现）
+// MySQL 插件（libmariadb）
 //
 // 与 Redis 插件同骨架（阻塞 IO 模型），SQL 特有三处：
-//   1. 连接池：每个命名连接 = db-pool-size 条连接（= worker 数），
+//   1. 连接池：每个命名连接 = mysql.pool_size 条连接（= worker 数），
 //      非事务请求 round-robin 分配
 //   2. 参数化查询：mysql_stmt_prepare + bind（全字符串参数，
 //      空串 ≠ NULL；NULL 参数 v1 不支持）
@@ -15,8 +15,10 @@
 //
 // 配置（CAF 配置系统，同文件字段区分）：
 //   caf-plugin-system {
-//     mysql-uris = "main=mysql://root:pass@127.0.0.1:3306/appdb,cache=mysql://root@127.0.0.1:3306/cachedb"
-//     db-pool-size = 2
+//     mysql {
+//       uris { main = "mysql://root:pass@127.0.0.1:3306/appdb" }
+//       pool_size = 2
+//     }
 //   }
 // uri = mysql://user:pass@host:port/dbname（各段可省略）
 //
@@ -58,6 +60,7 @@ namespace {
 using Op = caf_plugin_system::sql_backend::Operation;
 using Job = caf_plugin_system::sql_backend::Job;
 using ConnSlot = caf_plugin_system::sql_backend::ConnectionSlot;
+using ConnState = caf_plugin_system::sql_backend::ConnectionState;
 using SqlPool = caf_plugin_system::sql_backend::ConnectionPool;
 using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 
@@ -252,7 +255,7 @@ using ReconnectPolicy = caf_plugin_system::sql_backend::ReconnectPolicy;
 
 class MySqlConnection final : public caf_plugin_system::sql_backend::SqlConnection {
 public:
-    MySqlConnection(SqlSpec spec, std::shared_ptr<ConnSlot> slot, ReconnectPolicy policy)
+    MySqlConnection(SqlSpec spec, std::shared_ptr<ConnState> slot, ReconnectPolicy policy)
         : spec_(std::move(spec)), slot_(std::move(slot)), policy_(policy) {}
     ~MySqlConnection() override { close(); }
 
@@ -337,13 +340,13 @@ public:
 
 private:
     SqlSpec spec_;
-    std::shared_ptr<ConnSlot> slot_;
+    std::shared_ptr<ConnState> slot_;
     ReconnectPolicy policy_;
     MYSQL* handle_ = nullptr;
     std::unique_ptr<caf_plugin_system::sql_backend::SocketCancellation> cancellation_;
 };
 
-void sql_worker_main(const SqlSpec& spec, std::shared_ptr<ConnSlot> slot,
+void sql_worker_main(std::shared_ptr<ConnState> slot, const SqlSpec& spec,
                      ReconnectPolicy policy) {
     caf_plugin_system::sql_backend::ReconnectingSqlWorker worker{
         slot, std::make_unique<MySqlConnection>(spec, slot, policy), policy};
@@ -393,7 +396,7 @@ public:
                 for (const auto& s : *specs) {
                     for (int i = 0; i < pool_size; ++i) {
                         auto slot = pools->add_slot(s.name);
-                        slot->start_worker(sql_worker_main, s, slot, reconnect);
+                        slot->start_worker(sql_worker_main, s, reconnect);
                     }
                     LOG_INFO_SELF(self, "pool launched: [{}] {}:{}/{} size={}",
                                   s.name, s.host, s.port, s.dbname, pool_size);

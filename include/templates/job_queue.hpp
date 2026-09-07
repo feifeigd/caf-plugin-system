@@ -11,7 +11,7 @@
 //   - push()：运行中入队；停止后立即回错误，绝不把任务留在无人消费的队列
 //   - pop()：阻塞直到有 job 或 stop；返回 nullptr = 应退出
 //   - fail_all()：清空队列 + 全部回错误 + 停（连接失败场景）
-//   - stop()：仅置 running=false 并唤醒，残留 job 不处理
+//   - stop()：拒绝新任务并唤醒；pop() 仍取出残留任务，由 worker 决定执行或拒绝
 // ------------------------------------------------------------------
 
 #include <condition_variable>
@@ -65,9 +65,13 @@ public:
             rest.swap(jobs);
             running = false;
         }
-        for (auto& j : rest)
-            j->fail(err);
         cv.notify_all();
+        for (auto& j : rest) {
+            // One broken completion must not strand the remaining jobs or
+            // prevent a worker/slot destructor from finishing shutdown.
+            try { j->fail(err); }
+            catch (...) { /* Completion callbacks must not throw. */ }
+        }
     }
 
     void stop() {

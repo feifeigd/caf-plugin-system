@@ -84,6 +84,8 @@ struct schema_discovery_target {
     std::string entity;
 };
 
+// 实体结构目录：按逻辑 store/entity 名查找路由和结构定义，不保存实体数据。
+// 手工配置与 SQL schema discovery 都通过此目录提供统一的映射信息。
 class schema_catalog {
 public:
     schema_catalog() = default;

@@ -4,6 +4,6 @@ param(
     [string]$BuildDir = "$PSScriptRoot/../out/build/windows-x64",
     [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')]
     [string]$Configuration = 'Debug',
-    [string]$MongoImage = 'mongo:7'
+    [string]$RedisImage = 'redis:7-alpine'
 )
-& "$PSScriptRoot/run_database_plugin_docker.ps1" -Backend Mongo -Image $MongoImage -BuildDir $BuildDir -Configuration $Configuration
+& "$PSScriptRoot/run_database_plugin_docker.ps1" -Backend Redis -Image $RedisImage -BuildDir $BuildDir -Configuration $Configuration

@@ -5,8 +5,9 @@
 // 普通请求选路以及带代际号的短生命周期事务句柄。
 
 #include "common/db_contract.hpp"
-#include "templates/job_queue.hpp"
+#include "templates/db_worker_pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -94,72 +95,74 @@ private:
     std::atomic<uint32_t> generation_{0};
 };
 
-class ConnectionSlot {
+// Adapter state is safe to retain from jobs: it does not own a thread.
+class ConnectionState : public db_backend::WorkerState<Job> {
 public:
-    using job_ptr = std::shared_ptr<Job>;
-
-    bool enqueue(job_ptr job) {
-        return queue_->push(std::move(job));
-    }
-
-    job_ptr next_job() {
-        return queue_->pop();
-    }
-
-    void fail_pending(const std::string& error) {
-        stop_source_.request_stop();
-        queue_->fail_all(error);
-    }
-
-    bool stopped() const { return stop_source_.stop_requested() || queue_->stopped(); }
-
-    std::stop_token stop_token() const noexcept { return stop_source_.get_token(); }
-
-    bool wait_for_stop(std::chrono::milliseconds timeout) {
-        return queue_->wait_for_stop(timeout);
-    }
-
+    using WorkerState::WorkerState;
     void enable_recovery() noexcept { recoverable_.store(true); }
     bool recoverable() const noexcept { return recoverable_.load(); }
+    TransactionState transaction_state() const noexcept { return transaction_.state(); }
+private:
+    friend class ConnectionPool;
+    friend class TransactionRegistry;
+    TransactionSlot transaction_;
+    std::atomic<bool> recoverable_{false};
+};
 
-    template <class Function, class... Args>
-    void start_worker(Function&& function, Args&&... args) {
-        if (worker_ && worker_->joinable())
-            throw std::logic_error("connection slot worker already started");
-        worker_ = std::make_shared<std::thread>(
-            std::forward<Function>(function), std::forward<Args>(args)...);
-    }
+class ConnectionSlot : public db_backend::WorkerSlot<Job, ConnectionState> {
+public:
+    using WorkerSlot::WorkerSlot;
+    TransactionState transaction_state() const noexcept { return state()->transaction_state(); }
+    void enable_recovery() noexcept { state()->enable_recovery(); }
+    bool recoverable() const noexcept { return state()->recoverable(); }
+};
 
-    void stop() {
-        // Callbacks only interrupt I/O; the owning worker still performs all
-        // native connection cleanup. Do not hold queue/transaction locks here.
-        stop_source_.request_stop();
-        queue_->stop();
-    }
-
-    bool join_worker() {
-        if (!worker_ || !worker_->joinable())
+// Completion callbacks must not own ConnectionPool/ConnectionSlot. Otherwise
+// forced actor exit could release the last pool owner on its own worker thread.
+// This registry contains weak state references only, never worker ownership.
+class TransactionRegistry {
+public:
+    bool insert(uint64_t token, const std::shared_ptr<ConnectionState>& state,
+                uint32_t generation, const std::string& request_key) {
+        std::lock_guard lock{mutex_};
+        if ((!request_key.empty() && keys_.contains(request_key)) || entries_.contains(token))
             return false;
-        if (worker_->get_id() == std::this_thread::get_id()) {
-            worker_->detach();
-            return false;
+        entries_.emplace(token, Entry{state, generation, request_key});
+        try {
+            if (!request_key.empty()) keys_.emplace(request_key, token);
+        } catch (...) {
+            entries_.erase(token);
+            throw;
         }
-        worker_->join();
         return true;
     }
 
-    TransactionState transaction_state() const noexcept {
-        return transaction_.state();
+    uint64_t find(const std::string& key) const {
+        std::lock_guard lock{mutex_};
+        auto it = keys_.find(key);
+        return it == keys_.end() ? 0 : it->second;
+    }
+
+    bool release_transaction(uint64_t token) {
+        std::lock_guard lock{mutex_};
+        auto it = entries_.find(token);
+        if (it == entries_.end()) return false;
+        auto state = it->second.state.lock();
+        const bool released = state && state->transaction_.release(it->second.generation);
+        if (!it->second.key.empty()) keys_.erase(it->second.key);
+        entries_.erase(it);
+        return released;
     }
 
 private:
-    friend class ConnectionPool;
-
-    std::shared_ptr<JobQueue> queue_ = std::make_shared<JobQueue>();
-    std::stop_source stop_source_;
-    std::shared_ptr<std::thread> worker_;
-    TransactionSlot transaction_;
-    std::atomic<bool> recoverable_{false};
+    struct Entry {
+        std::weak_ptr<ConnectionState> state;
+        uint32_t generation;
+        std::string key;
+    };
+    mutable std::mutex mutex_;
+    std::map<uint64_t, Entry> entries_;
+    std::map<std::string, uint64_t> keys_;
 };
 
 struct Route {
@@ -167,201 +170,126 @@ struct Route {
     uint64_t transaction = 0;
     std::string error;
     db::error_code code = db::error_code::none;
-
     explicit operator bool() const noexcept { return slot != nullptr; }
-
-    bool enqueue(std::shared_ptr<Job> job) const {
-        return slot->enqueue(std::move(job));
-    }
+    bool enqueue(std::shared_ptr<Job> job) const { return slot->enqueue(std::move(job)); }
 };
 
 class ConnectionPool {
 public:
     using slot_ptr = std::shared_ptr<ConnectionSlot>;
 
-    explicit ConnectionPool(std::string backend)
-        : backend_(std::move(backend)) {
-    }
-
-    ~ConnectionPool() {
-        stop_and_join();
-    }
+    explicit ConnectionPool(std::string backend) : backend_(std::move(backend)) {}
+    ~ConnectionPool() { stop_and_join(); }
 
     slot_ptr add_slot(const std::string& name) {
-        const auto inserted = indexes_.try_emplace(name, names_.size()).second;
-        if (inserted) {
-            names_.push_back(name);
-            pools_.try_emplace(name);
-        }
-        auto slot = std::make_shared<ConnectionSlot>();
-        pools_[name].push_back(slot);
-        return slot;
+        if (indexes_.try_emplace(name, names_.size()).second) names_.push_back(name);
+        return workers_.add_slot(name);
     }
+
+    std::shared_ptr<TransactionRegistry> transactions() const noexcept { return transactions_; }
 
     Route route_idle(const std::string& name) {
-        auto it = pools_.find(name);
-        if (it == pools_.end() || it->second.empty())
+        const auto* slots = workers_.find_slots(name);
+        if (!slots || slots->empty())
             return failed("unknown " + backend_ + " connection: " + name);
-        auto& slots = it->second;
-        auto start = round_robin_.fetch_add(1, std::memory_order_relaxed);
-        for (size_t offset = 0; offset < slots.size(); ++offset) {
-            auto index = (start + offset) % slots.size();
-            if (!slots[index]->stopped() && slots[index]->transaction_.idle())
-                return Route{slots[index], 0, {}};
-        }
-        return failed(backend_
-                      + " pool exhausted (all connections in transactions)");
+        auto slot = workers_.route_round_robin(name, [](const slot_ptr& candidate) {
+            return candidate->transaction_state() == TransactionState::Idle;
+        });
+        if (slot) return Route{std::move(slot), 0, {}};
+        return failed(backend_ + " pool exhausted (all connections stopped or in transactions)");
     }
 
-    Route acquire_transaction(const std::string& name,
-                              const std::string& request_key = {}) {
-        std::lock_guard lock{transaction_keys_mutex_};
-        if (!request_key.empty() && keyed_transactions_.contains(request_key))
+    Route acquire_transaction(const std::string& name, const std::string& request_key = {}) {
+        if (!request_key.empty() && transactions_->find(request_key) != 0)
             return failed("duplicate " + backend_ + " transaction request key");
-        auto pool_it = pools_.find(name);
-        auto index_it = indexes_.find(name);
-        if (pool_it == pools_.end() || index_it == indexes_.end()
-            || pool_it->second.empty())
+        const auto* slots = workers_.find_slots(name);
+        const auto index = indexes_.find(name);
+        if (!slots || slots->empty() || index == indexes_.end())
             return failed("unknown " + backend_ + " connection: " + name);
-        const auto pool_index = index_it->second;
-        if (pool_index > max_index)
+        if (index->second > max_index)
             return failed(backend_ + " transaction pool index exceeds handle capacity");
-        auto& slots = pool_it->second;
-        auto start = round_robin_.fetch_add(1, std::memory_order_relaxed);
-        for (size_t offset = 0; offset < slots.size(); ++offset) {
-            auto slot_index = (start + offset) % slots.size();
-            if (slots[slot_index]->stopped())
-                continue;
-            auto generation = slots[slot_index]->transaction_.try_acquire();
-            if (generation == 0)
-                continue;
-            if (slot_index > max_index) {
-                slots[slot_index]->transaction_.release(generation);
-                return failed(backend_
-                              + " transaction slot index exceeds handle capacity");
-            }
-            auto tx = encode(pool_index, slot_index, generation);
-            if (!request_key.empty()) {
-                keyed_transactions_.emplace(request_key, tx);
-                transaction_keys_.emplace(tx, request_key);
-            }
-            return Route{slots[slot_index], tx, {}};
+
+        uint32_t generation = 0;
+        auto slot = workers_.route_round_robin(name, [&](const slot_ptr& candidate) {
+            generation = candidate->state()->transaction_.try_acquire();
+            return generation != 0;
+        });
+        if (!slot) return failed(backend_ + " transaction pool exhausted: " + name);
+        const auto position = std::find(slots->begin(), slots->end(), slot);
+        const auto slot_index = static_cast<size_t>(position - slots->begin());
+        auto state = slot->state();
+        if (slot_index > max_index) {
+            state->transaction_.release(generation);
+            return failed(backend_ + " transaction slot index exceeds handle capacity");
         }
-        return failed(backend_ + " transaction pool exhausted: " + name);
+        const auto token = encode(index->second, slot_index, generation);
+        try {
+            if (!transactions_->insert(token, state, generation, request_key)) {
+                state->transaction_.release(generation);
+                return failed("duplicate " + backend_ + " transaction request key");
+            }
+        } catch (...) {
+            state->transaction_.release(generation);
+            throw;
+        }
+        return Route{std::move(slot), token, {}};
     }
 
-    Route route_transaction(uint64_t tx, bool closing = false) {
-        const auto parts = decode(tx);
+    Route route_transaction(uint64_t token, bool closing = false) {
+        const auto parts = decode(token);
         if (parts.pool_index >= names_.size())
-            return failed("invalid " + backend_ + " transaction: "
-                          + std::to_string(tx));
-        auto pool_it = pools_.find(names_[parts.pool_index]);
-        if (pool_it == pools_.end() || parts.slot_index >= pool_it->second.size())
-            return failed("invalid " + backend_ + " transaction: "
-                          + std::to_string(tx));
-        auto slot = pool_it->second[parts.slot_index];
-        if (slot->transaction_.generation() != parts.generation)
-            return failed("inactive " + backend_ + " transaction: "
-                          + std::to_string(tx));
-        const auto state = slot->transaction_.state();
+            return failed("invalid " + backend_ + " transaction: " + std::to_string(token));
+        const auto* slots = workers_.find_slots(names_[parts.pool_index]);
+        if (!slots || parts.slot_index >= slots->size())
+            return failed("invalid " + backend_ + " transaction: " + std::to_string(token));
+        auto slot = (*slots)[parts.slot_index];
+        auto state = slot->state();
+        auto& transaction = state->transaction_;
+        if (transaction.generation() != parts.generation)
+            return failed("inactive " + backend_ + " transaction: " + std::to_string(token));
+        const auto status = transaction.state();
         if (closing) {
-            if (state == TransactionState::Closing)
-                return failed("closing " + backend_ + " transaction: "
-                              + std::to_string(tx));
-            if (state != TransactionState::Active
-                || !slot->transaction_.try_close(parts.generation))
-                return failed("inactive " + backend_ + " transaction: "
-                              + std::to_string(tx));
-        } else if (state != TransactionState::Active) {
-            return failed("inactive " + backend_ + " transaction: "
-                          + std::to_string(tx));
+            if (status == TransactionState::Closing)
+                return failed("closing " + backend_ + " transaction: " + std::to_string(token));
+            if (status != TransactionState::Active || !transaction.try_close(parts.generation))
+                return failed("inactive " + backend_ + " transaction: " + std::to_string(token));
+        } else if (status != TransactionState::Active) {
+            return failed("inactive " + backend_ + " transaction: " + std::to_string(token));
         }
-        return Route{std::move(slot), tx, {}};
+        return Route{std::move(slot), token, {}};
     }
 
-    // BEGIN 回执可能晚于调用方超时。关联键在投递 BEGIN 前已登记，调用方
-    // 无须知道 tx_handle 即可取消；ROLLBACK 会排在同一连接的 BEGIN 后。
-    Route route_transaction(const std::string& request_key,
-                            bool closing = false) {
-        std::lock_guard lock{transaction_keys_mutex_};
-        const auto it = keyed_transactions_.find(request_key);
-        if (it == keyed_transactions_.end())
-            return failed("inactive " + backend_ + " transaction request key");
-        return route_transaction(it->second, closing);
+    // Request keys let cancellation find BEGIN even before its handle reply.
+    Route route_transaction(const std::string& request_key, bool closing = false) {
+        const auto token = transactions_->find(request_key);
+        if (token == 0) return failed("inactive " + backend_ + " transaction request key");
+        return route_transaction(token, closing);
     }
 
-    bool release_transaction(uint64_t tx) {
-        std::lock_guard lock{transaction_keys_mutex_};
-        const auto parts = decode(tx);
-        if (parts.pool_index >= names_.size())
-            return false;
-        auto pool_it = pools_.find(names_[parts.pool_index]);
-        if (pool_it == pools_.end() || parts.slot_index >= pool_it->second.size())
-            return false;
-        const auto released =
-            pool_it->second[parts.slot_index]->transaction_.release(
-                parts.generation);
-        if (released) {
-            const auto key = transaction_keys_.find(tx);
-            if (key != transaction_keys_.end()) {
-                keyed_transactions_.erase(key->second);
-                transaction_keys_.erase(key);
-            }
-        }
-        return released;
-    }
-
-    size_t stop_and_join() {
-        for (auto& [name, slots] : pools_)
-            for (auto& slot : slots)
-                slot->stop();
-        size_t joined = 0;
-        for (auto& [name, slots] : pools_)
-            for (auto& slot : slots)
-                if (slot->join_worker())
-                    ++joined;
-        return joined;
-    }
+    bool release_transaction(uint64_t token) { return transactions_->release_transaction(token); }
+    size_t stop_and_join() { return workers_.stop_and_join(); }
 
 private:
-    static constexpr size_t max_index =
-        static_cast<size_t>(std::numeric_limits<uint16_t>::max());
-
-    /// 事务句柄的组成部分，用于从 64 位句柄中解码。
-    struct HandleParts {
-        size_t pool_index;     ///< 连接池索引
-        size_t slot_index;     ///< 插槽索引
-        uint32_t generation;   ///< 生成号
-    };
-
-    static uint64_t encode(size_t pool_index, size_t slot_index,
-                           uint32_t generation) noexcept {
+    static constexpr size_t max_index = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
+    struct HandleParts { size_t pool_index; size_t slot_index; uint32_t generation; };
+    static uint64_t encode(size_t pool_index, size_t slot_index, uint32_t generation) noexcept {
         return (static_cast<uint64_t>(generation) << 32)
-               | (static_cast<uint64_t>(pool_index) << 16)
-               | static_cast<uint64_t>(slot_index);
+               | (static_cast<uint64_t>(pool_index) << 16) | static_cast<uint64_t>(slot_index);
     }
-
-    static HandleParts decode(uint64_t tx) noexcept {
-        return {
-            static_cast<size_t>((tx >> 16) & 0xffffu),
-            static_cast<size_t>(tx & 0xffffu),
-            static_cast<uint32_t>(tx >> 32),
-        };
+    static HandleParts decode(uint64_t token) noexcept {
+        return {static_cast<size_t>((token >> 16) & 0xffffu),
+                static_cast<size_t>(token & 0xffffu), static_cast<uint32_t>(token >> 32)};
     }
-
     static Route failed(std::string error,
                         db::error_code code = db::error_code::connection_unavailable) {
         return Route{nullptr, 0, std::move(error), code};
     }
 
     std::string backend_;
-    std::map<std::string, std::vector<slot_ptr>> pools_;
+    db_backend::WorkerPool<ConnectionSlot> workers_;
     std::map<std::string, size_t> indexes_;
     std::vector<std::string> names_;
-    std::atomic<size_t> round_robin_{0};
-    std::mutex transaction_keys_mutex_;
-    std::map<std::string, uint64_t> keyed_transactions_;
-    std::map<uint64_t, std::string> transaction_keys_;
+    std::shared_ptr<TransactionRegistry> transactions_ = std::make_shared<TransactionRegistry>();
 };
 
 } // namespace caf_plugin_system::sql_backend

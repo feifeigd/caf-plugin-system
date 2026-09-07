@@ -1,11 +1,11 @@
 // ------------------------------------------------------------------
-// MongoDB 插件（mongo-cxx-driver，Phase 3）
+// MongoDB 插件（mongo-cxx-driver）
 //
 // 与 Redis/MySQL/PostgreSQL 同骨架（阻塞 IO 模型）：
-//   event-based actor 收消息入队 → 每命名连接一个 worker 线程
+//   event-based actor 收消息入队 → 每命名连接维护公共 worker 池
 //   （独占 mongocxx::client）→ rp.deliver() 回调用方。
 // 差异仅在驱动适配：
-//   - 操作：JSON 参数化（BSON 天然 JSON 化，无注入面）
+//   - 原始接口接受 Mongo JSON 查询/更新文档；EntityStore 按受信 schema 构造操作。
 //   - 原始 mongo_op 保持原语义；EntityStore 使用 session 多文档事务
 //   - 结果：find/aggregate → 每文档一行 JSON；写操作 → affected/insert_id
 //
@@ -25,15 +25,17 @@
 //   delete_*:     {"filter": {}}
 //   count:        {"filter": {}}
 //   aggregate:    {"$match": {}, "$group": {}, ...}（字段 = 阶段，v1
-//                 每阶段各一次；多阶段同 key 需要 C API，留 v2）
+//                 当前对象格式不支持重复阶段名，扩展需调整输入格式）
 //   drop:         {}
 //   create_index: {"keys": {"k": 1}, "name": ""}
 //   distinct:     {"field": "k", "filter": {}}
 //
 // 配置（CAF 配置系统，同文件字段区分）：
 //   caf-plugin-system {
-//     mongo-uris = "main=mongodb://127.0.0.1:27017/appdb,cache=mongodb://127.0.0.1:27017/cachedb"
-//     db-pool-size = 2
+//     mongo {
+//       uris { main = "mongodb://127.0.0.1:27017/appdb" }
+//       pool_size = 2
+//     }
 //   }
 // uri = mongodb://[user:pass@]host[:port][/dbname][?opts]（各段可省略）
 // ------------------------------------------------------------------
@@ -43,7 +45,7 @@
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
 #include "common/plugin_config.hpp"
-#include "templates/job_queue.hpp"
+#include "templates/db_worker_pool.hpp"
 
 // mongocxx 依赖 winsock2，必须最先包含（同 hiredis/libpq 坑）
 #ifdef _WIN32
@@ -148,9 +150,6 @@ struct Job {
     entities::load_request load;
     entities::save_request save;
     std::chrono::steady_clock::time_point deadline;
-    std::function<void()> released;
-
-    ~Job() { if (released) released(); }
 
     /// 失败交付方式（JobQueue::fail_all 统一调用）。
     void fail(const std::string& err) {
@@ -176,42 +175,9 @@ struct Job {
     }
 };
 
-using JobQueue = caf_plugin_system::JobQueue<Job>;
-
-/// 连接槽：一个 mongocxx::client + 专属队列 + worker 线程。
-struct WorkerState {
-    std::shared_ptr<JobQueue> queue = std::make_shared<JobQueue>();
-    std::stop_source stop;
-    std::atomic<size_t> pending{0};
-};
-
-class ConnSlot {
-public:
-    ConnSlot(const MongoSpec& spec, std::shared_ptr<const mongo_entities::service_config> settings);
-    ~ConnSlot() { stop(); join(); }
-    ConnSlot(const ConnSlot&) = delete;
-    ConnSlot& operator=(const ConnSlot&) = delete;
-    void push(std::shared_ptr<Job> job) {
-        if (state_->pending.fetch_add(1) >= max_pending_) {
-            state_->pending.fetch_sub(1);
-            job->fail("Mongo worker request queue is full");
-            return;
-        }
-        job->released = [state = state_] { state->pending.fetch_sub(1); };
-        state_->queue->push(std::move(job));
-    }
-    void stop() {
-        state_->stop.request_stop();
-        state_->queue->fail_all("Mongo worker is stopping");
-    }
-    void join() {
-        if (thread_.joinable()) thread_.join();
-    }
-private:
-    std::shared_ptr<WorkerState> state_ = std::make_shared<WorkerState>();
-    size_t max_pending_;
-    std::thread thread_;
-};
+using WorkerState = caf_plugin_system::db_backend::WorkerState<Job>;
+using ConnSlot = caf_plugin_system::db_backend::WorkerSlot<Job>;
+using WorkerPool = caf_plugin_system::db_backend::WorkerPool<ConnSlot>;
 
 /// 取 json 中的 document 字段（缺省返回 fallback 文档）。
 bsoncxx::document::value get_doc(bsoncxx::document::view v, const char* key) {
@@ -470,7 +436,7 @@ std::string bounded_uri(const std::string& input) {
     return result;
 }
 
-void mongo_worker_main(MongoSpec spec, std::shared_ptr<WorkerState> state,
+void mongo_worker_main(std::shared_ptr<WorkerState> state, MongoSpec spec,
                        std::shared_ptr<const mongo_entities::service_config> settings) {
     // The thread captures WorkerState, not ConnSlot: the owning slot can always
     // destruct, signal stop and join, including actor failure/send_exit paths.
@@ -478,9 +444,9 @@ void mongo_worker_main(MongoSpec spec, std::shared_ptr<WorkerState> state,
     std::unique_ptr<mongo_entities::EntityStoreEngine> engine;
     std::string database;
     for (;;) {
-        auto job = state->queue->pop();
+        auto job = state->next_job();
         if (!job) break;
-        if (state->stop.stop_requested()) { job->fail("Mongo worker is stopping"); continue; }
+        if (state->stopped()) { job->fail("Mongo worker is stopping"); continue; }
         const auto started = std::chrono::steady_clock::now();
         try {
             if (!client) {
@@ -488,14 +454,14 @@ void mongo_worker_main(MongoSpec spec, std::shared_ptr<WorkerState> state,
                 database = uri.database();
                 client = std::make_unique<mongocxx::client>(uri);
                 engine = std::make_unique<mongo_entities::EntityStoreEngine>(
-                    *client, database, spec.name, *settings, state->stop.get_token());
+                    *client, database, spec.name, *settings, state->stop_token());
                 LOG_INFO("Mongo [{}] client initialized", spec.name);
             }
             if (job->load_done) job->load_done(engine->load(job->load, job->deadline));
             else if (job->save_done) job->save_done(engine->save(job->save, job->deadline));
             else {
                 auto result = mongo_execute(*client, database.empty() ? "admin" : database,
-                    job->collection, job->op, job->json, state->stop.get_token());
+                    job->collection, job->op, job->json, state->stop_token());
                 result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started).count();
                 if (job->done) job->done(result);
@@ -509,10 +475,6 @@ void mongo_worker_main(MongoSpec spec, std::shared_ptr<WorkerState> state,
     }
     LOG_INFO("Mongo [{}] worker exited", spec.name);
 }
-
-ConnSlot::ConnSlot(const MongoSpec& spec, std::shared_ptr<const mongo_entities::service_config> settings)
-    : max_pending_(settings->max_pending_requests),
-      thread_(mongo_worker_main, spec, state_, std::move(settings)) {}
 
 /// 字符串 op → 枚举；未知返回 false。
 bool parse_op(const std::string& s, Op& out) {
@@ -565,8 +527,7 @@ public:
 
         return sys.spawn([logger, uris, pool_size, entity_settings](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<MongoSpec>>(parse_uris(uris));
-            auto pools = std::make_shared<std::map<std::string, std::vector<std::shared_ptr<ConnSlot>>>>();
-            auto rr = std::make_shared<std::atomic<size_t>>(0);
+            auto pools = std::make_shared<WorkerPool>();
             auto started = std::make_shared<std::atomic<bool>>(false);
             auto default_conn = std::make_shared<std::string>("default");
 
@@ -576,11 +537,11 @@ public:
                 if (!specs->empty())
                     *default_conn = specs->front().name;
                 for (const auto& s : *specs) {
-                    auto& slots = (*pools)[s.name];
-                    slots.reserve(pool_size);
                     for (int i = 0; i < pool_size; ++i) {
-                        auto slot = std::make_shared<ConnSlot>(s, entity_settings);
-                        slots.push_back(slot);
+                        auto slot = pools->add_slot(s.name,
+                            caf_plugin_system::db_backend::WorkerOptions{
+                                entity_settings->max_pending_requests, true});
+                        slot->start_worker(mongo_worker_main, s, entity_settings);
                     }
                     LOG_INFO_SELF(self, "pool launched: [{}] size={}", s.name, pool_size);
                 }
@@ -588,32 +549,24 @@ public:
 
             // 入队到指定命名连接的池（round-robin）
             auto enqueue_rr = [=](const std::string& name, std::shared_ptr<Job> job) {
-                auto it = pools->find(name);
-                if (it == pools->end()) {
-                    db::db_result r;
-                    r.ok = false;
-                    r.error = "unknown mongo connection: " + name;
-                    if (job->done)
-                        job->done(r);
+                auto slot = pools->route_round_robin(name);
+                if (!slot) {
+                    job->fail("unknown or stopped mongo connection: " + name);
                     return;
                 }
-                auto& slots = it->second;
-                size_t idx = (rr->fetch_add(1)) % slots.size();
-                slots[idx]->push(std::move(job));
+                slot->enqueue(std::move(job));
             };
 
-            // Same store/partition stays on one worker even if the frontend's
-            // request times out. Its retries complete before later saves run.
+            // No affinity failover: an earlier timed-out save may still execute.
             auto enqueue_entity = [=](const std::string& name, const entities::entity_ref& target,
                                       std::shared_ptr<Job> job) {
-                auto found = pools->find(name);
-                if (found == pools->end()) {
-                    job->fail("unknown mongo connection: " + name);
+                const auto key = std::to_string(target.store.size()) + ":" + target.store + target.partition;
+                auto slot = pools->route_affine(name, key);
+                if (!slot) {
+                    job->fail("unknown or stopped mongo connection: " + name);
                     return;
                 }
-                const auto key = std::to_string(target.store.size()) + ":" + target.store + target.partition;
-                auto& slots = found->second;
-                slots[std::hash<std::string>{}(key) % slots.size()]->push(std::move(job));
+                slot->enqueue(std::move(job));
             };
 
             auto make_job = [](Op op, const std::string& coll, const std::string& json,
@@ -725,17 +678,7 @@ public:
                     return {};
                 },
                 .on_shutdown = [=]() {
-                    for (auto& [name, slots] : *pools) {
-                        for (auto& s : slots)
-                            s->stop();
-                    }
-                    size_t joined = 0;
-                    for (auto& [name, slots] : *pools) {
-                        for (auto& s : slots) {
-                            s->join();
-                            ++joined;
-                        }
-                    }
+                    const auto joined = pools->stop_and_join();
                     LOG_INFO_SELF(self, "MongoPlugin shutdown, {} workers joined", joined);
                 },
             }))};

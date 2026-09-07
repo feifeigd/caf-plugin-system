@@ -141,7 +141,7 @@ public:
         // Deliberately longer than our stop/join budget. A passing test cannot
         // be explained by the driver's ordinary read timeout expiring.
         policy.io_timeout_seconds = 5;
-        slot_->start_worker(sql_worker_main, spec, slot_, policy);
+        slot_->start_worker(sql_worker_main, spec, policy);
     }
 
     std::future<db::db_result> submit(Op operation, const std::string& statement) {

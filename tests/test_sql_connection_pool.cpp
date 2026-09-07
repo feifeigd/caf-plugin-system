@@ -68,8 +68,8 @@ int main() {
 
     ConnectionPool worker_pool{"worker-test"};
     auto worker_slot = worker_pool.add_slot("main");
-    worker_slot->start_worker([worker_slot] {
-        while (auto job = worker_slot->next_job()) {
+    worker_slot->start_worker([](auto state) {
+        while (auto job = state->next_job()) {
             caf_plugin_system::db::db_result result;
             result.ok = true;
             job->done(result);
@@ -100,6 +100,40 @@ int main() {
     };
     assert(!worker_slot->enqueue(std::move(stopped)));
     assert(stopped_failed);
+
+    // A transaction completion may retain state and the lease registry, but
+    // never the pool/slot that owns its thread. Destruction must join normally.
+    std::weak_ptr<ConnectionPool> weak_pool;
+    std::weak_ptr<caf_plugin_system::sql_backend::ConnectionSlot> weak_slot;
+    std::weak_ptr<caf_plugin_system::sql_backend::ConnectionState> weak_state;
+    bool transaction_completed = false;
+    {
+        auto owner = std::make_shared<ConnectionPool>("lifetime-test");
+        weak_pool = owner;
+        auto slot = owner->add_slot("main");
+        weak_slot = slot;
+        weak_state = slot->state();
+        auto lease = owner->acquire_transaction("main", "lifetime-request");
+        auto completion_job = std::make_shared<caf_plugin_system::sql_backend::Job>();
+        completion_job->done = [registry = owner->transactions(), state = slot->state(),
+                               token = lease.transaction, &transaction_completed](auto&) {
+            transaction_completed = registry->release_transaction(token);
+            assert(state->transaction_state() == TransactionState::Idle);
+        };
+        slot->enqueue(std::move(completion_job));
+        slot->start_worker([](auto state) {
+            while (auto current = state->next_job()) {
+                caf_plugin_system::db::db_result result;
+                result.ok = true;
+                current->done(result);
+            }
+        });
+        lease.slot.reset();
+        slot.reset();
+        owner.reset();
+    }
+    assert(transaction_completed && weak_pool.expired());
+    assert(weak_slot.expired() && weak_state.expired());
 
     caf::settings uri_settings{
         {"main", caf::config_value{std::string{

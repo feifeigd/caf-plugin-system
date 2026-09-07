@@ -1,28 +1,30 @@
 // ------------------------------------------------------------------
 // Redis 插件（数据库插件系列参考实现）
 //
-// 【阻塞 IO 模型】（数据库插件统一骨架，Phase 2/3 的 MySQL/PG/Mongo
-// 照抄本文件结构，只换驱动 API）：
+// 【阻塞 IO 模型】（数据库插件统一骨架，MySQL/PG/Mongo
+// 共用 db_worker_pool.hpp，插件保留驱动 API）：
 //   - 插件 actor（event-based）只收消息、入队，返回 response_promise
-//   - 每个【命名连接】一个 worker 线程 + 独占 hiredis ctx（连接间
-//     天然隔离），执行完 rp.deliver() 直接回调用方
-//   - worker 线程【绝不持有 caf::actor 强引用】，只捕获 rp 值
-//     （detached 线程被进程强杀不 unwind → 强引用导致 dump 泄露）
+//   - 每个命名连接一个 worker；原始命令与实体操作各用独立 hiredis 连接。
+//     执行完通过 response_promise 交付结果。
+//   - worker 不额外持有插件 actor 句柄；任务中的 promise 持有回复所需引用。
+//     工作线程必须由公共池 stop/join，不使用 detached 线程
 //
 // 【多连接】配置：走 CAF 默认配置系统（同一配置文件、字段区分），
-//   framework_config 注册的字段 "redis-uris"（caf-plugin-system 组）：
-//   格式 "name1=uri1,name2=uri2"（逗号分隔、等号配对；无 name 条目归入
-//   "default"）。uri = redis://host:port/db（db 可省略，默认 0）。
+//   caf-plugin-system.redis.uris 是字典，键为连接名，值为 URI。
+//   uri = redis://host:port/db（db 可省略，默认 0）。
 //   例（caf-application.conf）：
-//     caf-plugin-system { redis-uris = "cache=redis://127.0.0.1:6379/1,main=redis://127.0.0.1:6379/0" }
+//     caf-plugin-system { redis { uris {
+//       cache = "redis://127.0.0.1:6379/1"
+//       main = "redis://127.0.0.1:6379/0"
+//     } } }
 //   同一进程可同时连多个实例 / 一个实例多个 db（每命名连接一个 worker）。
 //   API：redis_cmd_atom + (conn, cmd, args)；无 conn 的三参版走默认连接
 //   （默认 = 配置里第一条；配置缺失时 = 127.0.0.1:6379/db0）。
 //   插件在 spawn 时经 sys.config() 读取（基类 get_or 自由函数，避开
 //   跨 DLL RTTI 的静态库副本问题）。
 //
-// 事务：Redis 的 MULTI/EXEC 就是命令流，execute("MULTI")...execute("EXEC")
-// 天然支持（同连接串行 = 同事务），无需显式事务状态机（tx_* 留给 MySQL/PG）。
+// 原始命令接口不提供调用方之间的事务隔离：分散发送 MULTI/EXEC 时，
+// 其他调用方的命令可能交错。统一对象接口另走 EntityStoreEngine 的原子提交。
 // ------------------------------------------------------------------
 
 #include "plugin/plugin_interface.hpp"
@@ -30,7 +32,7 @@
 #include "services/logging_service.hpp"
 #include "common/db_contract.hpp"
 #include "common/plugin_config.hpp"
-#include "templates/job_queue.hpp"
+#include "templates/db_worker_pool.hpp"
 
 // hiredis 依赖 winsock2 的 timeval；必须先于 caf/all.hpp（其可能拉入
 // windows.h）包含，否则 struct timeval 不完整 → 编译错
@@ -38,6 +40,7 @@
 #include <winsock2.h>
 #endif
 #include <hiredis/hiredis.h>
+#include "redis_entity_store.hpp"
 
 #include <caf/all.hpp>
 
@@ -54,6 +57,8 @@
 #include <vector>
 
 namespace db = caf_plugin_system::db;
+namespace entities = caf_plugin_system::entity_store;
+namespace redis_entities = caf_plugin_system::entity_store::redis;
 
 namespace {
 
@@ -74,7 +79,7 @@ struct ConnSpec {
 };
 
 /// 从配置 dictionary 构造命名连接表（键 = 连接名，值 = uri 字符串）；
-/// uri 尾部 /N 为 db 下标。解析失败条目跳过（记日志由调用方做）。
+/// uri 尾部 /N 为 db 下标；非字符串条目跳过，数值按 atoi 转换，此处不严格校验 URI。
 std::vector<ConnSpec> parse_uris(const caf::settings& uris) {
     std::vector<ConnSpec> out;
     for (const auto& [name, value] : uris) {
@@ -110,19 +115,37 @@ std::vector<ConnSpec> parse_uris(const caf::settings& uris) {
 }
 
 /// 队列元素：命令 + 响应承诺。rp 是值类型，可跨线程传递；
-/// worker 只调 deliver，绝不持有 actor 句柄。
+/// worker 通过 promise 交付结果，不额外保存插件 actor 句柄。
 struct Job {
     std::string cmd;
     std::vector<std::string> args;
     caf::typed_response_promise<db::db_result> rp;
 
-    /// 失败交付方式（JobQueue::fail_all 统一调用）。
+    enum class Kind { Raw, Load, Save };
+    Kind kind = Kind::Raw;
+    entities::load_request load;
+    entities::save_request save;
+    caf::typed_response_promise<entities::load_result> load_rp;
+    caf::typed_response_promise<entities::save_result> save_rp;
+    std::chrono::steady_clock::time_point deadline;
+
+    /// 仅尚未执行的任务由队列拒绝，不会宣称已执行的写请求失败。
     void fail(const std::string& err) {
-        rp.deliver(caf::make_error(caf::sec::runtime_error, err));
+        if (kind == Kind::Load) {
+            entities::load_result result; result.target = load.target;
+            result.code = entities::result_code::unavailable; result.error = err;
+            load_rp.deliver(std::move(result));
+        } else if (kind == Kind::Save) {
+            entities::save_result result; result.request_id = save.request_id;
+            result.code = entities::result_code::unavailable; result.error = err;
+            save_rp.deliver(std::move(result));
+        } else rp.deliver(caf::make_error(caf::sec::runtime_error, err));
     }
 };
 
-using JobQueue = caf_plugin_system::JobQueue<Job>;
+using WorkerState = caf_plugin_system::db_backend::WorkerState<Job>;
+using ConnSlot    = caf_plugin_system::db_backend::WorkerSlot<Job>;
+using WorkerPool  = caf_plugin_system::db_backend::WorkerPool<ConnSlot>;
 
 /// 嵌套数组递归展平（逗号分隔，v1 简化表示）。
 void flatten_reply(const redisReply* r, std::string& out) {
@@ -184,69 +207,35 @@ db::db_result reply_to_result(const redisReply* r) {
     return res;
 }
 
-/// worker 主循环：独占一条连接，串行执行队列。
-void redis_worker_main(const ConnSpec& spec, std::shared_ptr<JobQueue> queue) {
-    struct timeval tv { 2, 0 };  // 连接/命令 2s 超时，防关机链 join 卡死
-    redisContext* ctx = redisConnectWithTimeout(spec.host.c_str(), spec.port, tv);
-    if (ctx && ctx->err) {
-        redisFree(ctx);
-        ctx = nullptr;
-    }
-    if (!ctx) {
-        LOG_ERROR("Redis [{}] connect failed: {}:{}", spec.name, spec.host, spec.port);
-        queue->fail_all("redis connect failed: " + spec.host + ":" + std::to_string(spec.port));
-        return;
-    }
-    redisSetTimeout(ctx, tv);
-    if (spec.db > 0) {
-        // hiredis 1.x 的 redisCommand 返回 void*（宏展开为 redisvCommand）
-        redisReply* r = static_cast<redisReply*>(redisCommand(ctx, "SELECT %d", spec.db));
-        if (r && r->type == REDIS_REPLY_ERROR) {
-            LOG_ERROR("Redis [{}] SELECT {} failed: {}", spec.name, spec.db, r->str);
-            freeReplyObject(r);
-            redisFree(ctx);
-            queue->fail_all("redis SELECT failed");
-            return;
+/// 每条命名连接一个串行 worker；原始命令和实体事务使用独立 native session。
+void redis_worker_main(std::shared_ptr<WorkerState> state, const ConnSpec& spec,
+                       std::shared_ptr<const redis_entities::service_config> settings) {
+    redis_entities::ConnectionOptions options{spec.host, spec.port, spec.db};
+    redis_entities::NativeConnection raw{options}, entity_connection{options};
+    redis_entities::EntityStoreEngine engine{entity_connection, spec.name, *settings, state->stop_token()};
+    while (auto job = state->next_job()) {
+        if (job->kind == Job::Kind::Load) {
+            job->load_rp.deliver(engine.load(job->load, job->deadline));
+            continue;
         }
-        if (r)
-            freeReplyObject(r);
-    }
-    LOG_INFO("Redis [{}] connected: {}:{}/db{}", spec.name, spec.host, spec.port, spec.db);
-
-    for (;;) {
-        auto job = queue->pop();
-        if (!job)
-            break;
-        auto t0 = std::chrono::steady_clock::now();
-
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(job->args.size() + 1);
-        argvlen.reserve(job->args.size() + 1);
-        argv.push_back(job->cmd.c_str());
-        argvlen.push_back(job->cmd.size());
-        for (const auto& a : job->args) {
-            argv.push_back(a.c_str());
-            argvlen.push_back(a.size());
+        if (job->kind == Job::Kind::Save) {
+            job->save_rp.deliver(engine.save(job->save, job->deadline));
+            continue;
         }
-
-        redisReply* reply = static_cast<redisReply*>(redisCommandArgv(
-            ctx, static_cast<int>(argv.size()), argv.data(), argvlen.data()));
-        db::db_result r;
-        if (!reply) {
-            r.ok = false;
-            r.error = ctx->err ? ctx->errstr : "unknown redis error";
-        } else {
-            r = reply_to_result(reply);
-            freeReplyObject(reply);
+        auto started = std::chrono::steady_clock::now();
+        db::db_result result;
+        try {
+            std::vector<std::string> arguments{job->cmd};
+            arguments.insert(arguments.end(), job->args.begin(), job->args.end());
+            auto reply = raw.command(arguments, started + std::chrono::seconds{2}, true);
+            result = reply_to_result(reply.get());
+        } catch (const std::exception& error) {
+            result.error = error.what();
         }
-        r.duration_ms = static_cast<int64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - t0).count());
-        job->rp.deliver(std::move(r));
+        result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        job->rp.deliver(std::move(result));
     }
-
-    redisFree(ctx);
     LOG_INFO("Redis [{}] worker exited", spec.name);
 }
 
@@ -255,7 +244,7 @@ void redis_worker_main(const ConnSpec& spec, std::shared_ptr<JobQueue> queue) {
 class RedisPlugin : public PluginEntry {
 public:
     plugin_manifest manifest() const override {
-        // 连接配置走 CAF 配置系统（redis-uris 字段），不依赖 config_service
+        // 连接配置读取 caf-plugin-system.redis.uris，不依赖 config_service
         return {"RedisPlugin", "1.0.0",
                  {},
                 {"redis_service"}, 0, {}};
@@ -271,10 +260,12 @@ public:
         auto cfg = load_plugin_config(sys.config());
         caf::settings uris = cfg.uris;
 
-        return sys.spawn([logger, uris](caf::event_based_actor* self) -> caf::behavior {
+        auto raw_settings = caf::get_or(sys.config(), "caf-plugin-system.entity_store", caf::settings{});
+        auto entity_settings = std::make_shared<const redis_entities::service_config>(
+            redis_entities::parse_service_config(raw_settings));
+        return sys.spawn([logger, uris, entity_settings](caf::event_based_actor* self) -> caf::behavior {
             auto specs = std::make_shared<std::vector<ConnSpec>>(parse_uris(uris));
-            auto queues = std::make_shared<std::map<std::string, std::shared_ptr<JobQueue>>>();
-            auto threads = std::make_shared<std::map<std::string, std::shared_ptr<std::thread>>>();
+            auto pools = std::make_shared<WorkerPool>();
             auto started = std::make_shared<std::atomic<bool>>(false);
             auto default_conn = std::make_shared<std::string>("default");
 
@@ -286,10 +277,8 @@ public:
                 if (!specs->empty())
                     *default_conn = specs->front().name;
                 for (const auto& s : *specs) {
-                    auto q = std::make_shared<JobQueue>();
-                    (*queues)[s.name] = q;
-                    (*threads)[s.name] = std::make_shared<std::thread>(
-                        redis_worker_main, s, q);
+                    auto slot = pools->add_slot(s.name);
+                    slot->start_worker(redis_worker_main, s, entity_settings);
                     LOG_INFO_SELF(self, "worker launched: [{}] {}:{}/db{}",
                                   s.name, s.host, s.port, s.db);
                 }
@@ -298,16 +287,16 @@ public:
             // 入队请求；conn 不存在 → 立即回错误（不排队）
             auto enqueue = [=](const std::string& conn, const std::string& cmd,
                                const std::vector<std::string>& args) {
-                auto it = queues->find(conn);
-                if (it == queues->end()) {
+                auto slot = pools->route_round_robin(conn);
+                if (!slot) {
                     db::db_result r;
                     r.ok = false;
-                    r.error = "unknown redis connection: " + conn;
+                    r.error = "unknown or stopped redis connection: " + conn;
                     self->make_response_promise<db::db_result>().deliver(std::move(r));
                     return;
                 }
                 auto rp = self->make_response_promise<db::db_result>();
-                it->second->push(std::make_shared<Job>(Job{cmd, args, rp}));
+                slot->enqueue(std::make_shared<Job>(Job{cmd, args, rp}));
             };
 
             // 自检：PING + SET 各一轮（默认连接），
@@ -336,6 +325,38 @@ public:
             };
 
             caf::message_handler business{
+                [=](entity_load_atom, const std::string& conn, entities::load_request request,
+                    uint64_t timeout_ms) -> caf::result<entities::load_result> {
+                    auto promise = self->make_response_promise<entities::load_result>();
+                    auto slot = pools->route_round_robin(conn);
+                    if (!slot || slot->pending() >= entity_settings->max_pending_requests || timeout_ms == 0) {
+                        entities::load_result result; result.target = request.target;
+                        result.code = entities::result_code::unavailable;
+                        result.error = "Redis entity connection unavailable, queue full or deadline expired";
+                        promise.deliver(std::move(result)); return promise;
+                    }
+                    auto job = std::make_shared<Job>();
+                    job->kind = Job::Kind::Load; job->load = std::move(request); job->load_rp = promise;
+                    job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{
+                        std::min<uint64_t>(timeout_ms, entity_settings->request_timeout.count())};
+                    slot->enqueue(std::move(job)); return promise;
+                },
+                [=](entity_save_atom, const std::string& conn, entities::save_request request,
+                    uint64_t timeout_ms) -> caf::result<entities::save_result> {
+                    auto promise = self->make_response_promise<entities::save_result>();
+                    auto slot = pools->route_round_robin(conn);
+                    if (!slot || slot->pending() >= entity_settings->max_pending_requests || timeout_ms == 0) {
+                        entities::save_result result; result.request_id = request.request_id;
+                        result.code = entities::result_code::unavailable;
+                        result.error = "Redis entity connection unavailable, queue full or deadline expired";
+                        promise.deliver(std::move(result)); return promise;
+                    }
+                    auto job = std::make_shared<Job>();
+                    job->kind = Job::Kind::Save; job->save = std::move(request); job->save_rp = promise;
+                    job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{
+                        std::min<uint64_t>(timeout_ms, entity_settings->request_timeout.count())};
+                    slot->enqueue(std::move(job)); return promise;
+                },
                 // 四参版：指定命名连接。request → db_result；纯 send 无 rp，丢弃
                 [=](redis_cmd_atom, const std::string& conn, const std::string& cmd,
                     const std::vector<std::string>& args) {
@@ -369,21 +390,8 @@ public:
                     return {};
                 },
                 .on_shutdown = [=]() {
-                    // 先停全部队列再 join：worker 清空残留（deliver error）后快速退出；
-                    // hiredis 命令 2s 超时兜底，join 不会无限卡关机链。
-                    // 注意：此日志用 std::cout 直出（不经 logging_service）——
-                    // 关机尾部 shutdown_mgr 的 send_exit(logging_service) 与本
-                    // actor 的日志消息不同 sender 无 FIFO，异步日志可能被丢弃。
-                    for (auto& [name, q] : *queues)
-                        q->stop();
-                    for (auto& [name, t] : *threads) {
-                        if (t->joinable())
-                            t->join();
-                    }
-                    std::cout << "[RedisPlugin] shutdown hook: " << threads->size()
-                              << " workers joined" << std::endl;
-                    LOG_INFO_SELF(self, "RedisPlugin shutdown, {} workers joined",
-                                  threads->size());
+                    const auto joined = pools->stop_and_join();
+                    LOG_INFO_SELF(self, "RedisPlugin shutdown, {} workers joined", joined);
                 },
             }))};
         });

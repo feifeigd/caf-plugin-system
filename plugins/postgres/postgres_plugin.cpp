@@ -1,5 +1,5 @@
 // ------------------------------------------------------------------
-// PostgreSQL 插件（libpq，Phase 2）
+// PostgreSQL 插件（libpq）
 //
 // 与 MySQL 插件同骨架（连接池 + 参数化 + 事务），差异仅在驱动 API：
 //   - 连接：PQconnectdb（conninfo 文本）
@@ -10,8 +10,10 @@
 //
 // 配置（CAF 配置系统，同文件字段区分）：
 //   caf-plugin-system {
-//     pg-uris = "main=postgres://postgres:pass@127.0.0.1:5432/appdb"
-//     db-pool-size = 2
+//     postgres {
+//       uris { main = "postgres://postgres:pass@127.0.0.1:5432/appdb" }
+//       pool_size = 2
+//     }
 //   }
 // uri = postgres://user:pass@host:port/dbname（各段可省略）
 // ------------------------------------------------------------------
@@ -54,6 +56,7 @@ namespace {
 using Op = caf_plugin_system::sql_backend::Operation;
 using Job = caf_plugin_system::sql_backend::Job;
 using ConnSlot = caf_plugin_system::sql_backend::ConnectionSlot;
+using ConnState = caf_plugin_system::sql_backend::ConnectionState;
 using SqlPool = caf_plugin_system::sql_backend::ConnectionPool;
 using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 
@@ -100,7 +103,7 @@ db::db_result pg_failure(PGconn* connection, PGresult* native = nullptr) {
 // intervals instead, so broken networks and shutdown cannot pin a worker forever.
 bool pg_wait(PGconn* connection, bool read,
              std::chrono::steady_clock::time_point deadline,
-             const std::shared_ptr<ConnSlot>& slot, db::db_result& error) {
+             const std::shared_ptr<ConnState>& slot, db::db_result& error) {
     for (;;) {
         if (slot->stopped() || std::chrono::steady_clock::now() >= deadline) {
             error.code = db::error_code::connection_lost;
@@ -138,7 +141,7 @@ bool pg_wait(PGconn* connection, bool read,
 
 PGresult* pg_exchange(PGconn* connection, const char* sql, int count,
                        const char* const* values,
-                       const std::shared_ptr<ConnSlot>& slot, unsigned timeout,
+                       const std::shared_ptr<ConnState>& slot, unsigned timeout,
                        db::db_result& error) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeout};
     if (PQsendQueryParams(connection, sql, count, nullptr, values,
@@ -195,7 +198,7 @@ PGresult* pg_exchange(PGconn* connection, const char* sql, int count,
 
 /// 文本命令（BEGIN/COMMIT/ROLLBACK）。
 db::db_result exec_text(PGconn* c, const char* cmd,
-                        const std::shared_ptr<ConnSlot>& slot, unsigned timeout) {
+                        const std::shared_ptr<ConnState>& slot, unsigned timeout) {
     db::db_result r;
     PGresult* res = pg_exchange(c, cmd, 0, nullptr, slot, timeout, r);
     if (!res)
@@ -217,7 +220,7 @@ db::db_result exec_text(PGconn* c, const char* cmd,
 /// 参数化查询/写。结果集天然字符串（PQgetvalue），NULL → 空串。
 db::db_result stmt_execute(PGconn* c, const std::string& sql,
                            const std::vector<std::string>& params, bool want_rows,
-                           const std::shared_ptr<ConnSlot>& slot, unsigned timeout) {
+                           const std::shared_ptr<ConnState>& slot, unsigned timeout) {
     db::db_result r;
     // libpq text parameters are NUL-terminated; paramLengths is ignored for
     // text format. PostgreSQL text cannot contain NUL, so reject instead of
@@ -306,7 +309,7 @@ using ReconnectPolicy = caf_plugin_system::sql_backend::ReconnectPolicy;
 
 class PostgresConnection final : public caf_plugin_system::sql_backend::SqlConnection {
 public:
-    PostgresConnection(PgSpec spec, std::shared_ptr<ConnSlot> slot, ReconnectPolicy policy)
+    PostgresConnection(PgSpec spec, std::shared_ptr<ConnState> slot, ReconnectPolicy policy)
         : spec_(std::move(spec)), slot_(std::move(slot)), policy_(policy) {}
     ~PostgresConnection() override { close(); }
 
@@ -404,12 +407,12 @@ public:
 
 private:
     PgSpec spec_;
-    std::shared_ptr<ConnSlot> slot_;
+    std::shared_ptr<ConnState> slot_;
     ReconnectPolicy policy_;
     PGconn* handle_ = nullptr;
 };
 
-void pg_worker_main(const PgSpec& spec, std::shared_ptr<ConnSlot> slot,
+void pg_worker_main(std::shared_ptr<ConnState> slot, const PgSpec& spec,
                     ReconnectPolicy policy) {
     caf_plugin_system::sql_backend::ReconnectingSqlWorker worker{
         slot, std::make_unique<PostgresConnection>(spec, slot, policy), policy};
@@ -458,7 +461,7 @@ public:
                 for (const auto& s : *specs) {
                     for (int i = 0; i < pool_size; ++i) {
                         auto slot = pools->add_slot(s.name);
-                        slot->start_worker(pg_worker_main, s, slot, reconnect);
+                        slot->start_worker(pg_worker_main, s, reconnect);
                     }
                     LOG_INFO_SELF(self, "pool launched: [{}] {}:{}/{} size={}",
                                   s.name, s.host, s.port, s.dbname, pool_size);

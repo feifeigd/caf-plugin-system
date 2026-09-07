@@ -23,6 +23,14 @@ add_executable(test_sql_connection_pool
 target_link_libraries(test_sql_connection_pool PRIVATE caf_plugin_core)
 add_test(NAME sql_connection_pool COMMAND test_sql_connection_pool)
 
+# This layer deliberately has no CAF or database-driver dependency.
+find_package(Threads REQUIRED)
+add_executable(test_db_worker_pool test_db_worker_pool.cpp)
+target_include_directories(test_db_worker_pool PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(test_db_worker_pool PRIVATE Threads::Threads)
+add_test(NAME db_worker_pool COMMAND test_db_worker_pool)
+set_tests_properties(db_worker_pool PROPERTIES TIMEOUT 30)
+
 add_executable(test_sql_entity_store
     test_sql_entity_store.cpp
 )
@@ -53,6 +61,14 @@ else()
     target_link_libraries(test_mongo_entity_store PRIVATE caf_plugin_core mongo::mongocxx_static)
 endif()
 add_dependencies(test_mongo_entity_store mongo_plugin entity_store_plugin)
+
+add_executable(test_redis_worker_pool test_redis_worker_pool.cpp)
+target_link_libraries(test_redis_worker_pool PRIVATE caf_plugin_core)
+add_dependencies(test_redis_worker_pool redis_plugin)
+
+add_executable(test_redis_entity_store test_redis_entity_store.cpp)
+target_link_libraries(test_redis_entity_store PRIVATE caf_plugin_core)
+add_dependencies(test_redis_entity_store redis_plugin entity_store_plugin)
 
 # Socket lifetime/cancellation tests do not require a database or Docker.
 add_executable(test_sql_socket_cancellation test_sql_socket_cancellation.cpp)
@@ -181,6 +197,18 @@ if(WIN32)
             RUN_SERIAL TRUE
             TIMEOUT 300
         )
+        add_test(NAME redis_worker_pool_docker
+            COMMAND "${ENTITY_STORE_PWSH}" -NoProfile -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_redis_worker_pool_docker.ps1"
+                -BuildDir "${CMAKE_BINARY_DIR}" -Configuration "$<CONFIG>"
+        )
+        set_tests_properties(redis_worker_pool_docker PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME redis_entity_store_docker
+            COMMAND "${ENTITY_STORE_PWSH}" -NoProfile -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_redis_entity_store_docker.ps1"
+                -BuildDir "${CMAKE_BINARY_DIR}" -Configuration "$<CONFIG>"
+        )
+        set_tests_properties(redis_entity_store_docker PROPERTIES RUN_SERIAL TRUE TIMEOUT 240)
     endif()
 endif()
 

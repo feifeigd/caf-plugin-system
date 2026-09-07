@@ -4,8 +4,8 @@
 
 游戏、订单、支付等业务只依赖逻辑实体，不手写日常读写 SQL。统一协议在
 `include/common/entity_store_contract.hpp`，`EntityStorePlugin` 已提供
-`entity_store` 服务，支持 SQLite、MySQL、PostgreSQL 和 MongoDB。
-Redis 目前仍只有底层操作接口，没有接入这个实体事务协议。
+`entity_store` 服务，支持 SQLite、MySQL、PostgreSQL、MongoDB 和 Redis。
+各后端共用对象请求；存储形式与原子提交实现由各适配器负责。
 
 ```text
 Game / Order / Payment actor
@@ -17,6 +17,7 @@ Game / Order / Payment actor
       v
 SQL adapter   -> mysql_service / pg_service / sqlite_service
 Mongo adapter -> mongo_service
+Redis adapter -> redis_service
 ```
 
 这层划分有两个目的：
@@ -33,7 +34,7 @@ Mongo adapter -> mongo_service
 - `store` 选择配置好的读写连接，`entity + key` 通过 schema 定位记录；
 - `partition` 是保存串行键与批次约束，当前不自动选择物理分片；物理分片可配置成不同 store；
 - `field_mask.all_fields=true` 读取 schema 允许返回的全部字段；
-- 否则只读取 `field_mask.names`，实现真正的字段投影；
+- 否则只返回 `field_mask.names`；Redis 当前读取整个对象编码后做结果投影；
 - 返回 `version`，后续保存可用它做乐观锁。
 
 ### 保存
@@ -42,11 +43,11 @@ Mongo adapter -> mongo_service
 
 - `changes` 是一个事务中的实体 patch 列表；
 - 每个 `entity_patch.fields` 只描述变化字段，未出现的字段保持原值；
-- `set` 写值，`erase` 删除/置空，`increment` 在数据库端原子累加；
+- `set` 写值，`erase` 删除/置空，`increment` 原子累加（SQL/Mongo 原生运算，Redis 服务端 CAS）；
 - 所有 change 必须使用同一 `store + partition`，不一致直接返回
   `invalid_request`；
-- 任一 patch 失败、记录不存在或版本冲突，整批回滚；
-- 只有数据库 COMMIT 成功后，`committed` 才为 true。
+- 任一 patch 失败、记录不存在或版本冲突，整批不生效；
+- 只有后端确认原子提交成功，`committed` 才为 true。
 
 示例：
 
@@ -146,12 +147,40 @@ worker 的策略。旧事务令牌永远不能在重连后的新会话继续执�
 
 事务占用的连接不会接收普通 round-robin 请求，防止其他业务语句误入事务。
 
-## SQL 插件公共实现
+## 数据库插件公共实现
+
+SQLite、MySQL、PostgreSQL、MongoDB 和 Redis 命令插件共用
+`db_worker_pool.hpp`，不要求非 SQL 后端伪装成 SQL 请求：
+
+- `WorkerState<Job>`：线程安全 FIFO、停止信号和可选在途上限；计数覆盖排队及正在
+  执行的任务，任务释放时自动归还，不要求各插件再实现计数回调。
+- `WorkerSlot<Job, State>`：独占 worker 的创建、停止和 join；线程只拿共享 State，
+  不持有拥有线程的 Slot，避免循环引用。原生连接由所属 worker 创建和释放。
+- `WorkerPool<Slot>`：命名连接池、轮询和按键固定 worker；退出时先停止全部 worker
+  再逐个 join。固定选路不会在目标停止时换 worker，以免较早的请求尚未结束而乱序。
+
+池的创建和选路由插件 actor 串行管理，运行中不应改变同分区选路的槽位数量。
+公共层不重放数据库请求、不决定事务结果。SQL 的连接占用和事务句柄、Mongo 的
+session 和提交重试仍由对应适配器管理。Redis 仍是一条命名连接一个 worker，
+原始命令与 EntityStore 各自使用独立 native connection，防止原始 MULTI/SELECT
+改变实体会话；分散的原始 MULTI/EXEC 调用本身仍不构成隔离的业务事务。
+
+Mongo 沿用原先的在途上限；SQL/Redis 的原始命令入口保持既有排队策略，
+本次不新增它们的队列上限配置。SQL 的事务完成回调只持有 `TransactionRegistry`
+和 `ConnectionState`，不持有拥有线程的 Pool/Slot；强制退出时也由 actor 侧
+的池执行停止和 join，不允许 worker 自行 detach。
+
+`test_db_worker_pool` 独立于 CAF 和数据库驱动，验证该层的路由、队列、限流和退出。
+`test_redis_worker_pool` 通过真实插件验证原始命令、FIFO、二进制往返及正常/强制退出。
+Mongo 和 Redis 的 Docker 入口共用 `tests/run_database_plugin_docker.ps1`；
+每轮只创建一个带唯一所有权标签的临时容器，日志保留，容器与运行时二进制副本清理。
+
+### SQL 适配器公共实现
 
 三个 SQL 后端复用以下公共组件：
 
 - `sql_connection_pool.hpp`：`ConnectionPool` 管理普通请求选路和事务句柄，
-  `ConnectionSlot` 封装专属 FIFO、worker 生命周期与事务槽；
+  `ConnectionSlot` 复用公共 worker 槽，`ConnectionState` 保存事务槽和恢复能力；
 - `sql_service_handlers.hpp`：`SqlServiceDispatcher` 封装请求构造、普通路由、
   事务路由以及 CAF handler 的生命周期；
 - `sql_uri_config.hpp`：`ConnectionUriParser` 封装 MySQL/PostgreSQL 命名连接
@@ -162,13 +191,52 @@ worker 的策略。旧事务令牌永远不能在重连后的新会话继续执�
 SQLite、MySQL 和 PostgreSQL 插件只保留连接建立、参数绑定、SQL 执行和结果集
 转换等驱动相关代码。EntityStore 自身也按 OOP 拆分为：
 
-- `entity_store_schema.hpp`：SQL/Mongo 共用的 `schema_catalog`，字段白名单和读写路由；
+- `entity_store_schema.hpp`：SQL/Mongo/Redis 共用的 `schema_catalog`，字段白名单和读写路由；
   `sql_entity_store_schema.hpp` 保留旧命名空间别名，兼容已有调用；
 - `sql_entity_store_statements.hpp`：`sql_dialect`、`statement_builder`，参数化 SQL 生成和结果解码；
 - `sql_entity_store_actor.hpp`：`entity_store_actor`，保存队列、事务状态机、幂等回放和排空。
 - `sql_entity_store_schema_provider.hpp`：`schema_provider` 及三种数据库实现，生成
   参数化元数据查询、补全字段、校验业务配置；本身不做 I/O。
 - `sql_entity_store_recovery.hpp`：actor 的异步表结构加载、纯读取和整笔保存重试。
+- `document_entity_store_config.hpp` / `document_entity_store_actor.hpp`：Mongo/Redis 共用
+  配置骨架、对象请求、同分区保存队列、超时回执和退出排空；Mongo 旧头文件保留兼容别名。
+
+## Redis 适配
+
+使用 `dialect = "redis"`，同时加载 RedisPlugin 与 EntityStorePlugin。
+完整配置见 [Redis 示例](../examples/entity_store/redis.conf)，业务仍调用同一套
+entity_load_atom / entity_save_atom，不必手写 Redis 命令、Lua 或序列化代码。
+
+- 支持读取/结果投影、创建、set/erase/increment、版本检查、多实体原子保存和持久化幂等。
+  缺失字段可从零累加；显式 null 不能累加。必填字段、类型和可写白名单均在提交前校验。
+- schema 仍为 manual，不从 Redis 缓存内容推断必填字段/类型；table 是实体命名空间，
+  column 是对象编码中的物理字段名。版本从 1 开始，上限为 signed int64 最大值。
+- 存储格式为一个 Redis hash：键名是 `__caf_entity_store:v1:<idempotency_table>`。
+  对象 hash field 使用物理 table + 排序后的物理主键编码；幂等 field 使用 request_id，
+  两类 field 有独立前缀。值是带格式版本、长度前缀的二进制编码，不是原生 JSON/hash 属性。
+  partition 是排序/批次约束，不自动成为对象主键或 Redis Cluster 分片键。
+- C++ 先取对象快照并完整校验、计算全部 patch；Lua 比较快照是否仍然有效，
+  最后仅用一条多字段 HSET 同时发布全部对象及幂等结果。CAS 竞争失败有界重读重算，
+  不覆盖其他写入。整批多次修改同一对象按 changes 顺序计算，版本逐次递增。
+  这不依赖“Lua 出错后回滚之前写入”这种不存在的保证。
+  参见 [Redis 脚本原子性](https://redis.io/docs/latest/develop/programmability/eval-intro/) 和
+  [HSET 多字段写入](https://redis.io/docs/latest/commands/hset/)。
+- bool/int64/uint64/有限 double/text/bytes 均保留类型；金额 decimal 使用精确十进制运算，
+  不经过 Lua double，支持科学计数法并规范化输出，精度/小数位最多 4096。
+  JSON 支持对象/数组，包括树状嵌套数据；目前只能整体替换该 JSON 字段，不支持路径级 patch。
+- request_id 在同一连接数据库、同一 idempotency_table 内全局唯一；同 ID、同内容返回首次版本，
+  换内容（包括换 store/partition）返回 conflict。记录没有 TTL，插件重启后仍可重放。
+  不应手动覆盖/过期/淘汰内部 hash；清除它会同时丢失对象和幂等保护。
+- 请求发送前的连接故障和纯读取可有界重试；提交回执丢失返回 commit_unknown，
+  不自动猜测回滚或换 ID 重放。调用方必须保留原 ID 和内容再次请求。
+  下一请求会重新连接，原生建连/命令等待各受 2 秒及剩余请求预算限制。
+- 保留独立读写连接路由，但不建立主从复制、不保证副本写后即读。当前连接器面向单机 Redis
+  或显式主/副本地址，不实现 Cluster MOVED/ASK、Sentinel、TLS 或认证 URI。
+  持久化和故障恢复取决于 Redis 的落盘/复制/淘汰配置，原子提交不等于崩溃后绝不丢数据。
+- 这个实现以同一幂等命名空间的单 hash 换取一次写入的原子性；应按 store/连接合理拆分数据，
+  不应无限扩大一个 hash。一次 save 最多 1024 个 change，签名/单对象/读取快照各限 8 MiB，
+  CAS 提交参数的对象/快照/幂等编码合计限 24 MiB。读取投影和局部 patch 在 API 上成立，
+  存储端仍传输/重写受影响对象的完整编码，不是原生字段级存储更新。
 
 ## MongoDB 适配
 
@@ -211,7 +279,7 @@ BSON 原生类型；decimal 和 unsigned integer 使用 Decimal128（不经过 d
 JSON 对象/数组存为嵌套 BSON，不是 JSON 字符串。整数越界、非有限数值、类型不符会被
 拒绝；JSON 标量不支持。Mongo 支持 `bytes`，SQL 的二进制限制不变。保存签名最大 8 MiB。
 
-Mongo 专用调度、配置、BSON 转换和原生事务分别放在独立类/文件中；底层已有的
+Mongo/Redis 共用对象调度与配置骨架，BSON 转换和原生事务仍为 Mongo 专用类；底层已有的
 `mongo_op_atom` CRUD 接口仍可使用，但该接口的多次调用不自动组成 EntityStore 事务，
 也不自动获得实体层的版本、白名单、排序和幂等保护。
 
@@ -349,6 +417,13 @@ PostgreSQL 文本不支持内嵌 NUL 字节；驱动会拒绝这类参数和 SQL
 
 ## 验证范围
 
+- 2026-09-05：Redis EntityStore 接入后，完整 Debug 构建及 **22/22 CTest 通过**
+  （427.48 秒）。新增真实 Redis 用例覆盖类型/精确金额、大整数、投影、patch、
+  版本冲突、整批失败不落部分数据、同对象多次 patch、持久化幂等及跨 store/partition
+  重用 ID 拒绝、两个后端实例并发累加、独立读写连接、原始 MULTI/SELECT 会话隔离、
+  主动断线后重连、插件重启后的首次版本重放、正常/强制退出与 CRT 报告检查。
+  共享配置抽取引起的 Mongo 非法配置目录发布回归已修复并通过重测。
+  Redis 示例配置通过应用解析检查；测试不等同于验证掉电持久性、主从复制或 Cluster 故障切换。
 - 2026-09-04：最新 Debug 完整构建成功，全部 **19/19 CTest 通过**（190.75 秒），
   包含 SQLite 应用集成以及依次新建的 MySQL、PostgreSQL、MongoDB 容器测试。
   首轮全量回归曾因工作盘空间不足在复制运行库时失败；清理本轮副本并补上自动回收后，
@@ -442,17 +517,30 @@ pwsh -NoProfile -File ./tests/run_mongo_entity_store_docker.ps1
 启用 `CAF_ENABLE_DOCKER_TESTS` 后，CTest 同时注册 `mongo_entity_store_docker`。
 每轮日志保存在 `out/build/windows-x64/tests/mongo_entity_store_docker-<配置>-<运行号>/`，
 包含 `stdout.log`、`stderr.log`、数据库日志和镜像/容器 ID 元数据。强制终止脚本或
-Docker 引擎失联可能阻断清理，应根据本轮 ID 与 `caf.test=entity-store-mongo` 标签确认后处理。
+Docker 引擎失联可能阻断清理，应根据本轮 ID 与 `caf.test=database-plugin-mongo` 标签确认后处理。
 Mongo runner 从已有依赖目录加载第三方 DLL，并在结束时删除本轮运行库副本；
 即使日志写入失败，也会尝试清理已确认归属的容器。
+
+### Redis Docker 回归
+
+```powershell
+cmake --build --preset windows-x64-debug --target test_redis_entity_store test_redis_worker_pool --parallel 2
+pwsh -NoProfile -File ./tests/run_redis_entity_store_docker.ps1
+```
+
+需要本机已有 redis:7-alpine 镜像。每次运行新建一个独立临时 Redis，测试结束自动删除容器
+和测试数据，不访问已有 Redis。共享 runner 同样验证自然退出、worker 回收及 CRT 报告，
+日志保存在 `out/build/windows-x64/tests/redis_entity_store_docker-<配置>-<运行号>/`。
+启用 CAF_ENABLE_DOCKER_TESTS 后注册 redis_entity_store_docker；旧 redis_worker_pool_docker
+保留，继续覆盖原始命令兼容性及阻塞命令期间的正常/强制退出。
 
 ## 后端能力边界
 
 - MySQL / PostgreSQL / SQLite：实体 SQL 适配层已实现字段投影、patch、乐观锁和单连接事务。
 - MongoDB：已实现字段投影、patch、版本检查、持久化幂等和 session 多文档事务；
   需要副本集或支持事务的分片集群，字段 schema 目前手动配置。
-- Redis：适合作缓存或通过 Lua 实现单 key 原子更新；不要把 MULTI/EXEC 的
-  命令流伪装成跨实体强事务。
+- Redis：已实现统一对象存取、patch、版本检查与持久化幂等；同一内部 hash 中的
+  多对象变更和去重记录以 CAS + 单 HSET 原子提交，不是 SQL 式长生命周期事务。
 
 协议中的 `validate` 只做后端无关的结构校验，SQL 实现额外做 schema 白名单、类型、
 可写字段、事务预算和幂等检查。租户隔离、业务授权与入口请求体大小限制仍由业务服务/网关负责。

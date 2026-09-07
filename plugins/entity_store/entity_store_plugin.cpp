@@ -3,6 +3,7 @@
 #include "services/logging_service.hpp"
 #include "templates/sql_entity_store_actor.hpp"
 #include "templates/mongo_entity_store_actor.hpp"
+#include "templates/redis_entity_store_config.hpp"
 
 #include <caf/all.hpp>
 
@@ -87,6 +88,13 @@ public:
             if (!settings.config_error.empty())
                 LOG_ERROR("MongoDB EntityStore configuration error: {}", settings.config_error);
             return sys.spawn<caf_plugin_system::entity_store::mongo::entity_store_actor>(std::move(settings));
+        }
+        if (config.dialect == "redis") {
+            auto raw = caf::get_or(sys.config(), "caf-plugin-system.entity_store", caf::settings{});
+            auto settings = caf_plugin_system::entity_store::redis::parse_service_config(raw);
+            if (!settings.config_error.empty())
+                LOG_ERROR("Redis EntityStore configuration error: {}", settings.config_error);
+            return sys.spawn<caf_plugin_system::entity_store::document::entity_store_actor>(std::move(settings));
         }
         auto settings = make_service_config(config);
         if (!settings.config_error.empty())

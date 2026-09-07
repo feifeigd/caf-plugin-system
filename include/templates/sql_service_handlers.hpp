@@ -151,10 +151,10 @@ private:
             return;
         }
         auto deliver = std::move(job->done);
-        job->done = [deliver = std::move(deliver), pools = pools_, transaction](
+        job->done = [deliver = std::move(deliver), transactions = pools_->transactions(), transaction](
                         db::db_result& result) mutable {
             if (!result.ok && db::is_connection_error(result.code))
-                pools->release_transaction(transaction);
+                transactions->release_transaction(transaction);
             deliver(result);
         };
         route.enqueue(std::move(job));
@@ -174,12 +174,12 @@ private:
         auto job = std::make_shared<Job>();
         job->op = Operation::Begin;
         job->transaction = transaction;
-        job->done = [promise, pools = pools_,
+        job->done = [promise, transactions = pools_->transactions(),
                      transaction](db::db_result& result) mutable {
             if (result.ok)
                 result.insert_id = std::to_string(transaction);
             else
-                pools->release_transaction(transaction);
+                transactions->release_transaction(transaction);
             promise.deliver(std::move(result));
         };
         route.enqueue(std::move(job));
@@ -200,7 +200,7 @@ private:
         auto job = std::make_shared<Job>();
         job->op = operation;
         job->transaction = transaction;
-        job->done = [promise, pools = pools_, slot = route.slot,
+        job->done = [promise, transactions = pools_->transactions(), slot = route.slot->state(),
                      transaction, operation](db::db_result& result) mutable {
             if (operation == Operation::Commit && !result.ok) {
                 // COMMIT 失败不代表连接已退出事务。先在同一 worker 上清理，
@@ -210,11 +210,11 @@ private:
                 auto cleanup = std::make_shared<Job>();
                 cleanup->op = Operation::Rollback;
                 cleanup->transaction = transaction;
-                cleanup->done = [promise, pools, slot, transaction, original](
+                cleanup->done = [promise, transactions, slot, transaction, original](
                                     db::db_result& rollback) mutable {
                     if (!rollback.ok && !slot->recoverable())
                         slot->fail_pending("transaction rollback failed");
-                    pools->release_transaction(transaction);
+                    transactions->release_transaction(transaction);
                     promise.deliver(std::move(*original));
                 };
                 slot->enqueue(std::move(cleanup));
@@ -223,7 +223,7 @@ private:
             if (operation == Operation::Rollback && !result.ok
                 && !slot->recoverable())
                 slot->fail_pending("transaction rollback failed");
-            pools->release_transaction(transaction);
+            transactions->release_transaction(transaction);
             promise.deliver(std::move(result));
         };
         route.enqueue(std::move(job));

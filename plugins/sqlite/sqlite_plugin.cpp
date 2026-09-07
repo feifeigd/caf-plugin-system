@@ -23,6 +23,7 @@ namespace {
 using Op = caf_plugin_system::sql_backend::Operation;
 using Job = caf_plugin_system::sql_backend::Job;
 using ConnSlot = caf_plugin_system::sql_backend::ConnectionSlot;
+using ConnState = caf_plugin_system::sql_backend::ConnectionState;
 using SqlPool = caf_plugin_system::sql_backend::ConnectionPool;
 using SqlDispatcher = caf_plugin_system::sql_backend::SqlServiceDispatcher;
 
@@ -127,8 +128,12 @@ db::db_result execute(sqlite3* conn, const Job& job) {
     return result;
 }
 
-void worker_main(DbSpec spec, int timeout_ms, std::shared_ptr<ConnSlot> slot) {
-    sqlite3* conn = nullptr;
+void worker_main(std::shared_ptr<ConnState> slot, DbSpec spec, int timeout_ms) {
+    struct ConnectionOwner {
+        sqlite3* handle = nullptr;
+        ~ConnectionOwner() { if (handle) sqlite3_close(handle); }
+    } connection;
+    auto*& conn = connection.handle;
     std::string open_error;
     if (spec.path != ":memory:" && spec.path.rfind("file:", 0) != 0) {
         std::error_code ec;
@@ -164,8 +169,6 @@ void worker_main(DbSpec spec, int timeout_ms, std::shared_ptr<ConnSlot> slot) {
         if (job->done)
             job->done(result);
     }
-    if (conn)
-        sqlite3_close(conn);
     LOG_INFO("SQLite [{}] worker exited", spec.name);
 }
 
@@ -203,7 +206,7 @@ public:
                     for (int i = 0; i < count; ++i) {
                         auto slot = pools->add_slot(spec.name);
                         slot->start_worker(
-                            worker_main, spec, timeout_ms, slot);
+                            worker_main, spec, timeout_ms);
                     }
                 }
             };

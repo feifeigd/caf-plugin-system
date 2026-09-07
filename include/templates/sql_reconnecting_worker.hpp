@@ -30,7 +30,7 @@ public:
 /// 带自动重连的工作循环
 class ReconnectingSqlWorker {
 public:
-    ReconnectingSqlWorker(std::shared_ptr<ConnectionSlot> slot,
+    ReconnectingSqlWorker(std::shared_ptr<ConnectionState> slot,
                           std::unique_ptr<SqlConnection> connection,
                           ReconnectPolicy policy = {})
         : slot_(std::move(slot)), connection_(std::move(connection)),
@@ -124,7 +124,7 @@ private:
         return result;
     }
 
-    std::shared_ptr<ConnectionSlot> slot_;
+    std::shared_ptr<ConnectionState> slot_;
     std::unique_ptr<SqlConnection> connection_;
     ReconnectPolicy policy_;
     bool connected_ = false;

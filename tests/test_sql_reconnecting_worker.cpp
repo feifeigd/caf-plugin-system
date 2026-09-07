@@ -71,7 +71,7 @@ public:
     Fixture()
         : slot(std::make_shared<sql::ConnectionSlot>()),
           native(std::make_unique<FakeConnection>()), fake(native.get()),
-          worker(slot, std::move(native), quick_policy()) {}
+          worker(slot->state(), std::move(native), quick_policy()) {}
 
     db::db_result run(sql::Operation operation, uint64_t transaction = 0) {
         sql::Job job;
@@ -183,7 +183,7 @@ int main() {
             sql::ReconnectPolicy policy;
             policy.initial_delay = 5s;
             policy.max_delay = 5s;
-            sql::ReconnectingSqlWorker worker{slot, std::move(fake), policy};
+            sql::ReconnectingSqlWorker worker{slot->state(), std::move(fake), policy};
             auto done = std::async(std::launch::async, [&] { return worker.process(sql::Job{}); });
             require(signal.wait_for(1s) == std::future_status::ready, "connect did not start");
             slot->stop();
