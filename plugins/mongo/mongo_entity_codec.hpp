@@ -260,7 +260,16 @@ public:
                 bson::kvp("create", change.create_if_missing), bson::kvp("check", change.check_version),
                 bson::kvp("version", std::to_string(change.expected_version))));
         }
-        auto result = bson::make_document(bson::kvp("changes", changes.extract()));
+        bson::document root;
+        root.append(bson::kvp("changes", changes.extract()));
+        if (std::any_of(request.changes.begin(), request.changes.end(), [](const auto& x) {
+                return x.operation != entity_operation::legacy_patch;
+            })) {
+            bson::array operations;
+            for (const auto& x : request.changes) operations.append(int32_t(x.operation));
+            root.append(bson::kvp("strict-crud-v1", operations.extract()));
+        }
+        auto result = root.extract();
         if (result.view().length() > 8 * 1024 * 1024) invalid("save exceeds 8 MiB");
         return result;
     }

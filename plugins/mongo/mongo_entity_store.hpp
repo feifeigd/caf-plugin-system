@@ -185,7 +185,7 @@ public:
                     bson::array versions;
                     for (const auto& change : request.changes) {
                         const auto version = apply(session, find_entity(store, change.target.entity), change, budget);
-                        result.entities.push_back({change.target, static_cast<uint64_t>(version)});
+                        result.entities.push_back({change.target, static_cast<uint64_t>(version), change.operation});
                         versions.append(version);
                     }
                     mongocxx::options::find_one_and_update finish;
@@ -339,7 +339,8 @@ private:
         find.max_time(budget.remaining());
         auto before = collection.find_one(session, filter.view(), find);
         if (!before) {
-            if (!patch.create_if_missing || (patch.check_version && patch.expected_version != 0))
+            if ((patch.operation != entity_operation::insert && !patch.create_if_missing)
+                || (patch.check_version && patch.expected_version != 0))
                 throw EntityError{result_code::not_found, "entity not found"};
             bson::document created;
             for (const auto& key : patch.target.key)
@@ -371,10 +372,19 @@ private:
             }
             return 1;
         }
+        if (patch.operation == entity_operation::insert)
+            throw EntityError{result_code::conflict, "entity already exists"};
         validate_document(before->view(), schema);
         const auto version = EntityCodec::version(before->view(), schema);
         if (patch.check_version && patch.expected_version != uint64_t(version))
             throw EntityError{result_code::conflict, "entity version conflict"};
+        if (patch.operation == entity_operation::delete_entity) {
+            budget.remaining();
+            auto removed = collection.delete_one(session, filter.view());
+            if (!removed || removed->deleted_count() != 1)
+                throw EntityError{result_code::conflict, "entity disappeared during delete"};
+            return 0;
+        }
         if (version == std::numeric_limits<int64_t>::max()) EntityCodec::invalid("entity version exhausted");
         bson::document set, increment, unset, update;
         increment.append(bson::kvp(schema.version_column, int64_t{1}));
@@ -414,9 +424,13 @@ private:
         result.request_id = request.request_id;
         size_t i = 0;
         for (const auto& version : versions.get_array().value) {
-            if (i >= request.changes.size() || version.type() != bsoncxx::type::k_int64 || version.get_int64().value <= 0)
+            if (i >= request.changes.size() || version.type() != bsoncxx::type::k_int64
+                || version.get_int64().value < 0
+                || ((version.get_int64().value == 0)
+                    != (request.changes[i].operation == entity_operation::delete_entity)))
                 EntityCodec::corrupt("invalid idempotency result version");
-            result.entities.push_back({request.changes[i++].target, uint64_t(version.get_int64().value)});
+            const auto& change = request.changes[i++];
+            result.entities.push_back({change.target, uint64_t(version.get_int64().value), change.operation});
         }
         if (i != request.changes.size()) EntityCodec::corrupt("idempotency result size mismatch");
         result.code = result_code::ok; result.committed = true;

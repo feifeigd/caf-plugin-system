@@ -311,6 +311,12 @@ public:
                 out.text(field.name); out.byte(static_cast<uint8_t>(field.operation)); encode_value(out, field.data);
             }
         }
+        if (std::any_of(request.changes.begin(), request.changes.end(), [](const auto& x) {
+                return x.operation != entity_operation::legacy_patch;
+            })) {
+            out.text("strict-crud-v1");
+            for (const auto& x : request.changes) out.byte(static_cast<uint8_t>(x.operation));
+        }
         return out.take();
     }
     static std::string object_field(const schema::entity_schema& mapped, const entity_ref& target) {
@@ -345,8 +351,10 @@ public:
         save_result result; result.request_id = request.request_id;
         for (const auto& change : request.changes) {
             auto version = in.number();
-            if (!version || version > uint64_t(std::numeric_limits<int64_t>::max())) corrupt("invalid committed version");
-            result.entities.push_back({change.target, version});
+            if (version > uint64_t(std::numeric_limits<int64_t>::max())
+                || ((version == 0) != (change.operation == entity_operation::delete_entity)))
+                corrupt("invalid committed version");
+            result.entities.push_back({change.target, version, change.operation});
         }
         in.finish(); result.code = result_code::ok; result.committed = true; return result;
     }

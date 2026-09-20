@@ -25,6 +25,37 @@ Redis adapter -> redis_service
 - 业务代码不拼 SQL，也不能把客户端传来的实体名或字段名直接当数据库标识符。
 - 事务边界由一条保存请求决定，不把连接池事务句柄交给业务 actor 长期持有。
 
+## 严格新增、更新与删除
+
+`entity_patch.operation` 支持 `legacy_patch`（默认）、`insert`、`update`、
+`delete_entity`。旧调用方保留原有 `create_if_missing` 行为；严格操作禁止与
+`create_if_missing` 混用。
+
+- `insert`：主键必须不存在；仅接受 `set` 字段，不接受已有版本条件。可省略字段，
+  SQL 后端由数据库应用默认值；MongoDB/Redis 仍须满足其字段 schema。
+- `update`：必须存在，且必须给出 `check_version=true` 和正数 `expected_version`；
+  不会自动插入，字段列表不能为空。
+- `delete_entity`：必须存在并匹配预期版本，字段列表必须为空。不要使用字段级
+  `patch_op::erase` 代替删除记录，后者仍是字段删除/SQL NULL。
+- 严格批次中同一逻辑实体主键不能重复（主键字段顺序无关）；纯旧式 patch 批次
+  继续允许同一实体的顺序 patch。不同逻辑别名映射到同一物理记录时仍由映射配置及
+  后端事务约束处理，不应在业务中当作两个独立实体。
+
+结果 `committed_entity.operation` 标识对应操作，顺序与请求一致；删除的
+`version=0` 表示没有存活版本。删除回执丢失时，用原 `request_id` 和原内容重试，
+返回首次提交结果；换新 ID 删除已不存在记录返回 `not_found`。相同主键重新插入后，
+旧删除请求的幂等重放也不能再次删除它。
+重新插入的版本从 1 开始；版本号不是跨删除/重建的实体代际标识。业务应使用
+不复用的实体 ID，或另行设计 generation，不能依赖版本检查识别所有旧代际的新请求。
+
+Redis 在内部 hash 中以空载荷保存删除标记，读取视为不存在、主键可以重新插入。
+标记与本批其他对象及幂等记录由同一条 HSET 发布，避免多条写命令出现部分提交；
+内部删除标记与幂等记录目前均无自动清理机制。
+
+CAF 消息布局新增操作字段，部署时必须同批升级通信双方，不支持混用旧二进制。
+旧式请求的持久化幂等签名保持不变；严格请求签名增加版本化操作列表，避免相同
+ID 被不同 CRUD 操作复用。业务表不需要因这次协议扩展修改结构。
+
 ## 协议
 
 ### 读取
@@ -416,6 +447,15 @@ SQL schema 当前不接受 `bytes` 字段；NULL 与空字符串通过结果集�
 PostgreSQL 文本不支持内嵌 NUL 字节；驱动会拒绝这类参数和 SQL，避免静默截断主键或字段。
 
 ## 验证范围
+
+- 2026-09-08：显式严格 CRUD 扩展通过完整 Debug 构建，分四批完成全部 **22/22 CTest**。
+  SQLite、MySQL、PostgreSQL、MongoDB、Redis 共用新增 CRUD 场景，覆盖插入冲突、
+  更新不隐式新增、删除版本冲突、插入/删除整批回滚、删除回执重放及主键重建后的旧请求重放。
+  协议测试覆盖新增操作字段与删除结果的 CAF 二进制往返；原有恢复、退出和 worker 用例通过。
+  严格 CRUD 测试模拟重复请求，不等于新增了所有后端的网络丢包故障注入；已有恢复测试继续保留。
+  构建和分批结果日志：`out/build/windows-x64/strict-crud-build.log`、
+  `strict-crud-early-tests.log`、`strict-crud-database-tests.log`、
+  `strict-crud-remaining-tests.log`、`strict-crud-redis-tests.log`（同目录）。
 
 - 2026-09-05：Redis EntityStore 接入后，完整 Debug 构建及 **22/22 CTest 通过**
   （427.48 秒）。新增真实 Redis 用例覆盖类型/精确金额、大整数、投影、patch、

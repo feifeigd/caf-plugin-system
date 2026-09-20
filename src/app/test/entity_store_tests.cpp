@@ -1,4 +1,5 @@
 #include "app_tests.hpp"
+#include "../../../tests/entity_crud_scenarios.hpp"
 
 #include "common/db_contract.hpp"
 #include "common/entity_store_contract.hpp"
@@ -57,6 +58,21 @@ public:
         if (dialect_ == "postgres" && !verify_postgres_copy_recovery())
             return finish();
 
+        if (!entity::test::strict_crud(create_order_request(),
+                [this](const auto& input) {
+                    auto result = save(input, "strict CRUD");
+                    return result.value_or(entity::save_result{});
+                },
+                [this](const auto& key) {
+                    entity::load_result result;
+                    self_->request(store_, std::chrono::seconds(10), entity_load_atom_v,
+                                   entity::load_request{.target = key})
+                        .receive([&](entity::load_result value) { result = std::move(value); },
+                                 [&](const caf::error&) {});
+                    return result;
+                },
+                [this](bool ok, const char* message) { return require(ok, message); }))
+            return finish();
         auto create = create_order_request();
         auto created = save(create, "create order");
         if (!require_ok(created, 1, "create order"))

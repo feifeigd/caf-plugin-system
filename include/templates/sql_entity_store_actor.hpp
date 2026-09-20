@@ -325,7 +325,11 @@ private:
                                                + change.target.entity));
                 return promise;
             }
-            auto update = builder_.update(*schema, change);
+            auto update = change.operation == entity_operation::insert
+                ? builder_.insert(*schema, change)
+                : change.operation == entity_operation::delete_entity
+                    ? builder_.delete_entity(*schema, change)
+                    : builder_.update(*schema, change);
             if (!update) {
                 promise.deliver(save_error(request,
                                            result_code::invalid_request,
@@ -608,7 +612,8 @@ inline void entity_store_actor::replay_request(
                 replay.committed = true;
                 for (size_t i = 0; i < versions.size(); ++i)
                     replay.entities.push_back(
-                        {context->request.changes[i].target, versions[i]});
+                        {context->request.changes[i].target, versions[i],
+                         context->request.changes[i].operation});
                 rollback_replay(context, std::move(replay));
             },
             [this, context](caf::error& error) {
@@ -629,7 +634,13 @@ inline void entity_store_actor::apply_next_change(
     }
     const auto index = context->change_index;
     const auto& change = context->request.changes[index];
-    auto command = builder_.update(*context->schemas[index], change);
+    if (change.operation == entity_operation::insert) {
+        insert_change(context);
+        return;
+    }
+    auto command = change.operation == entity_operation::delete_entity
+        ? builder_.delete_entity(*context->schemas[index], change)
+        : builder_.update(*context->schemas[index], change);
     if (!command) {
         rollback(context, result_code::invalid_request,
                  std::move(command.error));
@@ -648,6 +659,12 @@ inline void entity_store_actor::apply_next_change(
                 const auto& change =
                     context->request.changes[context->change_index];
                 if (result.affected > 0) {
+                    if (change.operation == entity_operation::delete_entity) {
+                        context->versions.push_back(0);
+                        ++context->change_index;
+                        apply_next_change(context);
+                        return;
+                    }
                     load_change_version(context);
                     return;
                 }
@@ -804,7 +821,7 @@ inline void entity_store_actor::commit(
                 for (size_t i = 0; i < context->versions.size(); ++i)
                     committed.entities.push_back(
                         {context->request.changes[i].target,
-                         context->versions[i]});
+                         context->versions[i], context->request.changes[i].operation});
                 finish_save(context, std::move(committed));
             },
             [this, context](caf::error& error) {
@@ -921,6 +938,14 @@ inline std::string entity_store_actor::request_signature(
             token(field.name);
             append_value(field.data);
         }
+    }
+    // Keep historical legacy signatures byte-for-byte for persisted replays.
+    if (std::any_of(request.changes.begin(), request.changes.end(), [](const auto& x) {
+            return x.operation != entity_operation::legacy_patch;
+        })) {
+        token("strict-crud-v1");
+        for (const auto& x : request.changes)
+            token(std::to_string(static_cast<unsigned>(x.operation)));
     }
     return result;
 }

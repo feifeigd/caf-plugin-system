@@ -1,4 +1,5 @@
 #include "common/message_meta.hpp"
+#include "entity_crud_scenarios.hpp"
 #include "plugin/dynamic_library.hpp"
 #include "plugin/plugin_interface.hpp"
 #include <caf/init_global_meta_objects.hpp>
@@ -260,6 +261,10 @@ entity::save_request initial() {
 }
 
 void verify(Harness& test, Plugin& driver) {
+    entity::test::strict_crud(initial(),
+        [&](const auto& request) { return test.save(request); },
+        [&](const auto& key) { return test.load(key); },
+        [](bool ok, const char* message) { require(ok, message); return ok; });
     auto created = test.save(initial());
     require(created.committed && created.entities.front().version == 1, "create failed: " + created.error);
     auto all = test.load(target("one"));

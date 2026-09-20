@@ -109,7 +109,11 @@ public:
                     auto reply = connection_.command({"HGET", EntityCodec::hash_key(store), field}, deadline);
                     check_reply(*reply);
                     if (reply->type == REDIS_REPLY_NIL) { result.code = result_code::not_found; return result; }
-                    auto document = EntityCodec::decode(string_reply(*reply));
+                    auto bytes = string_reply(*reply);
+                    // Empty payload is an internal deletion marker, published by the
+                    // same single HSET as the ledger (no partially applied HDEL).
+                    if (bytes.empty()) { result.code = result_code::not_found; return result; }
+                    auto document = EntityCodec::decode(bytes);
                     validate_document(document, mapped);
                     for (auto column : selected) {
                         auto found = document.fields.find(column->column);
@@ -165,7 +169,7 @@ public:
                         if (item->type != REDIS_REPLY_NIL) {
                             bytes = string_reply(*item); total_bytes += bytes->size();
                             if (total_bytes > Writer::max_bytes) invalid("batch snapshot exceeds 8 MiB");
-                            documents.emplace(field, EntityCodec::decode(*bytes));
+                            if (!bytes->empty()) documents.emplace(field, EntityCodec::decode(*bytes));
                         }
                     }
                     save_result result; result.request_id = request.request_id;
@@ -173,14 +177,15 @@ public:
                         const auto& patch = request.changes[i];
                         auto& document = documents[fields[i]];
                         apply(document, find_entity(store, patch.target.entity), patch);
-                        result.entities.push_back({patch.target, document.version});
+                        result.entities.push_back({patch.target, document.version, patch.operation});
                     }
                     const auto committed_record = EntityCodec::ledger(signature, result);
                     std::vector<std::string> command{"EVAL", commit_script(), "1", hash, ledger,
                         committed_record, std::to_string(snapshots.size())};
                     total_bytes = committed_record.size();
                     for (const auto& [field, bytes] : snapshots) {
-                        auto updated = EntityCodec::encode(documents.at(field));
+                        const auto& document = documents.at(field);
+                        auto updated = document.version == 0 ? std::string{} : EntityCodec::encode(document);
                         total_bytes += field.size() + updated.size() + (bytes ? bytes->size() : 0);
                         if (total_bytes > 3 * Writer::max_bytes) invalid("atomic batch exceeds 24 MiB");
                         command.push_back(field); command.push_back(bytes ? "1" : "0");
@@ -306,13 +311,20 @@ return redis.call('HSET', KEYS[1], unpack(updates))
     static void apply(Document& document, const schema::entity_schema& mapped, const entity_patch& patch) {
         const bool creating = document.version == 0;
         if (creating) {
-            if (!patch.create_if_missing || (patch.check_version && patch.expected_version != 0))
+            if ((patch.operation != entity_operation::insert && !patch.create_if_missing)
+                || (patch.check_version && patch.expected_version != 0))
                 throw EntityError{result_code::not_found, "entity not found"};
             for (const auto& key : patch.target.key) document.fields.emplace(mapped.find_key(key.name)->column, key.data);
         } else {
+            if (patch.operation == entity_operation::insert)
+                throw EntityError{result_code::conflict, "entity already exists"};
             validate_document(document, mapped);
             if (patch.check_version && patch.expected_version != document.version)
                 throw EntityError{result_code::conflict, "entity version conflict"};
+        }
+        if (patch.operation == entity_operation::delete_entity) {
+            document = Document{};
+            return;
         }
         if (document.version == uint64_t(std::numeric_limits<int64_t>::max())) invalid("entity version exhausted");
         for (const auto& field : patch.fields) {

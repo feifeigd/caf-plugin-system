@@ -79,6 +79,17 @@ int main() {
     assert(update.statement.params
            == std::vector<std::string>({"paid", "99.50", "order-42", "7"}));
 
+    auto deletion = patch;
+    deletion.fields.clear();
+    deletion.operation = entity_operation::delete_entity;
+    auto deleted = sqlite.delete_entity(order, deletion);
+    assert(deleted && deleted.statement.text ==
+        "DELETE FROM \"orders\" WHERE \"order_id\" = ? AND \"version\" = ?");
+    assert(deleted.statement.params == std::vector<std::string>({"order-42", "7"}));
+    auto key_only = deletion;
+    key_only.operation = entity_operation::insert;
+    assert(sqlite.insert(order, key_only));
+
     patch.create_if_missing = true;
     auto insert = sqlite.insert(order, patch);
     assert(insert);

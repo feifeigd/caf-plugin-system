@@ -1,6 +1,8 @@
 #include "common/entity_store_contract.hpp"
 #include "common/message_tags.hpp"
 
+#include <caf/binary_serializer.hpp>
+#include <caf/binary_deserializer.hpp>
 #include <cassert>
 #include <string>
 
@@ -70,6 +72,48 @@ int main() {
         {patch_op::set, "order_id", value::text("another-order")});
     assert(validate(save).find("key field") != std::string::npos);
     save.changes[0].fields.pop_back();
+
+    auto strict = save;
+    strict.changes.resize(1);
+    auto& change = strict.changes.front();
+    change.operation = entity_operation::delete_entity;
+    change.fields.clear();
+    assert(validate(strict).empty());
+    caf::byte_buffer request_bytes;
+    caf::binary_serializer request_writer{request_bytes};
+    assert(request_writer.apply(strict));
+    save_request decoded_request;
+    caf::binary_deserializer request_reader{request_bytes};
+    assert(request_reader.apply(decoded_request));
+    assert(decoded_request.changes[0].operation == entity_operation::delete_entity);
+    assert(decoded_request.changes[0].expected_version == 7);
+    save_result reply;
+    reply.committed = true;
+    reply.entities.push_back({order(), 0, entity_operation::delete_entity});
+    caf::byte_buffer reply_bytes;
+    caf::binary_serializer reply_writer{reply_bytes};
+    assert(reply_writer.apply(reply));
+    save_result decoded_reply;
+    caf::binary_deserializer reply_reader{reply_bytes};
+    assert(reply_reader.apply(decoded_reply));
+    assert(decoded_reply.entities[0].operation == entity_operation::delete_entity);
+    assert(decoded_reply.entities[0].version == 0);
+    auto duplicated = strict;
+    duplicated.changes.push_back(change);
+    assert(validate(duplicated).find("duplicate") != std::string::npos);
+    change.check_version = false;
+    assert(!validate(strict).empty());
+    change.operation = entity_operation::insert;
+    change.expected_version = 0;
+    assert(validate(strict).empty()); // Key-only insert permits backend defaults.
+    change.create_if_missing = true;
+    assert(!validate(strict).empty());
+    change.create_if_missing = false;
+    change.operation = static_cast<entity_operation>(255);
+    assert(!validate(strict).empty());
+    change.operation = entity_operation::insert;
+    change.fields = {{patch_op::increment, "paid_amount", value::signed_integer(1)}};
+    assert(!validate(strict).empty());
 
     save.changes[0].fields[1].data = value::text("not-a-number");
     assert(validate(save).find("numeric") != std::string::npos);

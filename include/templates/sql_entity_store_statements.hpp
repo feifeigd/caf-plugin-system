@@ -275,6 +275,20 @@ public:
         return result;
     }
 
+    statement_result delete_entity(const entity_schema& schema,
+                                   const entity_patch& patch) const {
+        statement_result result;
+        if (!validate_keys(schema, patch.target, result.error)) return result;
+        auto& out = result.statement;
+        out.text = "DELETE FROM " + dialect_.quote(schema.table) + " WHERE ";
+        append_where(out, schema, patch.target);
+        if (patch.check_version) {
+            out.text += " AND " + dialect_.quote(schema.version_column) + " = ";
+            append_parameter(out, value::unsigned_integer(patch.expected_version));
+        }
+        return result;
+    }
+
     statement_result current_version(const entity_schema& schema,
                                      const entity_ref& target) const {
         statement_result result;

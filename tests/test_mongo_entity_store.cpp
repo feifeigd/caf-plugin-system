@@ -1,4 +1,5 @@
 #include "common/message_meta.hpp"
+#include "entity_crud_scenarios.hpp"
 #include "plugin/dynamic_library.hpp"
 #include "plugin/plugin_interface.hpp"
 #include <caf/init_global_meta_objects.hpp>
@@ -234,6 +235,10 @@ void verify(Harness& test, mongocxx::client& observer, const std::string& databa
         {patch_op::set, "payload", value::json(R"({"items":[1,2],"label":"stored"})")},
         {patch_op::set, "binary", value::bytes({std::byte{0}, std::byte{255}})},
         {patch_op::set, "note", value::text("keep")}}, true);
+    entity::test::strict_crud(create,
+        [&](const auto& request) { return test.save(request); },
+        [&](const auto& key) { return test.load(key); },
+        [](bool ok, const char* message) { require(ok, message); return ok; });
     auto result = test.save(create);
     require(result.committed && result.entities.front().version == 1, "create failed: " + result.error);
     auto all = test.load(target("one"));
