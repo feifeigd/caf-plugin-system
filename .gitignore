@@ -145,3 +145,7 @@ __pycache__/
 
 # 本地 AI 辅助配置（不入库）
 /.claude/
+
+# caf-plugin-sdk：由 sdk/package.cmake 从最新构建组装的插件开发 SDK（生成物，
+# 模板与脚本在 sdk/）。提交产物会导致 core.dll 版本漂移无从考证。
+/caf-plugin-sdk/
